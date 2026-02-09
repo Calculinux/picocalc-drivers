@@ -1,0 +1,43 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Device tree overlay for DS3231 I2C RTC module
+ * 
+ * This overlay adds support for the Maxim DS3231 I2C Real-Time Clock
+ * module connected to I2C bus 2.
+ * 
+ * Default I2C address: 0x68
+ * 
+ * To apply this overlay at runtime:
+ *   mkdir -p /sys/kernel/config/device-tree/overlays/ds3231
+ *   cat /lib/firmware/overlays/ds3231-rtc.dtbo > /sys/kernel/config/device-tree/overlays/ds3231/dtbo
+ *   echo 1 > /sys/kernel/config/device-tree/overlays/ds3231/status
+ * 
+ * To remove:
+ *   echo 0 > /sys/kernel/config/device-tree/overlays/ds3231/status
+ *   rmdir /sys/kernel/config/device-tree/overlays/ds3231
+ */
+
+&i2c2 {
+#address-cells = <1>;
+#size-cells = <0>;
+
+status = "okay";
+
+ds3231: rtc@68 {
+compatible = "maxim,ds3231";
+reg = <0x68>;
+
+/* Optional: Uncomment if using the interrupt pin for alarms
+interrupt-parent = <&gpio0>;
+interrupts = <RK_PA0 IRQ_TYPE_EDGE_FALLING>;
+*/
+
+/* Optional: Enable wakeup capability
+wakeup-source;
+*/
+
+#clock-cells = <0>;
+};
+};
