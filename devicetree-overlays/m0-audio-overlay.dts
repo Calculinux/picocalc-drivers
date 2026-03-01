@@ -47,10 +47,10 @@
                 reset-names = "h_m0", "m0_jtag", "hresetn_m0_ac";
             };
         };
-    }
+    };
 
     fragment@1 {
-        target = <&pinctrl>;
+        target-path = "/pinctrl";
         __overlay__ {
             picocalc_snd {
                 snd_pins: snd-pins {
@@ -63,7 +63,7 @@
     };
 
     fragment@2 {
-        target = <&reserved_memory>;
+        target-path = "/reserved-memory";
         __overlay__ {
             m0_shmem: m0-shmem@3c00000 {
                 reg = <0x03c00000 0x100000>;
