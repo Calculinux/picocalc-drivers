@@ -1,8 +1,15 @@
+cru
 gpio3
+gpio4
 i2c2
 pcfg_pull_down
 pcfg_pull_none
 pinctrl
+pwm0_4ch_0
+pwm0_4ch_1
+reserved_memory
+rm_io12_pwm0_ch0
+rm_io13_pwm0_ch1
 sai2
 uart5
 uart5m0_xfer

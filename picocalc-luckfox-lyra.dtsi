@@ -121,74 +121,10 @@
 	};
 };
 
-/****** PWM Sound via Hardware Mod ******/
-&pinctrl {
-	picocalc_snd {
-		snd_pins: snd-pins {
-			rockchip,pins =
-				<4 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>,
-				<4 RK_PB3 RK_FUNC_GPIO &pcfg_pull_none>;
-		};
-	};
-};
-
-/ {
-	/* Default sound: M0 delta-sigma audio (same pins as softpwm/hwpwm) */
-	picocalc_snd_m0: picocalc-snd-m0 {
-		compatible = "picocalc,snd-m0";
-		status = "okay";
-		memory-region = <&m0_shmem>;
-		remote-proc = <&mcu_rproc>;
-		ring-buffer-bytes = <8192>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&snd_pins>;
-	};
-
-	/* Optional: hardware PWM sound (requires HW mod); disable when using M0 */
-	picocalc_snd {
-		status = "disabled";
-		compatible = "fsl,picocalc-snd-pwm";
-		pinctrl-names = "default";
-		pinctrl-0 = <&snd_pins>;
-		leftpin = <&gpio4 RK_PB2 GPIO_ACTIVE_HIGH>;
-		rightpin = <&gpio4 RK_PB3 GPIO_ACTIVE_HIGH>;
-		pwm-names = "pwm-snd-left", "pwm-snd-right";
-		pwms = <&pwm0_4ch_0 0 25000 0>, <&pwm0_4ch_1 0 25000 0>;
-	};
-
-	/* RK3506 Cortex-M0 remoteproc for M0 audio firmware */
-	mcu_rproc: mcu@fff84000 {
-		compatible = "rockchip,rk3506-mcu";
-		reg = <0xfff84000 0x8000>;
-		firmware-name = "rk3506-m0-audio.elf";
-		clocks = <&cru HCLK_M0>, <&cru STCLK_M0>,
-			 <&cru PCLK_TIMER>, <&cru CLK_TIMER0_CH5>;
-		resets = <&cru SRST_H_M0>, <&cru SRST_M0_JTAG>,
-			 <&cru SRST_HRESETN_M0_AC>;
-		reset-names = "h_m0", "m0_jtag", "hresetn_m0_ac";
-	};
-};
-
-&pwm0_4ch_0 {
-	pinctrl-names = "active";
-	pinctrl-0 = <&rm_io12_pwm0_ch0>;
-	status = "okay";
-	assigned-clocks = <&cru CLK_PWM0>;
-	assigned-clock-rates = <100000000>;
-};
-
-&pwm0_4ch_1 {
-	pinctrl-names = "active";
-	pinctrl-0 = <&rm_io13_pwm0_ch1>;
-	status = "okay";
-	assigned-clocks = <&cru CLK_PWM0>;
-	assigned-clock-rates = <100000000>;
-};
-
-/****** M0 shared memory for audio (reserved_memory from SoC dtsi) ******/
-&reserved_memory {
-	m0_shmem: m0-shmem@3c00000 {
-		reg = <0x03c00000 0x100000>;
-		no-map;
-	};
-};
+/*
+ * PicoCalc audio (M0 delta-sigma or PWM) is configured via runtime device tree
+ * overlays. Apply one of:
+ *   - m0-audio overlay: picocalc,snd-m0 (default firmware path)
+ *   - pwm-audio overlay: fsl,picocalc-snd-pwm (hardware mod)
+ * See devicetree-overlays/m0-audio-overlay.dts and pwm-audio-overlay.dts.
+ */
