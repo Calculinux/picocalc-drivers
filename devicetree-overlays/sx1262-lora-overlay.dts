@@ -26,7 +26,7 @@
  * 
  * To apply this overlay at runtime:
  *   mkdir -p /sys/kernel/config/device-tree/overlays/sx1262
- *   cat /lib/firmware/overlays/sx1262-lora.dtbo > /sys/kernel/config/device-tree/overlays/sx1262/dtbo
+ *   cat /boot/devicetree/sx1262-lora.dtbo > /sys/kernel/config/device-tree/overlays/sx1262/dtbo
  *   echo 1 > /sys/kernel/config/device-tree/overlays/sx1262/status
  * 
  * To remove:

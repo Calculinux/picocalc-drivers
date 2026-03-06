@@ -39,7 +39,7 @@
  * 
  * To apply this overlay at runtime:
  *   mkdir -p /sys/kernel/config/device-tree/overlays/pcm5102a
- *   cat /lib/firmware/overlays/pcm5102a-i2s.dtbo > /sys/kernel/config/device-tree/overlays/pcm5102a/dtbo
+ *   cat /boot/devicetree/pcm5102a-i2s.dtbo > /sys/kernel/config/device-tree/overlays/pcm5102a/dtbo
  *   echo 1 > /sys/kernel/config/device-tree/overlays/pcm5102a/status
  * 
  * To remove:

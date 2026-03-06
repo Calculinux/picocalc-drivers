@@ -1,8 +1,6 @@
 /dts-v1/;
 /plugin/;
 
-#include <dt-bindings/pinctrl/rockchip.h>
-
 /*
  * Device tree overlay for u-blox NEO-M8N GPS module
  * 
@@ -26,7 +24,7 @@
  * 
  * To apply this overlay at runtime:
  *   mkdir -p /sys/kernel/config/device-tree/overlays/neo-m8n
- *   cat /lib/firmware/overlays/neo-m8n-gps.dtbo > /sys/kernel/config/device-tree/overlays/neo-m8n/dtbo
+ *   cat /boot/devicetree/neo-m8n-gps.dtbo > /sys/kernel/config/device-tree/overlays/neo-m8n/dtbo
  *   echo 1 > /sys/kernel/config/device-tree/overlays/neo-m8n/status
  * 
  * To remove:
