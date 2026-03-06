@@ -1,0 +1,44 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/*
+ * SX1262 LoRA overlay (runtime-friendly)
+ *
+ * This variant avoids adding a new rockchip-pinctrl group and does not reference
+ * pinctrl-0. It can be applied via ConfigFS at runtime, assuming the RMII1 test
+ * pad pins are already muxed as GPIOs by the base DTB.
+ *
+ * Use `sx1262-lora-overlay.dts` (sx1262-lora.dtbo) for the default persistent
+ * workflow where overlays are merged into the boot DTB/FIT for the next boot.
+ */
+
+/ {
+    compatible = "rockchip,rk3506";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            spi_lora: spi_lora {
+                compatible = "spi-gpio";
+                #address-cells = <1>;
+                #size-cells = <0>;
+                status = "okay";
+
+                /* GPIO3: B2=SCK(10), B5=MOSI(13), A6=MISO(6) */
+                sck-gpios = <&gpio3 RK_PB2 0>;
+                mosi-gpios = <&gpio3 RK_PB5 0>;
+                miso-gpios = <&gpio3 RK_PA6 0>;
+                num-chipselects = <0>;   /* CS tied to GND */
+
+                lora_spidev: spidev@0 {
+                    compatible = "rohm,dh2228fv";
+                    reg = <0>;
+                    spi-max-frequency = <2000000>;
+                };
+            };
+        };
+    };
+};
+
