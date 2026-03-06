@@ -8,17 +8,17 @@ menuconfig STAGING_PICOCALC
 
 if STAGING_PICOCALC
 
-source "drivers/staging/picocalc/picocalc_kbd/Kconfig"
-source "drivers/staging/picocalc/picocalc_lcd_fb/Kconfig"
-source "drivers/staging/picocalc/picocalc_lcd_drm/Kconfig"
-source "drivers/staging/picocalc/picocalc_snd-pwm/Kconfig"
-source "drivers/staging/picocalc/picocalc_snd-softpwm/Kconfig"
-source "drivers/staging/picocalc/picocalc_mfd/Kconfig"
-source "drivers/staging/picocalc/picocalc_mfd_bms/Kconfig"
-source "drivers/staging/picocalc/picocalc_mfd_bkl/Kconfig"
-source "drivers/staging/picocalc/picocalc_mfd_kbd/Kconfig"
-source "drivers/staging/picocalc/picocalc_mfd_led/Kconfig"
-source "drivers/staging/picocalc/picocalc_rk3506_rproc/Kconfig"
-source "drivers/staging/picocalc/picocalc_snd-m0/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_kbd/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_lcd_fb/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_lcd_drm/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_snd-pwm/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_snd-softpwm/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_mfd/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_mfd_bms/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_mfd_bkl/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_mfd_kbd/Kconfig"
+source "drivers/staging/picocalc/drivers/picocalc_mfd_led/Kconfig"
+source "drivers/staging/picocalc/luckfox-lyra/drivers/picocalc_rk3506_rproc/Kconfig"
+source "drivers/staging/picocalc/luckfox-lyra/drivers/picocalc_snd-m0/Kconfig"
 
 endif

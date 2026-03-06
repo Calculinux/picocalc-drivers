@@ -16,28 +16,28 @@
 #      that must come from the base DTB.
 #
 # Usage:
-#   ./scripts/extract-overlay-symbols.sh [overlay-dir]
+#   ./scripts/extract-overlay-symbols.sh [overlay-dir...]
 #
-# Default overlay-dir: devicetree-overlays  (relative to repo root)
+# Scans one or more overlay directories for *-overlay.dts files.
+# Default: overlays luckfox-lyra/overlays  (generic + Luckfox Lyra)
 # Output: stdout, one symbol per line.  Pipe to a file as needed.
 
 set -euo pipefail
 
-OVERLAY_DIR="${1:-devicetree-overlays}"
+OVERLAY_DIRS=("${@:-overlays luckfox-lyra/overlays}")
 
-if [ ! -d "${OVERLAY_DIR}" ]; then
-    echo "Error: overlay directory '${OVERLAY_DIR}' not found" >&2
-    exit 1
-fi
-
-# Gather overlay sources
+# Gather overlay sources from all directories
 OVERLAYS=()
-for f in "${OVERLAY_DIR}"/*-overlay.dts; do
-    [ -f "$f" ] && OVERLAYS+=("$f")
+for dir in "${OVERLAY_DIRS[@]}"; do
+    if [ -d "$dir" ]; then
+        for f in "$dir"/*-overlay.dts; do
+            [ -f "$f" ] && OVERLAYS+=("$f")
+        done
+    fi
 done
 
 if [ ${#OVERLAYS[@]} -eq 0 ]; then
-    echo "# No overlay DTS files found in ${OVERLAY_DIR}" >&2
+    echo "# No overlay DTS files found in ${OVERLAY_DIRS[*]}" >&2
     exit 0
 fi
 

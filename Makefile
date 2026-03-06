@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: GPL-2.0
 
-# List of driver subdirectories. Keep names in sync with repo layout.
-SUBDIRS := picocalc_kbd picocalc_lcd_fb picocalc_lcd_drm picocalc_snd-pwm picocalc_snd-softpwm \
-		   picocalc_mfd picocalc_mfd_bms picocalc_mfd_bkl picocalc_mfd_kbd picocalc_mfd_led \
-		   picocalc_rk3506_rproc picocalc_snd-m0
+# Generic drivers (any SBC) and Luckfox Lyra-specific drivers.
+# Keep names in sync with repo layout.
+SUBDIRS := drivers/picocalc_kbd drivers/picocalc_lcd_fb drivers/picocalc_lcd_drm \
+		   drivers/picocalc_snd-pwm drivers/picocalc_snd-softpwm \
+		   drivers/picocalc_mfd drivers/picocalc_mfd_bms drivers/picocalc_mfd_bkl \
+		   drivers/picocalc_mfd_kbd drivers/picocalc_mfd_led \
+		   luckfox-lyra/drivers/picocalc_rk3506_rproc luckfox-lyra/drivers/picocalc_snd-m0
 
-obj-$(CONFIG_PICOCALC_KBD)     += picocalc_kbd/
-obj-$(CONFIG_PICOCALC_LCD_FB)  += picocalc_lcd_fb/
-obj-$(CONFIG_PICOCALC_LCD_DRM) += picocalc_lcd_drm/
-obj-$(CONFIG_PICOCALC_SND_PWM)     += picocalc_snd-pwm/
-obj-$(CONFIG_PICOCALC_SND_SOFT_PWM)     += picocalc_snd-softpwm/
-obj-$(CONFIG_PICOCALC_MFD)     += picocalc_mfd/
-obj-$(CONFIG_PICOCALC_MFD_BMS)     += picocalc_mfd_bms/
-obj-$(CONFIG_PICOCALC_MFD_BKL)     += picocalc_mfd_bkl/
-obj-$(CONFIG_PICOCALC_MFD_KBD)     += picocalc_mfd_kbd/
-obj-$(CONFIG_PICOCALC_MFD_LED)     += picocalc_mfd_led/
-obj-$(CONFIG_PICOCALC_RK3506_RPROC) += picocalc_rk3506_rproc/
-obj-$(CONFIG_PICOCALC_SND_M0)   += picocalc_snd-m0/
+obj-$(CONFIG_PICOCALC_KBD)     += drivers/picocalc_kbd/
+obj-$(CONFIG_PICOCALC_LCD_FB)  += drivers/picocalc_lcd_fb/
+obj-$(CONFIG_PICOCALC_LCD_DRM) += drivers/picocalc_lcd_drm/
+obj-$(CONFIG_PICOCALC_SND_PWM)     += drivers/picocalc_snd-pwm/
+obj-$(CONFIG_PICOCALC_SND_SOFT_PWM)     += drivers/picocalc_snd-softpwm/
+obj-$(CONFIG_PICOCALC_MFD)     += drivers/picocalc_mfd/
+obj-$(CONFIG_PICOCALC_MFD_BMS)     += drivers/picocalc_mfd_bms/
+obj-$(CONFIG_PICOCALC_MFD_BKL)     += drivers/picocalc_mfd_bkl/
+obj-$(CONFIG_PICOCALC_MFD_KBD)     += drivers/picocalc_mfd_kbd/
+obj-$(CONFIG_PICOCALC_MFD_LED)     += drivers/picocalc_mfd_led/
+obj-$(CONFIG_PICOCALC_RK3506_RPROC) += luckfox-lyra/drivers/picocalc_rk3506_rproc/
+obj-$(CONFIG_PICOCALC_SND_M0)   += luckfox-lyra/drivers/picocalc_snd-m0/
 
 # Kernel build targets
 # Allow overriding KERNEL_SRC from the environment/recipe (e.g. KSRC)
@@ -45,15 +48,16 @@ install:
 	done
 
 # --- Device tree overlay symbol whitelist ---
-# Scans all *-overlay.dts files, extracts the base-DTB phandle labels they
-# reference, and writes them to overlay-symbols.txt.  The Yocto kernel recipe
-# reads this file to inject only the needed __symbols__ into the DTB.
+# Scans all *-overlay.dts files (generic + luckfox-lyra), extracts the base-DTB
+# phandle labels they reference, and writes them to overlay-symbols.txt.
+# The Yocto kernel recipe reads this file to inject only the needed __symbols__ into the DTB.
 
-OVERLAY_SYMBOLS_FILE := devicetree-overlays/overlay-symbols.txt
+OVERLAY_SYMBOLS_FILE := overlays/overlay-symbols.txt
+OVERLAY_DIRS := overlays luckfox-lyra/overlays
 
-overlay-symbols: $(wildcard devicetree-overlays/*-overlay.dts) scripts/extract-overlay-symbols.sh
+overlay-symbols: scripts/extract-overlay-symbols.sh
 	@echo "Extracting overlay symbols..."
-	@./scripts/extract-overlay-symbols.sh > $(OVERLAY_SYMBOLS_FILE).tmp
+	@./scripts/extract-overlay-symbols.sh $(OVERLAY_DIRS) > $(OVERLAY_SYMBOLS_FILE).tmp
 	@if ! cmp -s $(OVERLAY_SYMBOLS_FILE).tmp $(OVERLAY_SYMBOLS_FILE) 2>/dev/null; then \
 		mv $(OVERLAY_SYMBOLS_FILE).tmp $(OVERLAY_SYMBOLS_FILE); \
 		echo "Updated $(OVERLAY_SYMBOLS_FILE)"; \

@@ -4,6 +4,12 @@
 
    For Yocto/OpenEmbedded consumption and BitBake recipes, see the `meta-picocalc-drivers` or `meta-calculinux` repositories which contain recipes that can fetch and package these sources for images.
 
+   ## Repository layout
+
+   - **`drivers/`** – Generic drivers applicable to any SBC used with PicoCalc (MFD, keyboard, LCD, sound, etc.).
+   - **`overlays/`** – Generic device tree overlays (e.g. 100 kHz I2C, DS3231 RTC).
+   - **`luckfox-lyra/`** – Luckfox Lyra–specific drivers, firmware, overlays, and device tree sources.
+
    What this repo contains
    - A top-level Makefile that can build all drivers against a kernel source (`KERNEL_SRC` / `KSRC`).
    - Subdirectories for individual drivers (MFD core and sub-drivers, legacy keyboard, LCD, sound drivers, etc.).
@@ -28,10 +34,10 @@
    Device tree / runtime notes
    - The drivers support both a legacy keyboard driver and a new MFD-based keyboard. These can be installed simultaneously; the device tree 'compatible' strings and driver probe order control which driver binds at runtime.
    - The MFD core driver populates child platform devices for sub-drivers (keyboard, backlight, BMS, LED).
-   - Device tree source-of-truth lives in this repo. Linux files are prefixed `linux-` and U-Boot files are prefixed `uboot-`.
-      - Linux: `linux-rk3506-luckfox-lyra.dtsi`, `linux-rk3506g-luckfox-lyra.dts`
-      - U-Boot: `uboot-rk3506-luckfox.dtsi`, `uboot-rk3506-luckfox.dts`
-      The Yocto `picocalc-devicetree` recipe installs these into the sysroot using the historical filenames (no prefixes), so kernel/U-Boot recipes do not need to change.
+   - Device tree source-of-truth lives in this repo. Luckfox Lyra–specific Linux and U-Boot DTS files are under `luckfox-lyra/`:
+      - Linux: `luckfox-lyra/linux-rk3506-luckfox-lyra.dtsi`, `luckfox-lyra/linux-rk3506g-luckfox-lyra.dts`
+      - U-Boot: `luckfox-lyra/uboot-rk3506-luckfox.dtsi`, `luckfox-lyra/uboot-rk3506-luckfox.dts`
+      The Yocto `picocalc-devicetree` recipe installs these into the sysroot for the Luckfox Lyra platform.
 
    Contributing
    - Keep each driver in its own subdirectory with a small `Makefile`/Kbuild fragment if needed (see existing subdirs).
