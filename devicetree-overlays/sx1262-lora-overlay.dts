@@ -5,33 +5,28 @@
 
 /*
  * Device tree overlay for Waveshare SX1262HF LoRA module
- * 
- * This overlay configures GPIO pins for bitbang SPI communication with
- * the SX1262 LoRA transceiver module on the RMII1 test pads.
- * 
+ *
+ * Uses the kernel spi-gpio (bitbang) driver to create a /dev/spidevX.Y
+ * that meshtasticd uses for the SX1262. CS is tied to GND; Busy/IRQ/Reset
+ * are controlled via GPIO by meshtasticd (see meshtasticd config).
+ *
  * Pin Assignment (RMII1 test pads):
- *   GPIO3_B2 (Pin 30) → CLK  (UART5_CTSN - CTS not needed for GPS)
- *   GPIO3_B5 (Pin 27) → MOSI (UART5_RTSN - RTS not needed for GPS)
- *   GPIO3_A6 (Pin 34) → MISO (SAI2_SDI_M0 - non-UART pin)
- *   GPIO3_B6 (Pin 26) → DIO1 (Interrupt - SAI2_MCLK)
- *   GPIO1_D0 (Pin 115)→ BUSY (Module status - VO_LCDC_D3)
- *   GND                → CS   (Chip Select - tied permanently)
- *   3.3V+10kΩ         → RESET (Tied HIGH - no pin needed)
- * 
- * Note: UART5_TX (GPIO3_B4) and UART5_RX (GPIO3_B3) are preserved
- * for future GPS module connection.
- * 
- * The SX1262 module is controlled via software SPI (GPIO bitbang) at 2 MHz,
- * which is fast enough for LoRA communication.
- * 
- * To apply this overlay at runtime:
+ *   GPIO3_B2 → CLK   (spi-gpio SCK)
+ *   GPIO3_B5 → MOSI  (spi-gpio MOSI)
+ *   GPIO3_A6 → MISO  (spi-gpio MISO)
+ *   GPIO3_B6 → DIO1/IRQ (GPIO - meshtasticd)
+ *   GPIO1_D0 → BUSY  (GPIO - meshtasticd)
+ *   GND      → CS    (tied permanently)
+ *   3.3V+10kΩ→ RESET (tied HIGH)
+ *
+ * UART5_TX/RX (GPIO3_B4/B3) are preserved for GPS.
+ *
+ * To apply at runtime:
  *   mkdir -p /sys/kernel/config/device-tree/overlays/sx1262
  *   cat /boot/devicetree/sx1262-lora.dtbo > /sys/kernel/config/device-tree/overlays/sx1262/dtbo
  *   echo 1 > /sys/kernel/config/device-tree/overlays/sx1262/status
- * 
- * To remove:
- *   echo 0 > /sys/kernel/config/device-tree/overlays/sx1262/status
- *   rmdir /sys/kernel/config/device-tree/overlays/sx1262
+ *
+ * After load, use the spidev device in meshtasticd config, e.g. spidev2.0
  */
 
 / {
@@ -40,43 +35,65 @@
     fragment@0 {
         target-path = "/";
         __overlay__ {
-            /* LoRA device node for Meshtastic */
-            sx1262_lora: lora {
-                compatible = "semtech,sx1262";
+            /* spi-gpio bitbang SPI for SX1262; creates /dev/spidevX.Y */
+            spi_lora: spi_lora {
+                compatible = "spi-gpio";
+                #address-cells = <1>;
+                #size-cells = <0>;
                 status = "okay";
-                
-                /* SPI bitbang configuration - handled by Meshtastic daemon */
-                spi_speed = <2000000>; /* 2 MHz */
-                
-                /* GPIO pin assignments for Meshtastic meshtasticd daemon */
-                /* These are exposed for user-space control */
+
+                /*
+                 * Pinmux/pulls are set via pinctrl.
+                 *
+                 * IMPORTANT: on this Rockchip kernel, pinctrl groups added via
+                 * runtime ConfigFS overlay loading are not available to the
+                 * pinctrl driver at probe time. This overlay is intended to be
+                 * applied at boot by merging into the boot DTB/FIT.
+                 */
+                pinctrl-names = "default";
+                pinctrl-0 = <&sx1262_pins>;
+
+                /* GPIO3: B2=SCK(10), B5=MOSI(13), A6=MISO(6) */
+                sck-gpios = <&gpio3 RK_PB2 0>;
+                mosi-gpios = <&gpio3 RK_PB5 0>;
+                miso-gpios = <&gpio3 RK_PA6 0>;
+                num-chipselects = <0>;   /* CS tied to GND */
+
+                /* Child so spidev binds; meshtasticd opens this device */
+                lora_spidev: spidev@0 {
+                    compatible = "rohm,dh2228fv";
+                    reg = <0>;
+                    spi-max-frequency = <2000000>;
+                };
             };
         };
     };
 
-    /* Pin configuration for LoRA SPI and control signals */
+    /*
+     * Pin configuration for LoRA SPI and control signals.
+     * Wrapped in a function node (sx1262) to match rk3506 pinctrl layout:
+     *   &pinctrl { <function> { <group> { rockchip,pins = ... } } }
+     */
     fragment@1 {
         target = <&pinctrl>;
         __overlay__ {
-            sx1262_pins: sx1262-pins {
-                /*
-                 * Pin macros (RK_PB2, RK_PB5, RK_PA6, RK_PB6, RK_PD0, RK_FUNC_GPIO)
-                 * come from dt-bindings/pinctrl/rockchip.h and require CPP
-                 * preprocessing before dtc.
-                 *
-                 * Format: <bank RK_Pxy RK_FUNC_GPIO &pull_config>
-                 */
-                rockchip,pins =
-                    /* SPI Clock - UART5_CTSN */
-                    <3 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>,
-                    /* SPI MOSI - UART5_RTSN */
-                    <3 RK_PB5 RK_FUNC_GPIO &pcfg_pull_none>,
-                    /* SPI MISO - SAI2_SDI_M0 */
-                    <3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>,
-                    /* DIO1 - Interrupt input (pull-down for edge detection) */
-                    <3 RK_PB6 RK_FUNC_GPIO &pcfg_pull_down>,
-                    /* BUSY - Status input */
-                    <1 RK_PD0 RK_FUNC_GPIO &pcfg_pull_down>;
+            sx1262 {
+                sx1262_pins: sx1262-pins {
+                    /*
+                     * Format: <bank RK_Pxy RK_FUNC_GPIO &pull_config>
+                     */
+                    rockchip,pins =
+                        /* SPI Clock - UART5_CTSN */
+                        <3 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>,
+                        /* SPI MOSI - UART5_RTSN */
+                        <3 RK_PB5 RK_FUNC_GPIO &pcfg_pull_none>,
+                        /* SPI MISO - SAI2_SDI_M0 */
+                        <3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>,
+                        /* DIO1 - Interrupt input */
+                        <3 RK_PB6 RK_FUNC_GPIO &pcfg_pull_down>,
+                        /* BUSY - Status input */
+                        <1 RK_PD0 RK_FUNC_GPIO &pcfg_pull_down>;
+                };
             };
         };
     };

@@ -1,0 +1,8 @@
+gpio3
+i2c2
+pcfg_pull_down
+pcfg_pull_none
+pinctrl
+sai2
+uart5
+uart5m0_xfer

@@ -40,3 +40,23 @@ install:
 			$(MAKE) -C $(KERNEL_SRC) M=$(PWD)/$$d modules_install; \
 		fi; \
 	done
+
+# --- Device tree overlay symbol whitelist ---
+# Scans all *-overlay.dts files, extracts the base-DTB phandle labels they
+# reference, and writes them to overlay-symbols.txt.  The Yocto kernel recipe
+# reads this file to inject only the needed __symbols__ into the DTB.
+
+OVERLAY_SYMBOLS_FILE := devicetree-overlays/overlay-symbols.txt
+
+overlay-symbols: $(wildcard devicetree-overlays/*-overlay.dts) scripts/extract-overlay-symbols.sh
+	@echo "Extracting overlay symbols..."
+	@./scripts/extract-overlay-symbols.sh > $(OVERLAY_SYMBOLS_FILE).tmp
+	@if ! cmp -s $(OVERLAY_SYMBOLS_FILE).tmp $(OVERLAY_SYMBOLS_FILE) 2>/dev/null; then \
+		mv $(OVERLAY_SYMBOLS_FILE).tmp $(OVERLAY_SYMBOLS_FILE); \
+		echo "Updated $(OVERLAY_SYMBOLS_FILE)"; \
+	else \
+		rm -f $(OVERLAY_SYMBOLS_FILE).tmp; \
+		echo "$(OVERLAY_SYMBOLS_FILE) is up to date"; \
+	fi
+
+.PHONY: all clean install overlay-symbols

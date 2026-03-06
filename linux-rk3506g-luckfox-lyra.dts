@@ -5,7 +5,7 @@
 
 /dts-v1/;
 
-#include "rk3506-luckfox-lyra.dtsi";
+#include "rk3506-luckfox-lyra.dtsi"
 
 / {
 	model = "Luckfox Lyra";

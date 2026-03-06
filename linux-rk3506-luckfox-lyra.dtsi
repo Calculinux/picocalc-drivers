@@ -6,7 +6,7 @@
 /dts-v1/;
 
 #include "rk3506.dtsi"
-#include "picocalc-luckfox-lyra.dtsi";
+#include "picocalc-luckfox-lyra.dtsi"
 
 / {
 	adc_keys: adc-keys {
