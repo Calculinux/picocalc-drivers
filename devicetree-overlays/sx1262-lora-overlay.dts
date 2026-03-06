@@ -42,6 +42,14 @@
                 #size-cells = <0>;
                 status = "okay";
 
+                /*
+                 * Pinmux/pulls are set via pinctrl.
+                 *
+                 * IMPORTANT: on this Rockchip kernel, pinctrl groups added via
+                 * runtime ConfigFS overlay loading are not available to the
+                 * pinctrl driver at probe time. This overlay is intended to be
+                 * applied at boot by merging into the boot DTB/FIT.
+                 */
                 pinctrl-names = "default";
                 pinctrl-0 = <&sx1262_pins>;
 
@@ -63,9 +71,8 @@
 
     /*
      * Pin configuration for LoRA SPI and control signals.
-     * Wrapped in a function node (sx1262) to match base DTS layout so
-     * rockchip-pinctrl parses it. With the kernel patch that re-parses
-     * pinctrl on overlay apply, this takes effect at runtime.
+     * Wrapped in a function node (sx1262) to match rk3506 pinctrl layout:
+     *   &pinctrl { <function> { <group> { rockchip,pins = ... } } }
      */
     fragment@1 {
         target = <&pinctrl>;
@@ -73,10 +80,6 @@
             sx1262 {
                 sx1262_pins: sx1262-pins {
                     /*
-                     * Pin macros (RK_PB2, RK_PB5, RK_PA6, RK_PB6, RK_PD0, RK_FUNC_GPIO)
-                     * come from dt-bindings/pinctrl/rockchip.h and require CPP
-                     * preprocessing before dtc.
-                     *
                      * Format: <bank RK_Pxy RK_FUNC_GPIO &pull_config>
                      */
                     rockchip,pins =
@@ -86,7 +89,7 @@
                         <3 RK_PB5 RK_FUNC_GPIO &pcfg_pull_none>,
                         /* SPI MISO - SAI2_SDI_M0 */
                         <3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>,
-                        /* DIO1 - Interrupt input (pull-down for edge detection) */
+                        /* DIO1 - Interrupt input */
                         <3 RK_PB6 RK_FUNC_GPIO &pcfg_pull_down>,
                         /* BUSY - Status input */
                         <1 RK_PD0 RK_FUNC_GPIO &pcfg_pull_down>;
