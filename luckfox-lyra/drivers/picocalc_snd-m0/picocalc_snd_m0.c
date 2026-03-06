@@ -263,8 +263,12 @@ static int m0_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
-		if (!m->running)
-			break;
+		if (!m->running) {
+			/* Cancel any pending start_work so it cannot boot M0 later */
+			spin_unlock_irqrestore(&m->lock, flags);
+			cancel_work_sync(&m->start_work);
+			return 0;
+		}
 		m->running = false;
 		hrtimer_cancel(&m->timer);
 		m->shmem->ctrl = M0_CTRL_STOP;
