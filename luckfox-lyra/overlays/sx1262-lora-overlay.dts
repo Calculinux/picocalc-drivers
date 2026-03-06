@@ -1,0 +1,100 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/*
+ * Device tree overlay for Waveshare SX1262HF LoRA module
+ *
+ * Uses the kernel spi-gpio (bitbang) driver to create a /dev/spidevX.Y
+ * that meshtasticd uses for the SX1262. CS is tied to GND; Busy/IRQ/Reset
+ * are controlled via GPIO by meshtasticd (see meshtasticd config).
+ *
+ * Pin Assignment (RMII1 test pads):
+ *   GPIO3_B2 → CLK   (spi-gpio SCK)
+ *   GPIO3_B5 → MOSI  (spi-gpio MOSI)
+ *   GPIO3_A6 → MISO  (spi-gpio MISO)
+ *   GPIO3_B6 → DIO1/IRQ (GPIO - meshtasticd)
+ *   GPIO1_D0 → BUSY  (GPIO - meshtasticd)
+ *   GND      → CS    (tied permanently)
+ *   3.3V+10kΩ→ RESET (tied HIGH)
+ *
+ * UART5_TX/RX (GPIO3_B4/B3) are preserved for GPS.
+ *
+ * To apply at runtime:
+ *   mkdir -p /sys/kernel/config/device-tree/overlays/sx1262
+ *   cat /boot/devicetree/sx1262-lora.dtbo > /sys/kernel/config/device-tree/overlays/sx1262/dtbo
+ *   echo 1 > /sys/kernel/config/device-tree/overlays/sx1262/status
+ *
+ * After load, use the spidev device in meshtasticd config, e.g. spidev2.0
+ */
+
+/ {
+    compatible = "rockchip,rk3506";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            /* spi-gpio bitbang SPI for SX1262; creates /dev/spidevX.Y */
+            spi_lora: spi_lora {
+                compatible = "spi-gpio";
+                #address-cells = <1>;
+                #size-cells = <0>;
+                status = "okay";
+
+                /*
+                 * Pinmux/pulls are set via pinctrl.
+                 *
+                 * IMPORTANT: on this Rockchip kernel, pinctrl groups added via
+                 * runtime ConfigFS overlay loading are not available to the
+                 * pinctrl driver at probe time. This overlay is intended to be
+                 * applied at boot by merging into the boot DTB/FIT.
+                 */
+                pinctrl-names = "default";
+                pinctrl-0 = <&sx1262_pins>;
+
+                /* GPIO3: B2=SCK(10), B5=MOSI(13), A6=MISO(6) */
+                sck-gpios = <&gpio3 RK_PB2 0>;
+                mosi-gpios = <&gpio3 RK_PB5 0>;
+                miso-gpios = <&gpio3 RK_PA6 0>;
+                num-chipselects = <0>;   /* CS tied to GND */
+
+                /* Child so spidev binds; meshtasticd opens this device */
+                lora_spidev: spidev@0 {
+                    compatible = "rohm,dh2228fv";
+                    reg = <0>;
+                    spi-max-frequency = <2000000>;
+                };
+            };
+        };
+    };
+
+    /*
+     * Pin configuration for LoRA SPI and control signals.
+     * Wrapped in a function node (sx1262) to match rk3506 pinctrl layout:
+     *   &pinctrl { <function> { <group> { rockchip,pins = ... } } }
+     */
+    fragment@1 {
+        target = <&pinctrl>;
+        __overlay__ {
+            sx1262 {
+                sx1262_pins: sx1262-pins {
+                    /*
+                     * Format: <bank RK_Pxy RK_FUNC_GPIO &pull_config>
+                     */
+                    rockchip,pins =
+                        /* SPI Clock - UART5_CTSN */
+                        <3 RK_PB2 RK_FUNC_GPIO &pcfg_pull_none>,
+                        /* SPI MOSI - UART5_RTSN */
+                        <3 RK_PB5 RK_FUNC_GPIO &pcfg_pull_none>,
+                        /* SPI MISO - SAI2_SDI_M0 */
+                        <3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>,
+                        /* DIO1 - Interrupt input */
+                        <3 RK_PB6 RK_FUNC_GPIO &pcfg_pull_down>,
+                        /* BUSY - Status input */
+                        <1 RK_PD0 RK_FUNC_GPIO &pcfg_pull_down>;
+                };
+            };
+        };
+    };
+};

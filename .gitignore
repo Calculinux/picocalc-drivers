@@ -12,6 +12,10 @@ oe-workdir
 modules.order
 Module.symvers
 
+# M0 firmware build artifacts
+*.elf
+*.o
+
 # Kernel build directories and files
 *.markers
 *.order

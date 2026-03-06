@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-2.0
+config PICOCALC_RK3506_RPROC
+	tristate "RK3506 Cortex-M0 remoteproc support"
+	depends on REMOTEPROC && (ARM || ARM64)
+	help
+	  Say M here to build the remoteproc driver for the RK3506 Cortex-M0
+	  core. Required for M0-based audio (picocalc,snd-m0). Port of
+	  nvitya/rk3506-mcu with ELF boot address support for 0xFFF88000.

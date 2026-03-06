@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0
+config PICOCALC_SND_M0
+	tristate "PicoCalc M0 delta-sigma audio support"
+	depends on STAGING_PICOCALC && REMOTEPROC
+	help
+	  Say M here for M0-driven delta-sigma audio on GPIO4_B2/B3 (same pins
+	  as softpwm). Requires rk3506_rproc and rk3506-m0-audio.elf firmware.
