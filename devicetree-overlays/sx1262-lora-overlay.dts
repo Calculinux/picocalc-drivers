@@ -23,7 +23,7 @@
  *
  * To apply at runtime:
  *   mkdir -p /sys/kernel/config/device-tree/overlays/sx1262
- *   cat /lib/firmware/overlays/sx1262-lora.dtbo > /sys/kernel/config/device-tree/overlays/sx1262/dtbo
+ *   cat /boot/devicetree/sx1262-lora.dtbo > /sys/kernel/config/device-tree/overlays/sx1262/dtbo
  *   echo 1 > /sys/kernel/config/device-tree/overlays/sx1262/status
  *
  * After load, use the spidev device in meshtasticd config, e.g. spidev2.0
