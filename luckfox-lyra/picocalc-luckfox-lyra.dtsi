@@ -99,7 +99,7 @@
 	ili9488: ili9488@0 {
 		status = "okay";
 		compatible = "picocalc,spilcd", "ilitek,ili9488";
-		spi-max-frequency = <80000000>;
+		spi-max-frequency = <100000000>;
 		reg = <0>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&ili9488_pins>;
