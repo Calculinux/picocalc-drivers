@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Run the PicoCalc ILI9488 LCD at up to 100 MHz SPI instead of 80 MHz.
+ *
+ * clk_spi0 is 187.5 MHz and the Rockchip SPI divider is even-only, so an
+ * 80 MHz request lands on /4 = 46.875 MHz; 100 MHz selects /2 = 93.75 MHz.
+ * Measured with modetest: ~28 -> ~49 full frames/s (~20 ms per frame).
+ *
+ * This is ~1.9x Rockchip's documented 50 MHz sclk_out limit, so it is
+ * opt-in. It needs a kernel whose spi-rockchip MAX_SCLK_OUT is above
+ * 50 MHz; otherwise the request is clamped and nothing changes.
+ *
+ * Apply at boot (device-tree-overlays.conf). A ConfigFS apply has no
+ * effect: the LCD driver is already bound and reads its speed at probe.
+ */
+&spi0 {
+	ili9488@0 {
+		spi-max-frequency = <100000000>;
+	};
+};

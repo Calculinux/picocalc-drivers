@@ -13,5 +13,6 @@ rm_io12_pwm0_ch0
 rm_io13_pwm0_ch1
 sai2
 snd_pins
+spi0
 uart5
 uart5m0_xfer
