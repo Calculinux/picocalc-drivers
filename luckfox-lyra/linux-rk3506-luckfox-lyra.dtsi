@@ -106,6 +106,20 @@
 	status = "disabled";
 };
 
+/*
+ * Vendor/kernel knob (not an upstream arm-pl330 binding). Without CMA
+ * the ili9488 fb is non-contiguous; SPI DMA SG lists overflow the
+ * kernel's default PL330 microcode buffer. Scroll blits failed with
+ * "Try increasing mcbufsz (279/256)".
+ */
+&dmac0 {
+	arm,pl330-mcbufsz-bytes = <2048>;
+};
+
+&dmac1 {
+	arm,pl330-mcbufsz-bytes = <2048>;
+};
+
 /**********graphics**********/
 &vop {
 	status = "okay";
