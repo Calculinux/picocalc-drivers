@@ -1,350 +1,462 @@
-# PicoCalc keyboard: interrupt-delivery evaluation
+# PicoCalc keyboard: interrupt-delivery evaluation & plan
 
-Status: research/evaluation — no code changes in this document.
-Date: 2026-09-30. Line numbers below refer to `main` at `cf9f01a` unless noted.
+Status: research/evaluation + agreed plan — no code changes in this document.
+Revised: 2026-09-30 (v2: adds UART/USB switch topology, compat-mode and
+firmware-update plan). Line numbers refer to `main` at `cf9f01a` unless noted.
 
-Goal of this document: capture everything learned while evaluating a move from the
-current 128 Hz I²C-poll keyboard pipeline to interrupt-driven event delivery, across
-all three layers — the Linux drivers (this repo), the PicoCalc mainboard hardware,
-and the two available STM32 keyboard firmwares. Everything here is intended to be
-reusable for whoever implements the change.
+Goal of this document: capture everything learned while evaluating a move from
+the current 128 Hz I²C-poll keyboard pipeline to interrupt-driven event
+delivery — across the Linux drivers (this repo), the PicoCalc mainboard
+hardware, and the two STM32 keyboard firmwares — plus the agreed plan to
+implement it seamlessly (no DIP switches, no case opening, after a one-time
+first install). Everything here should be reusable by whoever implements.
 
 Legend: **[verified]** = traced to source/schematic with citation,
-**[assumed]** = inferred, worth confirming, **[open]** = unresolved, blocking or
-informative.
+**[assumed]** = inferred, worth confirming, **[open]** = unresolved.
 
 ## 1. Current Linux-side architecture (this repo)
 
-The MFD keyboard driver (`drivers/picocalc_mfd_kbd/picocalc_mfd_kbd.c`) runs a fixed
-pipeline:
+The MFD keyboard driver (`drivers/picocalc_mfd_kbd/picocalc_mfd_kbd.c`) runs a
+fixed pipeline:
 
-- Soft timer at `HZ/128` (≈7.8125 ms → 128 Hz), `kbd_timer_function()` **L577-582**.
-  Each expiry `schedule_work`s on `g_ctx->work_struct`.
+- Soft timer at `HZ/128` (≈7.8125 ms → 128 Hz), `kbd_timer_function()`
+  **L577-582**. Each expiry `schedule_work`s on `g_ctx->work_struct`.
 - `input_workqueue_handler()` (**L515**) drains the device FIFO via
   `input_fw_read_fifo()` (**L225-277**): repeated 2-byte `regmap_bulk_read` of
-  `REG_ID_FIF (0x09)` until a zero terminator; up to `KBD_FIFO_SIZE` (31) items.
-- Each FIFO item → `key_report_event()` (**L279**), which maps HID scancodes to
-  Linux keycodes and implements shift tracking, the dual-shift mouse-mode toggle,
-  mouse direction-flag tracking, and second-key (F6..F10, Break/Home/End/PageUp/
-  PageDown/Ins) emulation.
+  `REG_ID_FIF (0x09)` until a zero terminator; up to 31 items.
+- Each FIFO item → `key_report_event()` (**L279**): scancode→keycode mapping,
+  shift tracking, dual-shift mouse-mode toggle, mouse direction flags,
+  second-key emulation (F6..F10, Break/Home/End/PageUp/PageDown/Ins).
 - **Idle cost: ~128 I²C transactions/sec + 128 SoC wakeups/sec, permanently.**
 
-Hidden coupling — the mouse-mode repeat engine rides on the 128 Hz heartbeat:
-while `mouse_move_dir` is armed and `mouse_mode` is on, *every* tick emits
-`REL_X/REL_Y` with a 1×/2×/4× hold-duration ramp (**L529-561**). Any redesign that
-decouples event intake from the heartbeat must re-home this repeater or mouse mode
-loses its cadence.
+Hidden coupling: the mouse-mode repeat engine rides on the 128 Hz heartbeat —
+while `mouse_move_dir` is armed and `mouse_mode` is on, every tick emits
+`REL_X/REL_Y` with a 1×/2×/4× hold ramp (**L529-561**). Any redesign that
+decouples event intake from the heartbeat must re-home this repeater (a
+repeating `delayed_work` at the current ~7.8 ms period, armed by
+`mouse_move_dir`) or mouse mode loses its cadence. This refactor is shared by
+every option below.
 
 Known debt touched by this topic:
 
-- File-global `g_ctx` and `DEFINE_TIMER(g_kbd_timer)` (**L575, L613, L727**) —
-  single-instance assumptions, awkward for IRQ descriptor ownership.
+- File-global `g_ctx` and `DEFINE_TIMER(g_kbd_timer)` (**L575, L613, L727**).
 - Dead IRQ scaffolding already written but disabled:
   - `devm_request_threaded_irq(&i2c_client->dev, i2c_client->irq, NULL,
-    input_irq_handler, IRQF_SHARED | IRQF_ONESHOT, …)` — **L680-703** (references a
-    handler that no longer exists).
+    input_irq_handler, IRQF_SHARED | IRQF_ONESHOT, …)` — **L680-703** (references
+    a handler that no longer exists).
   - `kbd_write_i2c_u8(ctx, REG_ID_INT, 0)` after drain — "clear client interrupt
     flag", **L568-572**.
-  The drain code itself is thread-safe (no locking; already used from workqueue
-  context), so a threaded IRQ handler can reuse `input_fw_read_fifo()` and
+  The drain code is thread-safe (no locking; already used from workqueue
+  context), so a threaded IRQ handler can reuse `input_fw_read_fifo()` /
   `key_report_event()` verbatim.
-- `luckfox-lyra/picocalc-luckfox-lyra.dtsi`: the `picocalc-mfd@1f` node has **no
-  `interrupts`/`irq-gpios` property**; pinctrl reserves Lyra 31/32 (GPIO4_B2/B3)
-  for M0 audio and RM_IO12/13 for the PWM-audio overlay — both are spoken for.
+- `luckfox-lyra/picocalc-luckfox-lyra.dtsi`: `picocalc-mfd@1f` has **no
+  `interrupts`/`irq-gpios`**; Lyra 31/32 (GPIO4_B2/B3) reserved for M0 audio,
+  RM_IO12/13 for the PWM-audio overlay — both spoken for.
+- Legacy `drivers/picocalc_kbd/` flavor is architecturally identical (same
+  FIFO protocol, same workqueue/timer) and inherits any shared refactor.
 
-The legacy `drivers/picocalc_kbd/` flavor is architecturally identical (same FIFO
-protocol, same workqueue/timer shape) and would inherit any shared refactor.
+## 2. Mainboard hardware: the complete UART/USB picture
 
-## 2. The mainboard hardware (what can carry an IRQ)
+Sources: `clockwork_Mainboard_V2.0_Schematic.pdf` (sheet 1/1), the annotated
+J701/U701/U702/U703 region provided by the maintainer, and the Calculinux
+device trees.
 
-Source: `clockwork_Mainboard_V2.0_Schematic.pdf` (sheet 1 of 1, "clockwork
-Mainboard V2.0", 2024-12-20) in
-`https://github.com/clockworkpi/PicoCalc`.
+The keyboard MCU is an **STM32F103R8T6**, I²C slave at 0x1F.
 
-The keyboard MCU is an **STM32F103R8T6** (CKS32F103Rx), I²C slave at 0x1F. Full
-audit of its external nets **[verified]**:
+### 2.1 The MCU serial/USB paths
 
-| Net (MCU side) | MCU pin | Role |
+**[verified]** The Type-C port (J701) is a **sink** (CC1/CC2 pulldowns
+R701/R702, 5.1 kΩ) and powers the board. Two DIP-switched multiplexers
+(WAS7227 SPDT, selectors from SW701) define all connectivity:
+
+| Switch | Selector | Position A (assumed factory) | Position B |
+|---|---|---|---|
+| U701 | `SEL2` | Type-C D± → **CH340C** USB | Type-C D± → `M_USB_DP/DM` (STM32 PA11/PA12 native USB) |
+| U703 | `SEL1` | CH340C TxD/RxD → **Lyra `UART0` pair** (console) | CH340C TxD/RxD → **MCU flashing/debug UART** (USART1, PA9/PA10 net, a.k.a. "UART1") |
+
+Consequences:
+
+- The **console path is passive hardware**: Type-C → CH340C → (SEL1=A) → Lyra
+  uart0. This is where U-Boot `stdout-path = &uart0`
+  (`uboot-rk3506-luckfox.dtsi`) and kernel `earlycon` land. The keyboard MCU
+  is *not* in this path; stock firmware does no "USB forwarding". This path is
+  sacrosanct — nothing in this plan may disturb it. SEL1's factory position
+  (A) is **[open: verify]**.
+- **MCU flashing** (STM32 ROM bootloader, USART1-only) is reachable only via
+  SEL1=B + CH340C + USB — i.e., the DIP switch + case access in the BIOS
+  README. No other path reaches PA9/PA10.
+- The **STM32's native USB** (PA11/PA12) is live but only behind SEL2=B —
+  a USB-based transport is *possible but switch-gated*; judged moot for
+  production (§8 option C).
+
+**[verified]** There is a **third, un-switched path**: the Lyra's **UART1
+pair** → mainboard net `M_UART3_RX` → **MCU pin PC10** (and `M_UART3_TX` →
+PC9), straight to the connector with no DIP selector. Notes:
+
+- PC9 is consumed as the **AXP2101 PMU interrupt input** by *both* firmware
+  trees, so only the PC10 leg is practically usable.
+- In the BIOS, **PC10 is the `PICO_IRQ` output** (§4). In stock firmware PC10
+  is unowned (floating input).
+- **[open — the single remaining hardware unknown]** which **Lyra GPIO balls**
+  the M_UART3 pair terminates on. Must be measured (continuity from connector
+  socket → Lyra pins); not provable from the schematic text available.
+
+### 2.2 Inventory of MCU external nets
+
+| Net (MCU side) | MCU pin | Role / destination |
 |---|---|---|
-| `M_I2C1_SDA` / `M_I2C1_SCL` | PD0/PD1 area | Keyboard I²C bus → mainboard ("I2C1") |
-| `M_I2C2_SDA` / `M_I2C2_SCL` | PB11/PB10 | AXP2101 PMU bus |
-| `M_UART3_TX` | PC9 | "spare UART" line 1 — consumed as **PMU IRQ input** by both firmwares |
-| `M_UART3_RX` | **PC10** | "spare UART" line 2 — the only candidate IRQ carrier (see §4) |
-| `HP_DET` | PC11 | Headphone detect to mainboard (R201, 1.2 kΩ) |
-| `M_USB_DP/DM` | PA11/PA12 | Native USB, inactive in both firmware trees; also feeds CH340C debug converter |
-| power/chg/button nets | — | CHGLED, PWR_OK, power button → mainboard |
-| key matrix ROW1-8/COL1-8, membrane pads M11-M78, KEY1-12 | internal | not brought out |
+| keyboard I²C | PB9 (SDA)/PB8 (SCL) | → mainboard → Lyra i2c2 (RM_IO10/11) — the register/FIFO bus |
+| AXP2101 PMU bus | PB11/PB10 | PMU SDA/SCL |
+| AXP2101 IRQ | PC9 | `M_UART3_TX` net — **PMU input** (both FW) |
+| **`M_UART3_RX`** | **PC10** | **un-switched; = `PICO_IRQ` in BIOS; the IRQ carrier** |
+| HP_DET | PC11 | headphone detect (R201, 1.2 kΩ) — **stolen as USART3_RX in BIOS `UART_PICO_INTERFACE` mode** |
+| `M_USB_DP/DM` | PA11/PA12 | native USB → SEL2 → Type-C (DIP-gated) |
+| debug/flash UART (USART1) | PA9/PA10 | → SEL1 → CH340C (DIP-gated) |
+| power/chg/button nets | — | CHGLED, PWR_OK, power button |
+| matrix ROW1-8/COL1-8, membrane M11-M78 | internal | not brought out |
 
-The Pico side of the mainboard connector is labelled with PicoMite GPIO numbers
-(`GP2/GP3` = UART0 RX/TX, `GP4/GP5` = M_UART1 RX/TX, `GP21/GP28` = M_USB DP/DM,
-`GP14-17` = display SPI/DC/RST on the 20-pin connector). **[open]** The Luckfox
-Lyra mates with the same mainboard connector (all Calculinux wiring goes through
-it), but the Lyra-side GPIO assignment for the PC10 (`M_UART3_RX`) net is not
-documented anywhere we found — this is **the single remaining hardware unknown**.
-Candidate ways to resolve it: (a) continuity meter from the connector socket to
-Lyra pins, (b) Luckfox Lyra board pinout/schematic, (c) probe behaviour.
+**[verified]** No dedicated kbd-INT net exists other than the repurposed
+M_UART3_RX line — every MCU output is accounted for above. Corroboration:
+Jack's forum post — "the only connections between the pico board and the stm32
+are the I2C and the UART bus… I was thinking of reconditioning it as IRQ_pin".
 
-**[verified]** No dedicated kbd-INT net exists between MCU and mainboard: every
-MCU output is accounted for above, and none is labelled as an interrupt.
-Corroboration: on the original PicoCalc, the IRQ's intended consumer was the
-PicoMite — Jack's forum post (below) states "the only connections between the pico
-board and the stm32 are the I2C and the UART bus… I was thinking of reconditioning
-it as IRQ_pin".
+### 2.3 Pinmux landmine in the Calculinux DTS (independent fix needed)
+
+**[verified]** `linux-rk3506-luckfox-lyra.dtsi` (kernel) enables
+`&uart1 { pinctrl = rm_io30 (TX) + rm_io28 (RX); status = "okay"; }`, while
+`picocalc-luckfox-lyra.dtsi` (this repo) assigns the **same two balls** to the
+SD-card reader (`&spi1`: rm_io29 clk, **rm_io28 mosi**, rm_io31 miso,
+**rm_io30 csn0**). Ball mapping (kernel
+`arch/arm/boot/dts/rk3506-pinctrl-rmio.dtsi`): **RM_IO28 = GPIO1_C3,
+RM_IO30 = GPIO1_D2**. Two drivers request the same pins → runtime pinctrl
+conflict (first binder wins).
+
+**[assumed]** Since the mainboard cannot route one net to both an SD slot and
+a UART, the M_UART3 pair almost certainly does *not* land on RM_IO28/30;
+those are likely stock LuckFox Lyra debug-header balls (unwired in the
+PicoCalc case), making the uart1 node generic-Luckfox heritage. Likely fix:
+`status = "disabled"` for uart1 in the picocalc dtsi (SD reader keeps the
+balls) — **pending runtime confirmation** via `/sys/kernel/debug/pinctrl` and
+a check that the SD slot works today. File as its own fix regardless of the
+IRQ work.
 
 ## 3. Stock firmware: `clockworkpi/PicoCalc` — `Code/picocalc_keyboard`
 
-([GitHub](https://github.com/clockworkpi/PicoCalc/tree/master/Code/picocalc_keyboard),
-checked `master` and `devel`). Arduino-core, busy-loop design.
+(Arduino core, busy-loop; `master` and `devel` checked.)
 
-Protocol basics **[verified]**:
+Protocol **[verified]** (`reg.h`, `conf_app.h`, `reg.ino`,
+`picocalc_keyboard.ino`):
 
-- Registers per `reg.h`: `REG_ID_TYp 0x00` (0x00 = official), VER 0x01, CFG 0x02,
-  **INT 0x03**, KEY 0x04, BKL 0x05, DEB 0x06, FRQ 0x07, RST 0x08, FIF 0x09, BK2
-  0x0A, BAT 0x0B, C64_MTX 0x0C, C64_JS 0x0D, OFF 0x0E. Writes flagged by MSB.
-- Key events are debounced/scanned in `loop()` (10 ms idle delay) and enqueued into
-  a 31-slot FIFO; host reads 2-byte items until 0x00.
-- INT status register: `key_cb()` latches `INT_KEY` per event when
-  `CFG_KEY_INT` is set; `lock_cb()` latches INT_CAPSLOCK/INT_NUMLOCK; overflow
-  latches INT_OVERFLOW. **Defaults: `CFG_OVERFLOW_INT | CFG_KEY_INT |
-  CFG_USE_MODS | CFG_REPORT_MODS`** (`reg_init()`), i.e. latching is ON out of the
-  box. Overflow policy defaults to **drop-new-entry** (`CFG_OVERFLOW_ON` unset).
-- Ack convention: the whole INT byte is replaced by a host write, so **writing
-  0x00 clears all bits**.
-- I²C watchdog: if no I²C traffic in **2.5 s the firmware resets its I²C
-  peripheral** (`ResetI2CBus()`, `loop()`). Hosts must keep the bus alive with
-  ≤ ~2 s spacing in any reduced-poll scheme.
+- Registers: `TYP 0x00` (0x00 = official), VER 0x01, CFG 0x02, **INT 0x03**,
+  KEY 0x04, BKL 0x05, DEB 0x06, FRQ 0x07, RST 0x08, FIF 0x09, BK2 0x0A, BAT
+  0x0B, C64_MTX 0x0C, C64_JS 0x0D, OFF 0x0E. Write flag = MSB of reg address.
+- Keys scanned in busy `loop()` (10 ms idle) into a 31-slot FIFO; host reads
+  2-byte items until 0x00.
+- INT latch: `key_cb()` sets `INT_KEY` when `CFG_KEY_INT`; `lock_cb()` sets
+  INT_CAPSLOCK/INT_NUMLOCK; overflow sets INT_OVERFLOW. **Defaults on**:
+  `CFG_OVERFLOW_INT | CFG_KEY_INT | CFG_USE_MODS | CFG_REPORT_MODS`.
+  Overflow defaults to **drop-new-entry**.
+- Ack: host write *replaces* the whole INT byte → writing 0x00 clears all.
+- **I²C watchdog: no traffic for 2.5 s → `ResetI2CBus()`.** Reduced-poll
+  schemes need keepalive ≤ ~2 s spacing.
 
-Interrupt-pin status: **implemented in spirit, absent in silicon use**
-**[verified]**:
+IRQ pin status **[verified]**: `INT_DURATION_MS = 1` exists but is unused; the
+only pulse code is **commented out** in `lock_cb()` ("// int_pin can be a
+LED") and `int_pin` is declared nowhere (master and devel). The official
+firmware carries a non-functional draft (per Jack: no program space left).
 
-- `INT_DURATION_MS = 1` defined (`conf_app.h`) but unused.
-- The only pin-pulse code is **commented out** in `lock_cb()`
-  (`// int_pin can be a LED`, 1 ms pulse) and `int_pin` is **declared nowhere** —
-  same on `devel`. Clockwork's own README comment admits the official firmware
-  "have a draft for that feature, but not implemented in final (probably because
-  there is no program space left…)" (forum quote, §5).
+## 4. Alternative firmware: `jackcartersmith/picocalc_BIOS`
+(mirrored at `Calculinux/picocalc_BIOS`)
 
-Net: on stock hardware + stock firmware, a true IRQ line does not exist. The
-register latches exist but need a poller — they are an optimization hint, not a
-delivery channel.
+Local: `/home/benklop/repos/PicoCalc/picocalc_BIOS`. Mirror verified **0
+commits behind upstream** on 2026-09-30 (HEAD `1b649c8`
+"IC2S: readded missing REG_ID_INT in callback handler" — the INT ack path
+*regressed and had to be re-added*; smoke-test the handshake on first flash).
 
-## 4. Alternative firmware: `jackcartersmith/picocalc_BIOS` (mirrored at
-`Calculinux/picocalc_BIOS`)
+Full HAL/CubeMX rewrite; "more efficient both functionally and electrically",
+~3.5 mA run, <0.1 mA standby.
 
-Local: `/home/benklop/repos/PicoCalc/picocalc_BIOS`; the Calculinux mirror was
-verified **0 commits behind upstream** on 2026-09-30 (HEAD `1b649c8`
-"IC2S: readded missing REG_ID_INT in callback handler" — an ack-path regression
-had to be re-fixed, so exercise the INT write path during bring-up).
-
-A full HAL/CubeMX rewrite ("personal rewrite of the original PicoCalc STM32
-firmware… more efficient functionally and electrically").
-
-Implemented IRQ protocol **[verified]** — this is the headline finding:
+### 4.1 Implemented IRQ protocol — the headline finding
 
 - `PICO_IRQ` = **GPIOC pin 10 (PC10)**, push-pull output, **active-low**
   (`Core/Inc/hal_interface.h:109-110`).
-- Asserted (driven LOW) from `key_cb()` on any key event when
-  `INT_KEY` ∈ `REG_ID_INT_CFG`, from `lock_cb()` on lock toggles, and on FIFO
-  overflow / RTC alarm (`Core/Src/main.c` ~L342-401). Guarded by
-  `#ifndef UART_PICO_INTERFACE`.
-- De-asserted exclusively by the host's I²C write to `REG_ID_INT`: the handler
-  applies a **masked clear** — `reg_set_value(REG_ID_INT, old & ~written_byte)` —
-  then raises the pin (`Core/Src/i2cs.c` REG_ID_INT branch). Note: the pin is
-  raised on *any* write to that register, mask or not, so the line is best treated
-  as "event pending → go drain", with the latch as advisory and the FIFO as the
-  authoritative backlog. (The masked ack is strictly nicer than stock firmware's
-  full-byte-replace — no torn-status window if the host writes a partial mask.)
-- So the complete handshake is: *event → pin LOW → host IRQ → drain FIFO → write
-  `REG_ID_INT` ack → pin HIGH*.
+- Asserted (driven LOW) from `key_cb()` per key event when `INT_KEY` ∈
+  `REG_ID_INT_CFG`, from `lock_cb()` on lock toggles, and on overflow/RTC
+  alarm (`Core/Src/main.c`). Guarded by `#ifndef UART_PICO_INTERFACE`.
+- De-asserted **only** by the host's I²C write to `REG_ID_INT`: masked clear —
+  `reg_set_value(REG_ID_INT, old & ~written_mask)` — then the pin is raised
+  (`Core/Src/i2cs.c`). The pin rises on *any* write to that register, mask or
+  not. Treat the line as "event pending → go drain": latch is advisory, the
+  FIFO is the authoritative backlog.
+- Handshake: *event → pin LOW → host IRQ → drain FIFO → masked ack → pin
+  HIGH*.
+- **⚠ Compat gap:** the pin is configured as an output unconditionally at
+  boot. On a Lyra whose ball is still muxed UART-TX (idle-high driven), a
+  keypress-induced LOW would fight the SoC driver. **Required firmware
+  change:** gate both the output configuration and all asserts behind a
+  `SYS_CFG`/`INT_CFG` bit — proposed `IRQ_LINE_ENABLE`, **default 0**, pin
+  left as pulled input until set. ~20 lines; request upstream to Jack. Until
+  it lands, flashing the BIOS with the ball not remuxed to GPIO is *unsafe*.
 
-Register-map extensions (host must branch on firmware type) **[verified]**:
+### 4.2 Register-map extensions (host must branch on TYP)
 
-- `REG_ID_TYP = 0xCA` ("That's me :3", `Core/Src/regs.c` ~L91); stock reports
-  0x00. **This is the readiness gate for IRQ mode** — the design Jack and Ben
-  agreed on in the forum thread (vendor-id-style provenance probe).
-- `SYS_CFG 0x02` (successor of CFG) and a separate **`INT_CFG 0x12`** — the stock
-  `CFG_KEY_INT` (bit 4 of 0x02) moves to bit 3 of 0x12. Kernel code that wants to
-  *ensure* INT enablement must write different registers per TYP.
-- `REG_ID_DEB` write is a 16-bit hold-period (`keyboard_set_hold_period`); reads
-  return 2 bytes.
-- Full RTC exposure: `REG_ID_RTC_CFG/DATE/TIME/ALARM_DATE/ALARM_TIME` backed by
-  the STM32's internal RTC (backup-domain registers persist across deep-sleep
-  standby). Alarm "only trigger[s] the IRQ signal (no wake-up)" w.r.t. the host.
-  Known warts per author: calendar/day-roll issues, sleep/date retention — WIP.
-- Backlight scale changed to 0-9 steps; out-of-range writes (our driver writes
-  0-255, `default-brightness = <128>`) are accepted and linear-mapped for driver
-  compatibility.
+- **`REG_ID_TYP = 0xCA`** vs 0x00 stock — readiness gate for all custom
+  behavior (vendor-id probe agreed in the forum).
+- `SYS_CFG 0x02` (successor of CFG) + separate **`INT_CFG 0x12`**; stock
+  `CFG_KEY_INT` (CFG bit 4) moves to INT_CFG bit 3.
+- `REG_ID_DEB` write = 16-bit hold period (2 bytes back on read).
+- Full **RTC** exposure (`RTC_CFG/DATE/TIME/ALARM_DATE/ALARM_TIME`) on the
+  internal RTC (backup domain survives standby). Admitted warts: calendar
+  day-roll, sleep date retention — WIP. Alarms trigger the IRQ line only.
+- Backlight scale 0-9; out-of-range writes (our driver writes 0-255,
+  `default-brightness = 128`) are linearly mapped for compatibility (coarse
+  stepping perceptible if driven finely).
 
-Power story (why this firmware also matters beyond IRQs) **[claimed/verified-in-code]**:
-~3.5 mA run, < 0.1 mA standby (PMU left alive, STM32 asleep; RTC keeps running),
-persistent settings in emulated EEPROM (flash), power-button semantics (short
-press w/ Shift = pico reset; long press = PMU shutdown), I²C re-arm/error handling
-rewritten ("I2C: arch review and speed testing"). Author reports stock-firmware
-I²C stalls that this rewrite fixes (forum, Aug 2025).
+### 4.3 Power & lifecycle
 
-Alternate transport: `UART_PICO_INTERFACE` build flag configures **USART3 on
-PC10(TX)/PC11(RX), 115200 8N1** (note the PC11 swap — stock firmware uses PC11 as
-HP_DET) and suppresses the GPIO IRQ path. Effect/usage: not clearly consumed by
-any driver yet; treat as experimental. **[open]** whether this mode transmits a
-key-event stream (grep finds no event TX path in `Core/Src` outside DEBUG huart1)
-or is scaffolding.
+**[claimed/verified-in-code]** ~3.5 mA run; <0.1 mA standby (PMU alive,
+STM32 asleep, RTC running); settings in emulated flash EEPROM; power-button
+semantics (Shift+short = pico reset; long = PMU shutdown, optional host-ACK);
+I²C re-architected (fixes stock "i2c got stuck" reports). Flash = 64 KB.
+Watchdog was **removed** upstream ("Sadly removed the watchdog") — update/
+rollback safety must live in app self-test (§7.2).
 
-Host-side reference driver: `tests/pcsb/` (Pico SDK / RP2040) — deliberately
-poll-based ("works with this and the original firmware"), so it is **not** an IRQ
-consumer reference. **[open]** no public IRQ-consumer reference exists for the
-Linux side; ours would be the first.
+### 4.4 Alternate transport: `UART_PICO_INTERFACE`
 
-## 5. Prior art and intent (forum evidence)
+Build flag: **USART3 PC10 TX / PC11 RX**, 115200 8N1, GPIO IRQ suppressed.
+Status: init/NVIC present; **no key-event transmit path found in `Core/Src`**
+— scaffolding/experimental. MCU→host simplex; RX leg steals PC11
+(stock: HP_DET). Option B′ (§8) — contingent alternative.
 
-Thread: [Custom PicoCalc BIOS/keyboard firmware](https://forum.clockworkpi.com/t/custom-picocalc-bios-keyboard-firmware/17292)
-(May 2025 – ongoing; Ben (maintainer) participates).
+### 4.5 Host reference driver
 
-- shtirlic's original ask (the motivation for this whole effort): "IRQ for keyboard
-  events instead of i2c constant polling, will save a lot of CPU(power) — we can
-  use pins from **spare second UART already connected to stm32 and pico**. Second
-  pin for rtc?" and a proposal to use pin #1 for keyboard IRQ, pin #2 for
-  misc. southbridge events, plus the 7-bit command-register taxonomy
-  (reset/shutdown/power-sequence controls).
-- Jack's constraint admission: "the pico pin to be used seem to be the issue for
-  me right now, the only connections between the pico board and the stm32 are the
-  I2C and the UART bus. As I didn't plan to use this UART, I was thinking of
-  **reconditioning it as IRQ_pin**… And can only be de-asserted by reading the
-  IRQ registers/FIFO." — and "the official firmware have a draft for that
-  feature, but not implemented in final (probably because there is no program
-  space left…)". Roadmap at the time: missing official registers, RTC, "**I2C IRQ
-  mode** (+docs)", power modes.
-- shtirlic (Aug 2025): running the BIOS on a real unit, "working great and pretty
-  stable", stock 1.2 has "i2c got stuck" issues; interrupt experiments not yet
-  started by him; maintaining a custom NuttX driver with IRQ support for
-  PicoMite-class hosts.
-- Phantom-key discussion: partly membrane-switch contact physics ("click but
-  nothing registered" off-centre), partly addressed by the rewrite
-  ("reduced — probably wiped out — duplicate key press").
+`tests/pcsb/` (Pico SDK/RP2040) is deliberately poll-based, works with both
+firmwares — **not** an IRQ-consumer reference. No public Linux-side IRQ
+consumer exists; ours would be the first. shtirlic maintains a NuttX IRQ
+driver (forum) — sync candidate.
 
-Takeaways: (a) the IRQ line's intended carrier is the "spare UART" pair, exactly
-matching the schematic audit (§2); (b) the protocol (latch + masked-ack + level
-line) was designed and shipped in firmware years before any Linux work — the
-remaining work is squarely on the Lyra/host side; (c) there is community interest
-and at least one other maintainer (NuttX) working the same problem, worth syncing
-with.
+## 5. Prior art & intent (forum)
 
-## 6. Design options (ranked) and effort
+[Custom PicoCalc BIOS/keyboard firmware](https://forum.clockworkpi.com/t/custom-picocalc-bios-keyboard-firmware/17292)
+(May 2025+, Ben participating):
 
-### Option A — Adaptive slow-poll (no firmware, no hardware)
+- shtirlic's motivating ask: IRQ instead of constant polling via "spare second
+  UART" pins; proposed 7-bit command-register taxonomy (resets/shutdown/power
+  sequencing).
+- Jack: intended carrier = the spare UART line; roadmap "I2C IRQ mode
+  (+docs)"; stock FW has only an unimplemented draft.
+- shtirlic (Aug 2025): BIOS stable on hardware; stock 1.2 has I²C stalls;
+  NuttX IRQ driver ongoing.
+- Phantom keys: membrane-contact physics + partly fixed by the rewrite.
 
-Fast poll (128 Hz) while recently active; decay to a **1 Hz keepalive** when idle
-(also satisfies stock firmware's 2.5 s watchdog); first FIFO hit re-arms fast
-mode. Optionally consult `REG_ID_INT` as a dirty hint in BIOS builds.
+Takeaways: the protocol was designed in firmware long before any Linux work;
+the remaining work is host-side + one small firmware gate + one meter check.
 
-- Idle traffic: 128 txns/s → 1 txn/s (≈99 % less); idle wakeups likewise.
-- Worst first-keypress latency after long idle ≈ 1 s; subsequent latency ~8 ms.
-- Requires the mouse-repeat re-home (shared with B) — the one genuinely novel
-  piece: a repeating `delayed_work` at the current ~7.8 ms period, 1×/2×/4×
-  ramp, armed by `mouse_move_dir`.
-- Effort: **1–2 days** driver work + testing. Risk ≈ 0. Candidate companion to
-  PR #33 (which restructured exactly this code path).
-- Downside: still polling; latency floor is structural.
+## 6. Compat-mode & arming design (agreed)
 
-### Option B — True IRQ (BIOS firmware + Lyra GPIO) — recommended end state
+Principle: **a flashed BIOS is electrically invisible until the host says
+otherwise.**
 
-Requires: `Calculinux/picocalc_BIOS` flashed (TYP 0xCA) and the PC10/`M_UART3_RX`
-net terminating on a usable Lyra GPIO (the one open question, §2). No PCB mod is
-needed if that net reaches the Lyra — the "spare UART" line is factory-routed.
+1. Firmware: new `IRQ_LINE_ENABLE` bit (default 0). When 0: PC10 = pulled
+   input, never driven; latch still fills so poll mode is unaffected.
+   When 1: current BIOS behavior. *(Pending upstream.)*
+2. Host activation sequence (kernel, TYP-gated):
+   1. Probe: `TYP == 0xCA` and VER within supported set;
+   2. DT: ball on the M_UART3 net present, remuxed GPIO input; trigger
+      LEVEL (active-low pin) — pull config validated empirically (push-pull
+      source; pull mostly guards power states);
+   3. Write `IRQ_LINE_ENABLE`;
+   4. `request_threaded_irq` + start the 1 s watchdog drain.
+3. **Disarm = emergency stop**: one I²C write returns the pin to input and
+   the host falls back to poll mode without reboot — the field kill-switch.
+4. Tiering (auto-selected by probe; each downgrade a non-event):
 
-Kernel/DT work (the dead scaffolding at kbd L680-703 shows the intended shape):
+| Tier | Condition | Delivery |
+|---|---|---|
+| 0 | stock FW (TYP=0x00) | 128 Hz poll; Option A adaptive poll available |
+| 1 | BIOS, enable bit off | poll; IRQ pin silent |
+| 2 | BIOS + bit + DT GPIO | level-IRQ mode (or B′ stream build) |
 
-1. DT: `interrupts-extended`/`irq-gpios` + pinctrl group (pull-down recommended:
-   line is push-pull active-low from the MCU, but keep the input clean if the
-   firmware is asleep/resetting — actually with push-pull this mostly guards
-   against floating states on power sequences; validate polarity empirically).
-2. Threaded IRQ (primary handler NULL, `IRQF_ONESHOT`): drain FIFO via the
-   existing workqueue functions, then `REG_ID_INT` masked ack (write the bits
-   observed, not 0, so lock/alarm bits from other consumers are respected).
-3. **1 s watchdog drain** regardless — catches missed pulses, I²C NAKs, firmware
-   wedges; keepalive for stock firmware stays compatible if we ever run it.
-4. Gate: IRQ mode only when `REG_ID_TYP == 0xCA` AND the DT property is present;
-   otherwise transparent polling fallback. (Matches the vendor-id probe the
-   forum settled on.)
-5. Hygiene: retire `g_ctx`/`DEFINE_TIMER` globals; stats (irqs, drained, watchdog
-   rescues, i2c errors) — silent IRQ loss = dead keyboard, observability is
-   mandatory.
-6. PM: `enable_irq_wake()`; mask IRQ in suspend (regmap unusable while the bus
-   freezes).
-7. Mouse-repeat re-home (shared with A).
+## 7. Firmware update plan (agreed)
 
-Effort: DT+driver 2–3 days, repeat engine/PM/stats 1–2 days, bench + soak 2–3
-days → **~1.5 weeks** assuming the Lyra-side pin is usable. Dominant risk: the
-§2 open question (verify on metal before writing code — continuity/probe first).
+Objective: **seamless firmware upgrades shipped as part of Calculinux — no
+DIP fiddling, no case opening** after a one-time first install.
 
-### Option C — Native USB HID firmware (shelved)
+### 7.1 First install (one-time, switch-gated) — unavoidable
 
-MCU native USB (PA11/PA12) *is* routed to the mainboard connector
-(`M_USB_DP/DM`, GP21/28), so a USB-device rewrite would be the architecturally
-clean endgame, but it is a ground-up firmware project (descriptors, enumeration,
-power sequencing) with no community momentum for it on the Lyra side. Park.
+**[answer to the open question]** Stock firmware **cannot** be upgraded over
+the M_UART3 pair: PC10-as-RX is not implemented in stock, and the STM32 ROM
+bootloader listens only on the PA9/PA10 net — reachable solely via SEL1=B +
+CH340C + USB (BIOS README procedure: DIP switch, motherboard USB,
+STM32CubeProgrammer). So the *first* BIOS install walks the DIP+CH340C path,
+case open, once. Document in the Calculinux docs (mirror of the BIOS flashing
+page).
 
-### Variant considered and rejected — reuse UART3 crossover
+### 7.2 Steady state: I²C is the primary update channel (no switches)
 
-Electrically present (the "spare UART" pair) and would allow SoC UART-RX-IRQ
-delivery without an IRQ line — but on stock firmware the pair's TX leg (PC9) is
-the AXP2101 PMU interrupt input, and the BIOS's `UART_PICO_INTERFACE` mode swaps
-PC11 (stock: HP_DET). Either way another function dies. Skip; prefer the GPIO
-role the BIOS already implements.
+Once any BIOS is resident, updates run over the always-available I²C bus:
 
-## 7. Consolidated pitfalls register
+- **BIOS side:** DFU state via register command; while in DFU: ignore
+  `REG_ID_OFF` (§7.5), accept chunked payloads over the existing write path,
+  verify (CRC), program, update boot select, reset (host-issued `RST`).
+  30 KB at 400 kHz I²C is seconds — size is not a constraint.
+- **Flash layout:** A/B app banks in the 64 KB (boot area + two ~28 KB
+  slots); **boot selection persisted in the EEPROM** the BIOS already uses;
+  version stamp; **app self-test at boot reverts on failure** — required,
+  since the watchdog was removed upstream, so self-test-and-revert *is* the
+  safety mechanism.
+- **Host side:** a `calculinux-update` component ("kbd-stm32-fw"): read
+  TYP/VER → compare to packaged build → push chunks → `REG_ID_RST` →
+  re-probe → roll back on bad banner. Users see "keyboard firmware updated"
+  inside the normal update flow.
+- **Recovery rail** (catastrophic brick): the §7.1 DIP+CH340C procedure,
+  documented.
 
-1. **Stock-firmware 2.5 s I²C watchdog** → any reduced-poll scheme needs a
-   keepalive ≥ ~1 Hz, or expect periodic `ResetI2CBus()` hiccups.
-2. **Ack race semantics differ by firmware**: stock = full-byte replace
-   (write-0 clears); BIOS = masked clear. Host should write-back the bits it saw
-   (never a blanket 0) to be correct on both — on stock, that equals an
-   effectively-equivalent clear of the same bits.
-3. **The pin is released on any `REG_ID_INT` write in the BIOS**, even mask-less;
-   treat the line as edge/event-pending, not as a persistent level.
-4. **INT-enable bits moved** between firmwares (CFG.4 @ 0x02 → INT_CFG.3 @
-   0x12); do not assume stock layout behind a TYP check.
-5. **FIFO overflow drops new entries by default** in stock; BIOS inherits the
-   `CFG_OVERFLOW_ON` knob (in SYS_CFG). Chord storms > 31 events can silently eat
-   releases → stuck keys; the watchdog drain narrows but does not eliminate it.
-6. **Backlight scale change** in the BIOS (0-9 vs 0-255 with mapping) — coarse
-   stepping becomes perceptible if we ever drive it finely.
-7. **Latest BIOS commit (`1b649c8`) restored the INT ack path** — regression
-   happened once already; smoke-test the full handshake on first flash.
-8. **RTC in the BIOS is WIP-quality** (day-roll/calendar issues admitted); do not
-   build scheduling on it yet.
-9. **Audio pin reservations** (Lyra 31/32 M0 audio; RM_IO12/13 PWM audio) must not
-   be touched by any DT pinctrl work in this area.
-10. Legacy `picocalc_kbd` flavor exists for completeness; keep behavior aligned if
-    the shared path is refactored (it has its own workqueue/timer twin).
+### 7.3 UART as secondary channel
 
-## 8. Immediate next steps
+SEL1=B (CH340C → MCU USART1) stays available for low-level debug and
+ROM-bootloader recovery. The un-switched M_UART3 pair is *not* an update
+channel (direction/ownership per §2.1) — it is the IRQ line, full stop.
 
-1. **Close the §2 unknown on metal**: identify the Lyra GPIO on the mainboard
-   connector that carries the PC10 / `M_UART3_RX` net (continuity from the
-   connector socket; or obtain the Lyra pinout). Everything else is decided.
-2. Flash the Calculinux-mirror BIOS on a bench unit; verify TYP=0xCA, FIFO
-   handshake, and the IRQ pin pulsing with a logger (pin to multimeter/GPIO
-   sampler).
-3. Ship **Option A** as a regular PR (pair with the mouse-repeat re-home;
-   PR #33 already restructured the event path it must hook).
-4. Prototype **Option B** behind the TYP+DT gate using §6-B; keep polling
-   default until B soaks on at least one daily driver.
-5. Sync with shtirlic (NuttX IRQ consumer) on protocol edge cases — his driver
-   is the only known IRQ consumer in the wild.
+### 7.4 Updates must never regress
+
+Console path (SEL1=A / uart0) must work after every firmware update. Smoke
+test: post-reset console banner over Type-C, FIFO handshake, IRQ handshake
+(§4.1), typed-character check.
+
+### 7.5 Power-sequence traps
+
+- MFD core `shutdown()` writes `REG_ID_OFF` (power-off the whole peripheral)
+  on host reboot — an updater racing a reboot kills the session. DFU state
+  must ignore OFF (or the flow holds it), and `calculinux-update` must
+  serialize kbd-fw updates with reboots.
+- BIOS long-press = PMU shutdown without host ACK by default (opt-in ACK mode
+  per forum) — confirm DFU/host-ACK interplay with Jack.
+
+## 8. Design options & effort
+
+Shared precondition for all: mouse-repeat re-home (§1) + retirement of
+`g_ctx`/`DEFINE_TIMER` globals + stats (irqs, drained, watchdog rescues,
+i2c errors — silent IRQ loss = dead keyboard; observability is mandatory).
+
+### Option A — adaptive slow-poll (no firmware, no hardware)
+
+Fast poll (128 Hz) while recently active; decay to **1 Hz keepalive** when
+idle (satisfies stock's 2.5 s watchdog); first FIFO hit re-arms fast mode.
+
+- Idle traffic 128/s → 1/s (≈99 %); worst first-keystroke latency after long
+  idle ≈ 1 s; ~8 ms thereafter.
+- **1-2 days**, risk ≈ 0. Companion to PR #33 (same code path). Ship first
+  regardless of B's fate — the Tier-0 improvement.
+
+### Option B — level IRQ on the M_UART3 ball (recommended end state)
+
+Requires §6 machinery + firmware gate + the meter check (§2.1).
+
+1. DT: `interrupts-extended`/`irq-gpios` + pinctrl on the identified ball.
+2. Threaded IRQ (primary NULL, `IRQF_ONESHOT`): drain via existing workqueue
+   functions; **masked** `REG_ID_INT` ack (write back bits observed —
+   correct on both firmwares; never blanket 0).
+3. **1 s watchdog drain** always (missed pulses, NAKs, wedges; keepalive).
+4. Gates: TYP + DT property + `IRQ_LINE_ENABLE` (§6).
+5. PM: `enable_irq_wake()`; mask IRQ in suspend (regmap/bus frozen).
+6. Emergency disarm path (§6.3).
+
+**≈2-3 days driver/DT + 1-2 days PM/stats + 2-3 days bench/soak** = ~1.5
+weeks, dominated by the physical verification and joint firmware work.
+
+### Option B′ — UART event-stream variant (contingent alternative)
+
+Complete the BIOS `UART_PICO_INTERFACE` path (add event TX in `key_cb()`;
+init/NVIC present — a few dozen lines). MCU streams framed key events into
+the Lyra's uart1 RX on the same ball; SoC wakes on UART-RX FIFO IRQ. Zero
+driver-vs-driver contention (correct polarity, one-directional), "UART"
+preserved in the strongest sense; costs: simplex, byte-parser in Linux.
+Shares the entire Linux substrate with B; differ in ~150 lines. **Prototype
+both; select by what the meter/soak says about the ball.** Relevant only if
+the ball proves unsuitable for a level GPIO.
+
+### Option C — native USB transport (parked)
+
+Live but DIP-gated (§2.1); a CDC device (~10-16 KB, headroom exists) buys
+nothing production-grade without the switch. Park.
+
+### Rejected — UART3 crossover as host console channel
+
+Contends with the PMU IRQ input (PC9) or HP_DET (PC11) depending on mode.
+Skip.
+
+## 9. Consolidated pitfalls register
+
+1. **Never drive PC10 before the host remuxes the ball** (push-pull fight
+   with a UART-TX-idle-high if the ball is UART-muxed) → the
+   `IRQ_LINE_ENABLE` gate; BIOS-on-old-DT must stay a no-op.
+2. **Ack semantics differ by firmware**: stock = full-byte replace (write 0
+   clears); BIOS = masked clear, pin released on *any* write. Host must
+   write back only the bits it observed — never blanket 0 — to be correct on
+   both.
+3. **Stock 2.5 s I²C watchdog** → reduced-poll schemes need keepalive ≥ ~1
+   Hz or expect periodic `ResetI2CBus()` hiccups.
+4. **INT-enable bits moved** between firmwares (stock CFG.4 @0x02 → BIOS
+   INT_CFG.3 @0x12); branch on TYP, never assume.
+5. **FIFO overflow drops new entries** (both FWs default); chord storms can
+   silently eat releases → stuck keys. Watchdog drain narrows, doesn't
+   eliminate.
+6. **Backlight scale change** in BIOS (0-9, with mapping) — coarse stepping
+   if driven finely.
+7. **BIOS INT-ack regressed once** (re-fixed in `1b649c8`); smoke-test the
+   full handshake on every flash.
+8. **BIOS RTC is WIP-quality** (calendar/day-roll admitted); no scheduling
+   on it yet.
+9. **Audio pin reservations** (Lyra 31/32 M0 audio; RM_IO12/13 PWM audio)
+   must not be touched by DT work in this area.
+10. **`REG_ID_OFF` power-off on host reboot** (MFD `shutdown()`) interacts
+    with the update flow (§7.5).
+11. **Console path (uart0 / CH340C / SEL1=A) is sacrosanct** — verify after
+    every change that could touch the connector region.
+12. **UART1/SD pinmux conflict in the DTS** (§2.3) — independent bug;
+    resolve before relying on either consumer.
+
+## 10. Execution plan & verification checklist
+
+Phases (dependencies ordered):
+
+- **P0 — physical verification (blocks B; ~1 bench hour):**
+  (a) which Lyra GPIO balls carry the M_UART3 pair (continuity, connector
+  socket → Lyra); (b) SEL1/SEL2 factory positions; (c) runtime owner of
+  RM_IO28/30 (`/sys/kernel/debug/pinctrl`) + SD slot working today.
+- **P1 — DTS housekeeping (independent, file now):** disable/resolve the
+  uart1-vs-spi1 conflict (§2.3); confirm console path untouched.
+- **P2 — firmware gate (joint, small):** `IRQ_LINE_ENABLE` bit upstream
+  (Jack → mirror); validate pin-idle behavior with a meter.
+- **P3 — Option A** (Tier-0 win): adaptive slow-poll + repeat re-home;
+  PR against this repo (pairs with #33).
+- **P4 — Option B/B′** prototyped in parallel: DT + threaded IRQ (+parser for
+  B′), masked ack, watchdog, stats, PM; select winner via soak.
+- **P5 — update chain:** BIOS DFU state + A/B + self-revert (joint with
+  Jack); `calculinux-update` "kbd-stm32-fw" component; §7.4 smoke suite.
+- **P6 — (north star, parked):** U-Boot southbridge usage (wait-for-key,
+  RTC display); display ambitions — after P4 soaks.
+
+Sync list: Jack (gates, DFU, power semantics), shtirlic (NuttX IRQ consumer,
+protocol edge cases), Ben/Calculinux (dtsi ownership, update integration).
 
 ## Appendix: source map
 
 | Artifact | Location |
 |---|---|
-| Linux kbd driver (poll, dead IRQ scaffold) | `drivers/picocalc_mfd_kbd/picocalc_mfd_kbd.c` (this repo, main@cf9f01a) |
-| Legacy kbd flavor | `drivers/picocalc_kbd/picocalc_kbd.c` (same repo) |
+| Linux kbd driver (poll, dead IRQ scaffold) | `drivers/picocalc_mfd_kbd/picocalc_mfd_kbd.c` (main@cf9f01a) |
+| Legacy kbd flavor | `drivers/picocalc_kbd/picocalc_kbd.c` |
 | Register header (Linux) | `drivers/picocalc_mfd/picocalc_reg.h` |
-| MFD core (regmap, child populate) | `drivers/picocalc_mfd/picocalc_mfd.c` |
-| DT nodes | `luckfox-lyra/picocalc-luckfox-lyra.dtsi` |
+| MFD core (regmap, child populate, `shutdown()` → `REG_ID_OFF`) | `drivers/picocalc_mfd/picocalc_mfd.c` |
+| PicoCalc DT nodes | `luckfox-lyra/picocalc-luckfox-lyra.dtsi` |
+| Kernel Lyra dtsi (uart1 node) | kernel `arch/arm/boot/dts/linux-rk3506-luckfox-lyra.dtsi` |
+| Ball→GPIO map | kernel `arch/arm/boot/dts/rk3506-pinctrl-rmio.dtsi` (RM_IO28=GPIO1_C3, RM_IO30=GPIO1_D2) |
+| U-Boot console | `uboot-rk3506-luckfox.dtsi` (`stdout-path = &uart0`); meta layer `meta-picocalc-bsp-rockchip/recipes-bsp/u-boot/files/v2026.07-rk3506/dt/rk3506-luckfox-lyra.dtsi` |
+| Mainboard schematic (1 sheet) | `github.com/clockworkpi/PicoCalc` → `clockwork_Mainboard_V2.0_Schematic.pdf` (J701/U701/U702/U703 region annotated copy on file with maintainer) |
 | Stock FW | `github.com/clockworkpi/PicoCalc` → `Code/picocalc_keyboard` (master+devel) |
-| Schematic (sheet 1/1) | same repo, `clockwork_Mainboard_V2.0_Schematic.pdf` |
-| Alternative FW | `github.com/jackcartersmith/picocalc_BIOS`; Calculinux mirror `github.com/Calculinux/picocalc_BIOS` (in sync as of 2026-09-30, HEAD 1b649c8) |
-| BIOS IRQ protocol | `Core/Src/main.c` (asserts), `Core/Src/i2cs.c` (masked ack + de-assert), `Core/Inc/hal_interface.h:109` (PC10) |
-| BIOS host reference (poll) | `tests/pcsb/` in the BIOS repo |
+| Alternative FW | `github.com/jackcartersmith/picocalc_BIOS`; Calculinux mirror `github.com/Calculinux/picocalc_BIOS` (in sync 2026-09-30, HEAD 1b649c8); local `/home/benklop/repos/PicoCalc/picocalc_BIOS` |
+| BIOS IRQ protocol | `Core/Src/main.c` (asserts), `Core/Src/i2cs.c` (masked ack + release), `Core/Inc/hal_interface.h:109` (PC10), `Core/Src/regs.c` (TYP 0xCA, defaults) |
+| BIOS host reference (poll) | `tests/pcsb/` |
 | Design thread | forum.clockworkpi.com t=17292 |
-| Stale-flag fix (event path restructure) | PR Calculinux/picocalc-drivers#33 |
+| Related PRs | Calculinux/picocalc-drivers#33 (event-path restructure), #34 (this doc) |
