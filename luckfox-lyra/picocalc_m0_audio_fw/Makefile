@@ -12,7 +12,14 @@ CFLAGS  = -mcpu=cortex-m0 -mthumb -Os -ffunction-sections -fdata-sections \
           -Wall -Wextra -nostdlib -I.
 LDFLAGS = -T rk3506-m0-audio.ld -nostdlib -Wl,--gc-sections
 
-OBJS = startup.o main.o isr.o resource_table.o
+# make TICK_WFI=1: sleep in WFI between ticks instead of polling the timer
+# status bit (see play.S). Polling is the default because it depends on
+# nothing but the timer.
+ifeq ($(TICK_WFI),1)
+CFLAGS += -DM0_TICK_WFI
+endif
+
+OBJS = startup.o main.o play.o resource_table.o
 ELF  = rk3506-m0-audio.elf
 
 all: $(ELF)
@@ -20,21 +27,34 @@ all: $(ELF)
 $(ELF): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
 
-%.o: %.c
+HDRS = rk3506_regs.h shmem.h
+
+%.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-%.o: %.S
+%.o: %.S $(HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 HOSTCC ?= cc
 
-check: check_ring
+check: check_ring check_dsm
 	./check_ring
+	./check_dsm
 
 check_ring: check_ring.c
 	$(HOSTCC) -O2 -Wall -Wextra -o $@ $<
 
-clean:
-	rm -f $(OBJS) $(ELF) check_ring
+check_dsm: check_dsm.c $(HDRS)
+	$(HOSTCC) -O2 -Wall -Wextra -o $@ $< -lm
 
-.PHONY: all clean check
+# Runs m0_play() from the built ELF in a CPU emulator and compares every GPIO
+# write with a model. Needs: pip install unicorn pyelftools
+PYTHON ?= python3
+
+check-emu: $(ELF)
+	$(PYTHON) check_play.py $(ELF)
+
+clean:
+	rm -f $(OBJS) $(ELF) check_ring check_dsm
+
+.PHONY: all clean check check-emu

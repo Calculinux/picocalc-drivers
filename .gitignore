@@ -16,6 +16,7 @@ Module.symvers
 *.elf
 *.o
 luckfox-lyra/picocalc_m0_audio_fw/check_ring
+luckfox-lyra/picocalc_m0_audio_fw/check_dsm
 
 # Kernel build directories and files
 *.markers

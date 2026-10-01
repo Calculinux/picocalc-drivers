@@ -12,8 +12,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Ring copy/underrun math
+    - name: Ring copy/underrun and modulator math
       run: make -C luckfox-lyra/picocalc_m0_audio_fw check
+
+  check-m0-firmware:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install toolchain and emulator
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-arm-none-eabi
+        pip install unicorn pyelftools
+    - name: Build firmware
+      run: make -C luckfox-lyra/picocalc_m0_audio_fw
+    - name: Run the playback loop in the emulator
+      run: make -C luckfox-lyra/picocalc_m0_audio_fw check-emu
+    - name: Build WFI variant
+      run: make -C luckfox-lyra/picocalc_m0_audio_fw -B TICK_WFI=1
 
   build-drivers:
     runs-on: ubuntu-latest

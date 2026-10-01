@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: GPL-2.0
- * Cortex-M0 vector table and minimal startup (linked at 0xFFF88000)
+ * Cortex-M0 vector table and minimal startup (linked at 0, see rk3506-m0-audio.ld)
  */
 	.syntax unified
 	.cpu cortex-m0
@@ -26,10 +26,13 @@ __vectors:
 	.word	0
 	.word	PendSV_Handler
 	.word	SysTick_Handler
-	.rept 19
-	.word	0
+	@ External interrupts (TRM Table 4-4: 19 = TIMER0_CH5, 28-31 = INTMUX0-3).
+	@ The firmware takes none of them: the playback loop reads the timer
+	@ status bit itself (play.S). All 32 slots are still populated so a
+	@ stray enable cannot vector into whatever follows the table.
+	.rept 32
+	.word	Default_Handler
 	.endr
-	.word	TIMER0_CH5_IRQHandler
 
 	.text
 	.thumb_func
@@ -76,7 +79,5 @@ SysTick_Handler:	b .
 	.thumb_func
 	.weak Default_Handler
 Default_Handler:	b .
-
-	/* TIMER0_CH5_IRQHandler is implemented in isr.S (hand-tuned asm) for minimal stalls. */
 
 	/* _stack_top provided by linker script (end of RAM) */
