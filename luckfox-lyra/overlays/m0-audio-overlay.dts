@@ -42,8 +42,21 @@
                 compatible = "rockchip,rk3506-mcu";
                 reg = <0xfff84000 0x8000>;
                 firmware-name = "rk3506-m0-audio.elf";
+                /* Vendor 6.1 CRU clock IDs (include/dt-bindings/clock/
+                 * rockchip,rk3506-cru.h): 74=HCLK_M0, 104=STCLK_M0,
+                 * 76=PCLK_TIMER, 77=CLK_TIMER0_CH0.
+                 * The tick source is TIMER0_CH0, not CH5: only CH0-CH3 of
+                 * each timer are M0 INTMUX inputs (TRM Table 1-6); CH4/CH5
+                 * feed the A55 GIC exclusively and cannot interrupt the M0.
+                 * Mainline renumbered these IDs — if this lands on a
+                 * mainline-kernel device tree: HCLK_M0 74->60, STCLK_M0
+                 * 104->90, PCLK_TIMER 76->62, CLK_TIMER0_CH0 77->?(survey
+                 * mapped CH5 82->68, CH0 is adjacent; re-resolve from the
+                 * mainline binding header). Resets likewise: vendor
+                 * 90/91/10 = SRST_H_M0 / SRST_M0_JTAG / SRST_HRESETN_M0_AC,
+                 * mainline 35/36/SRST_H_M0_AC 8. */
                 clocks = <&cru 74>, <&cru 104>,
-                         <&cru 76>, <&cru 82>;
+                         <&cru 76>, <&cru 77>;
                 resets = <&cru 90>, <&cru 91>,
                          <&cru 10>;
                 reset-names = "h_m0", "m0_jtag", "hresetn_m0_ac";

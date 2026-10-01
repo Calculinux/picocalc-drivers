@@ -1,9 +1,18 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* M0 delta-sigma audio: single TIMER0_CH5 ISR drives both GPIO4_B2 (L) and B3 (R).
+/* M0 delta-sigma audio: single TIMER0_CH0 ISR drives both GPIO4_B2 (L) and
+ * B3 (R). TIMER0_CH0 is the tick source because its interrupt is an M0
+ * INTMUX input (source 76, TRM Table 1-6); CH5 only reaches the A55 GIC and
+ * could never interrupt the M0. The INTMUX source is unmasked in
+ * hardware_init(), and because the TRM does not state which of NVIC lines
+ * 16-19 carries INTMUX output 2, all four lines/slots are armed and the ISR
+ * discriminates via INTMUX_IRQ_FLAG2.
+ *
  * Power saving: WFE when idle; host must wake M0 via GRF rxev (TRM GRF_SOC_CON37 bit 4).
  * Optional WIC deep sleep: if host sets M0_SHMEM_FLAG_WIC_WAKE and grf_con_mcu_wicenreq
  * (CON37 bit 6), M0 uses WFI+SLEEPDEEP so it can fully power down; host asserts rxev
- * to wake. See RK3506 TRM Part 1 §4.6 (M0 status signals), GRF_SOC_CON37. */
+ * to wake. See RK3506 TRM Part 1 §4.6 (M0 status signals), GRF_SOC_CON37.
+ * NOTE: the WIC path is experimental and known-broken (WFI vs rxev, and the
+ * GRF bit macros do not match the TRM yet) — see docs/m0-audio-review.md H3/H4. */
 
 #include "rk3506_regs.h"
 #include "shmem.h"
@@ -38,7 +47,7 @@ typedef struct {
 	uint32_t read_idx;
 	uint32_t buf_ptr;
 	uint32_t shmem_ctr;
-	uint32_t _pad0;
+	uint32_t intmux_flag; /* &INTMUX_IRQ_FLAG2 — ISR source discriminator */
 	uint32_t _pad1;
 	/* Left channel DSM state (contiguous for LDM/STM) */
 	int32_t  integ1_l;
@@ -61,8 +70,9 @@ typedef struct {
 } m0_isr_globs_t;
 
 m0_isr_globs_t m0_isr_globs __attribute__((used)) = {
-	.timer_irq     = TIMER0_CH5_BASE + TIMER_INTSTAT,
+	.timer_irq     = TIMER0_CH0_BASE + TIMER_INTSTAT,
 	.gpio_dr       = GPIO4_BASE + GPIO_DR_L,
+	.intmux_flag   = INTMUX_IRQ_FLAG2,
 	.rate_48k      = M0_FIXED_SAMPLE_RATE_HZ,
 	.ds_rate       = DS_RATE_HZ,
 	.buf_mask      = M0_FIXED_BUF_MASK,
@@ -78,20 +88,23 @@ __attribute__((always_inline)) static inline void gpio_write_both(uint32_t bit_l
 	REG(GPIO4_BASE + GPIO_DR_L) = GPIO4_DR_WRITE(bit_l, bit_r);
 }
 
-static void timer5_start(void)
+static void timer_start(void)
 {
-	REG(TIMER0_CH5_BASE + TIMER_LOAD0) = DS_PERIOD_TICKS;
-	REG(TIMER0_CH5_BASE + TIMER_CTRL) = TIMER_RUN;
+	/* Reload LOAD while stopped (done in hardware_init()) then arm.
+	 * TIMER_RUN = free-running count-up with interrupt (TRM Ch. 10.4.3). */
+	REG(TIMER0_CH0_BASE + TIMER_CTRL) = TIMER_RUN;
 }
 
-static void timer5_stop(void)
+static void timer_stop(void)
 {
-	REG(TIMER0_CH5_BASE + TIMER_CTRL) = TIMER_STOP;
+	REG(TIMER0_CH0_BASE + TIMER_CTRL) = TIMER_STOP;
 }
 
-__attribute__((always_inline)) static inline void clear_timer5_irq(void)
+__attribute__((always_inline)) static inline void clear_timer_irq(void)
 {
-	REG(TIMER0_CH5_BASE + TIMER_INTSTAT) = 1;
+	/* Write-1-to-clear (TRM: TIMER_INTSTATUS.int_pd). Also de-asserts the
+	 * source from INTMUX, which releases FLAG2 bit 12 and the NVIC line. */
+	REG(TIMER0_CH0_BASE + TIMER_INTSTAT) = 1;
 }
 
 /* Advance read_idx by step bytes and batch-write to shared memory every 8 frames. */
@@ -122,25 +135,29 @@ __attribute__((always_inline)) static inline void consume_s16_stereo(int32_t *s3
 }
 
 /* Hand-tuned asm ISR: load-order scheduling to avoid stalls, minimal push/pop. */
-void TIMER0_CH5_IRQHandler(void);
+void TIMER0_CH0_IRQHandler(void);
 
-static void nvic_enable_timer5(void)
+static void nvic_enable_tick_lines(void)
 {
-	/* NVIC_ISER0: set bit 19 to enable IRQ 19 */
-	REG(0xE000E100) = (1u << TIMER0_CH5_IRQ);
+	/* NVIC_ISER0: arms IRQ 16..19 (M0_EXT_IRQ_LINES). Which single line the
+	 * INTMUX actually drives is not documented (TRM Part 1), so all four are
+	 * armed; the other three stay quiet because only INTMUX source 76 is
+	 * unmasked. Safe to collapse to one bit once measured on hardware. */
+	REG(0xE000E100) = M0_EXT_IRQ_LINES;
 }
 
-static void nvic_disable_timer5(void)
+static void nvic_disable_tick_lines(void)
 {
-	/* NVIC_ICER0: set bit 19 to disable IRQ 19 */
-	REG(0xE000E180) = (1u << TIMER0_CH5_IRQ);
+	/* NVIC_ICER0 */
+	REG(0xE000E180) = M0_EXT_IRQ_LINES;
 }
 
 static void hardware_init(void)
 {
-	/* CRU: enable TIMER0_CH5 and PCLK_TIMER */
-	REG(CRU_BASE + CRU_GATE_CON06) = CRU_TIMER5_EN;
-	REG(CRU_BASE + CRU_CLKSEL_CON23) = CRU_TIMER5_100M;
+	/* CRU: ungate pclk_timer0 + clk_timer0_ch0, select 100 MHz on ch0,
+	 * ungate GPIO4 (per-bit wren writes — see rk3506_regs.h) */
+	REG(CRU_BASE + CRU_GATE_CON06) = CRU_TIMER0_CH0_EN;
+	REG(CRU_BASE + CRU_CLKSEL_CON22) = CRU_TIMER0_CH0_100M;
 	REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
 
 	/* GPIO4 B2/B3: digital mode then output, both low */
@@ -148,16 +165,22 @@ static void hardware_init(void)
 	REG(GPIO4_BASE + GPIO_DDR_L) = GPIO4_B23_OUT_DIR;
 	gpio_write_both(0, 0);
 
+	/* INTMUX: unmask TIMER0_CH0 (source 76 -> MASK2 bit 12) so its expiry
+	 * can reach the M0 NVIC. Without this every M0 interrupt source stays
+	 * masked (reset state) and the timer is invisible to the core. RMW so
+	 * any unmask done elsewhere (e.g. a host-side mailbox setup) survives. */
+	REG(INTMUX_IRQ_MASK2) |= INTMUX_SRC_TIMER0_CH0;
+
 	/* Timer: load period, don't start yet */
-	REG(TIMER0_CH5_BASE + TIMER_LOAD0) = DS_PERIOD_TICKS;
-	REG(TIMER0_CH5_BASE + TIMER_CTRL) = TIMER_STOP;
+	REG(TIMER0_CH0_BASE + TIMER_LOAD0) = DS_PERIOD_TICKS;
+	REG(TIMER0_CH0_BASE + TIMER_CTRL) = TIMER_STOP;
 }
 
-/* Re-enable TIMER5 and GPIO4 clocks before starting playback (idle may gate them). */
+/* Re-enable TIMER0_CH0 and GPIO4 clocks before starting playback (idle may gate them). */
 static void clocks_ungate_play(void)
 {
-	REG(CRU_BASE + CRU_GATE_CON06) = CRU_TIMER5_EN;
-	REG(CRU_BASE + CRU_CLKSEL_CON23) = CRU_TIMER5_100M;
+	REG(CRU_BASE + CRU_GATE_CON06) = CRU_TIMER0_CH0_EN;
+	REG(CRU_BASE + CRU_CLKSEL_CON22) = CRU_TIMER0_CH0_100M;
 	REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
 }
 
@@ -202,13 +225,13 @@ int main(void)
 		m0_isr_globs.phase_acc = 0;
 		m0_isr_globs.last_l = m0_isr_globs.last_r = 0;
 		__asm volatile("" ::: "memory"); /* compiler barrier: state visible before IRQ */
-		nvic_enable_timer5();
-		timer5_start();
+		nvic_enable_tick_lines();
+		timer_start();
 		while (shmem->ctrl == M0_CTRL_PLAY)
 			__WFE();
-		timer5_stop();
-		REG(TIMER0_CH5_BASE + TIMER_INTSTAT) = 1; /* clear any pending IRQ before masking */
-		nvic_disable_timer5();
+		timer_stop();
+		clear_timer_irq(); /* clear any pending IRQ before masking */
+		nvic_disable_tick_lines();
 		gpio_write_both(0, 0);
 		clocks_gate_idle();
 	}

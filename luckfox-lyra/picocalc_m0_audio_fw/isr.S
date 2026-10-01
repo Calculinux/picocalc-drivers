@@ -1,8 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Hand-tuned TIMER0_CH5 ISR: load-order scheduling to avoid load-use stalls on Cortex-M0.
+/* Hand-tuned TIMER0_CH0 ISR: load-order scheduling to avoid load-use stalls on Cortex-M0.
  *
  * HIGH-LEVEL BEHAVIOUR:
- *   This ISR runs at ~1 MHz (TIMER0_CH5, DS_PERIOD_TICKS=100). Each tick it:
+ *   This ISR runs at 1 MHz (TIMER0_CH0, 100 MHz clock, DS_PERIOD_TICKS=100).
+ *   Entry first verifies via INTMUX_IRQ_FLAG2 bit 12 that TIMER0_CH0 is the
+ *   source that fired: the NVIC line is shared by everything in INTMUX
+ *   bucket 2 (sources 64-95) and the handler is installed at all four
+ *   hedged vector slots (NVIC 16-19), so a foreign pending source must be
+ *   recognised and left alone (+~6 cycles on the normal path).
+ *
+ *   Each tick it:
  *   1. Clears the timer interrupt and advances a phase accumulator (phase += rate).
  *   2. When phase >= DS_RATE, "consumes" one stereo sample from the host ring buffer
  *      if write_idx != read_idx (else hold last_l/last_r): reads next L/R 16-bit
@@ -17,6 +24,11 @@
  *   2: ldr, str, ldrsh, b/bl (taken), push/pop 1 reg
  *   3: dmb
  *   LDM/STM: 1+N cycles for N registers. Save/restore via r8-r11 + push {lr}/pop {pc}.
+ *
+ * BUILD NOTE: avoid Thumb-1 logical-immediate forms (ANDS/ORR/BIC/MVN #imm).
+ * Several binutils 2.4x distributions (e.g. Fedora's 2.45) refuse to
+ * assemble them for -mcpu=cortex-m0 ("cannot honor width suffix") even
+ * though they are valid ARMv6-M; the register forms assemble everywhere.
  */
 
 .syntax unified
@@ -25,14 +37,15 @@
 
 .section .ramfunc, "ax", %progbits
 .align 2
-.global TIMER0_CH5_IRQHandler
+.global TIMER0_CH0_IRQHandler
 .thumb_func
-.type TIMER0_CH5_IRQHandler, %function
+.type TIMER0_CH0_IRQHandler, %function
 
 /* ---------------------------------------------------------------------------
  * m0_isr_globs struct offsets. All state and constants at fixed offsets from
  * a single base (r5). Left/right DSM state is contiguous for LDM.
  * --------------------------------------------------------------------------- */
+.equ O_INTMUX_FLAG, 24 @ &INTMUX_IRQ_FLAG2 (source discriminator; ex-_pad0)
 .equ O_TIMER,   0   @ Timer base (e.g. TIMER_INTSTAT) for clearing IRQ
 .equ O_GPIO,    4   @ GPIO data register for bit-bang output
 .equ O_PHASE,   8   @ Phase accumulator; when >= DS_RATE we consume a sample
@@ -60,13 +73,24 @@
 
 /* PROLOGUE: save lr and preserve r4-r7 in r8-r11 so we can use r4-r7 without
  * load-use stalls. r5 = &m0_isr_globs for all O_* offsets. */
-TIMER0_CH5_IRQHandler:
+TIMER0_CH0_IRQHandler:
 	push    {lr}                         @ 2  Return address (return via pop {pc})
 	mov     r8, r4                       @ 1  Callee-saved; restore in epilogue
 	mov     r9, r5                       @ 1
 	mov     r10, r6                      @ 1
 	mov     r11, r7                      @ 1
 	ldr     r5, .L_globs                 @ 2  r5 = base pointer for globs
+
+	/* Source identification (B1 discipline): this vector can be entered for
+	 * ANY of the four hedged NVIC lines, so verify that TIMER0_CH0 (INTMUX
+	 * source 76, FLAG2 bit 12) actually raised before touching the timer.
+	 * Foreign/spurious: skip to the epilogue without clearing anything. */
+	ldr     r1, [r5, #O_INTMUX_FLAG]     @ 2
+	ldr     r1, [r1]                     @ 2  INTMUX_IRQ_FLAG2
+	movs    r0, #1                       @ 1  mask = INTMUX_SRC_TIMER0_CH0
+	lsls    r0, r0, #12                  @ 1  (source 76 = FLAG2 bit 12)
+	ands    r1, r1, r0                   @ 1  register AND (see build note)
+	beq     .L_epilogue                  @ 1  foreign source: bail (2 if taken)
 
 	/* Clear timer IRQ, then advance phase. phase += rate; if phase >= DS_RATE
 	 * we consume one stereo sample and subtract DS_RATE (sample-rate timing). */
@@ -179,7 +203,8 @@ TIMER0_CH5_IRQHandler:
 	ldr     r0, [r5, #O_GPIO]           @ 2  GPIO DR address
 	str     r2, [r0]                     @ 2  Write (atomic update of B2/B3)
 
-	/* EPILOGUE: restore r4-r7 from r8-r11, return via pop {pc}. */
+.L_epilogue:
+	/* Restore r4-r7 from r8-r11, return via pop {pc}. */
 	mov     r4, r8                       @ 1
 	mov     r5, r9                       @ 1
 	mov     r6, r10                      @ 1
@@ -188,4 +213,4 @@ TIMER0_CH5_IRQHandler:
 
 .L_globs:
 	.word   m0_isr_globs
-.size TIMER0_CH5_IRQHandler, . - TIMER0_CH5_IRQHandler
+.size TIMER0_CH0_IRQHandler, . - TIMER0_CH0_IRQHandler

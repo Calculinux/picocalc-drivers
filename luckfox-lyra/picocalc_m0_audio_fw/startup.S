@@ -26,10 +26,20 @@ __vectors:
 	.word	0
 	.word	PendSV_Handler
 	.word	SysTick_Handler
-	.rept 19
+	@ IRQ 0-15 (vector indices 16-31): unused by this firmware
+	.rept 16
 	.word	0
 	.endr
-	.word	TIMER0_CH5_IRQHandler
+	@ IRQ 16-19 (indices 32-35): the four M0 external lines driven by the
+	@ INTMUX. The TRM does not state which line carries INTMUX output 2
+	@ (our timer's bucket, sources 64-95), so the same source-safe handler
+	@ is installed at all four. The ISR checks INTMUX_IRQ_FLAG2 bit 12 and
+	@ leaves foreign sources untouched. Collapse to the single measured
+	@ line (and NVIC enable bit) once verified on hardware.
+	.word	TIMER0_CH0_IRQHandler
+	.word	TIMER0_CH0_IRQHandler
+	.word	TIMER0_CH0_IRQHandler
+	.word	TIMER0_CH0_IRQHandler
 
 	.text
 	.thumb_func
@@ -77,6 +87,6 @@ SysTick_Handler:	b .
 	.weak Default_Handler
 Default_Handler:	b .
 
-	/* TIMER0_CH5_IRQHandler is implemented in isr.S (hand-tuned asm) for minimal stalls. */
+	/* TIMER0_CH0_IRQHandler is implemented in isr.S (hand-tuned asm) for minimal stalls. */
 
 	/* _stack_top provided by linker script (end of RAM) */
