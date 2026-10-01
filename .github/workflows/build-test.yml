@@ -33,6 +33,12 @@ jobs:
       run: make -C luckfox-lyra/picocalc_m0_audio_fw check-emu
     - name: Build WFI variant
       run: make -C luckfox-lyra/picocalc_m0_audio_fw -B TICK_WFI=1
+    - name: Build diagnostic firmware and reader tool
+      run: |
+        make -C luckfox-lyra/picocalc_m0_diag_fw
+        make -C luckfox-lyra/picocalc_m0_diag_fw m0diag
+    - name: Run the diagnostic firmware in the emulator
+      run: make -C luckfox-lyra/picocalc_m0_diag_fw check-emu
 
   build-drivers:
     runs-on: ubuntu-latest

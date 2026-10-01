@@ -201,6 +201,9 @@ unaligned start index, clean return on STOP and preserved registers.
 7. The device tree's reserved-memory node for a non-DDR address is accepted at
    boot (Rockchip's `rk3506-amp.dtsi` does the same for `0xFFF80000`).
 
-Suggested order: ALDO4 with a static GPIO level; a firmware that just toggles
-B2 in a loop (proves 1, 2, gives 3 on a scope); the timer at 1 MHz (4); then
-audio.
+Items 1-5 are what the diagnostic firmware in
+[`picocalc_m0_diag_fw`](../picocalc_m0_diag_fw/README.md) measures: load it
+through the same remoteproc and read the results with `m0diag`. Its 500 Hz
+tone on pin 31 also exercises the buffer and ALDO4. Suggested order: set
+ALDO4; run the diagnostics; adjust `DS_TIMER_LOAD`, the tick rate and
+`TICK_WFI` from what they report; then audio.
