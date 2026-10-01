@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * PicoCalc M0 delta-sigma audio driver
- * Uses RK3506 Cortex-M0 core to drive GPIO4_B2/B3 from shared memory ring buffer.
+ * Uses RK3506 Cortex-M0 core to drive GPIO4_B2/B3 from a shared ring buffer.
+ * The header and ring live in system SRAM next to the M0 firmware image (the
+ * m0_shmem reserved-memory node), so the M0 never reads DDR while playing.
  */
 
 #include <asm/barrier.h>
@@ -57,7 +59,7 @@ struct picocalc_m0 {
 	struct snd_pcm_substream *substream;
 	struct rproc *rproc;
 	struct m0_audio_shmem *shmem;
-	void *shmem_virt;  /* WC: uncached to M0; no second map in rproc */
+	void *shmem_virt;  /* WC mapping of the SRAM ring */
 	size_t shmem_size;
 	uint32_t buf_size;
 	spinlock_t lock;
@@ -102,8 +104,10 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 }
 
 /*
- * Caller holds m->lock. Copy at most one period. appl_ptr and copied_frames
- * share runtime->boundary so a full PCM buffer is not mistaken for empty.
+ * Caller holds m->lock. Copy as much as the ring will take, so it stays
+ * topped up between timer callbacks instead of running one period from empty.
+ * appl_ptr and copied_frames share runtime->boundary so a full PCM buffer is
+ * not mistaken for empty.
  */
 static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
 {
@@ -142,9 +146,7 @@ static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
 	else
 		avail_fr = runtime->boundary - copied + appl;
 	space_fr = space / frame_bytes;
-	to_fr = runtime->period_size;
-	if (to_fr > space_fr)
-		to_fr = space_fr;
+	to_fr = space_fr;
 	if (to_fr > avail_fr)
 		to_fr = avail_fr;
 	to_copy = frames_to_bytes(runtime, to_fr);
@@ -200,7 +202,7 @@ static void m0_rproc_work(struct work_struct *work)
 		spin_unlock_irqrestore(&m->lock, flags);
 
 		if (want) {
-			/* Reboot M0 so ISR local read_idx cannot outlive host index reset. */
+			/* Reboot M0 so its local read_idx cannot outlive host index reset. */
 			if (m->rproc_up) {
 				spin_lock_irqsave(&m->lock, flags);
 				m->running = false;
@@ -277,6 +279,8 @@ static enum hrtimer_restart m0_timer_cb(struct hrtimer *t)
 	buf_mask = m->buf_size - 1;
 	read_idx = m->shmem->read_idx;
 	dma_rmb();
+	/* The masked difference is at most buf_size - 1, so this can only fire
+	 * for periods shorter than the ring; hw.period_bytes_max enforces that. */
 	if (((read_idx - m->last_read_idx) & buf_mask) >= period_bytes) {
 		m->last_read_idx = read_idx;
 		elapsed = true;
@@ -307,7 +311,9 @@ static int m0_pcm_open(struct snd_pcm_substream *ss)
 		.channels_max = 2,
 		.buffer_bytes_max = 32768,
 		.period_bytes_min = 1024,
-		.period_bytes_max = 8192,
+		/* Must stay below the ring size: see the period check in
+		 * m0_timer_cb(). Half the ring also leaves a period of margin. */
+		.period_bytes_max = M0_FIXED_BUF_SIZE / 2,
 		.periods_min = 2,
 		.periods_max = 16,
 	};
@@ -318,8 +324,25 @@ static int m0_pcm_open(struct snd_pcm_substream *ss)
 static int m0_pcm_close(struct snd_pcm_substream *ss)
 {
 	struct picocalc_m0 *m = snd_pcm_substream_chip(ss);
+	unsigned long flags;
 
+	spin_lock_irqsave(&m->lock, flags);
 	m->substream = NULL;
+	spin_unlock_irqrestore(&m->lock, flags);
+	return 0;
+}
+
+/*
+ * Called (sleepable) after a stop and before hw_free/prepare/close. Trigger
+ * only flags the stop; wait here until the worker has shut the M0 down and
+ * the timer callback can no longer be copying out of the PCM buffer.
+ */
+static int m0_pcm_sync_stop(struct snd_pcm_substream *ss)
+{
+	struct picocalc_m0 *m = snd_pcm_substream_chip(ss);
+
+	flush_work(&m->rproc_work);
+	hrtimer_cancel(&m->timer);
 	return 0;
 }
 
@@ -400,6 +423,7 @@ static const struct snd_pcm_ops m0_pcm_ops = {
 	.hw_free = m0_pcm_hw_free,
 	.prepare = m0_pcm_prepare,
 	.trigger = m0_pcm_trigger,
+	.sync_stop = m0_pcm_sync_stop,
 	.pointer = m0_pcm_pointer,
 };
 
@@ -454,7 +478,7 @@ static int m0_probe(struct platform_device *pdev)
 		goto put_rproc;
 	}
 	m->shmem_size = rmem->size;
-	/* WC: no A55 cache on M0 stores; writes combine for the ring memcpy */
+	/* SRAM, not system RAM: this is an ioremap_wc underneath */
 	m->shmem_virt = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WC);
 	if (!m->shmem_virt) {
 		ret = -ENOMEM;

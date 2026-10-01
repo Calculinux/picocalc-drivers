@@ -3,7 +3,7 @@
 //
 // Copyright (c) Viktor Nagy
 // First version published at https://github.com/nvitya/rk3506-mcu
-// Ported and extended for PicoCalc (ELF boot address from rproc->bootaddr)
+// Ported and extended for PicoCalc
 
 #define FW_FORMAT_BIN 0
 
@@ -49,6 +49,23 @@ extern struct resource_table *rproc_elf_find_loaded_rsc_table(struct rproc *rpro
 #define RK3506_MCU_TCM_ADDR 0xFFF84000
 #define RK3506_MCU_TCM_SIZE 0x8000
 
+/*
+ * Where the firmware image goes, and what the M0 sees at address 0.
+ *
+ * The Cortex-M0 has no VTOR: it fetches its vectors from address 0, and the
+ * SoC's address converter maps M0 address 0 onto the "code start address"
+ * given to the SiP call. Firmware is therefore linked at 0 (the core cannot
+ * execute at 0xFFF8xxxx in any case: 0xE0000000 and up is execute-never on
+ * ARMv6-M) and its ELF segments carry device addresses 0..size, which
+ * da_to_va() places at RK3506_MCU_CODE_ADDR.
+ *
+ * 0xFFF88000 rather than 0xFFF84000: with stock OP-TEE, 0xFFF84000 switches
+ * the SRAM into TCM mode and locks the A7 out of it until reboot, so the
+ * firmware could never be reloaded (nvitya/rk3506-mcu issue #2).
+ */
+#define RK3506_MCU_CODE_ADDR 0xFFF88000
+#define RK3506_MCU_CODE_SIZE 0x4000
+
 #define RK3506_PMU_BASE 0xFF900000
 #define RK3506_CRU_BASE 0xFF9A0000
 #define RK3506_GRF_BASE 0xFF288000
@@ -83,12 +100,9 @@ static int rk3506_rproc_start(struct rproc *rproc)
 {
 	rk3506_mcu_t *mcu = rproc->priv;
 	struct arm_smccc_res res;
-	uint32_t mcu_entry;
-
-	/* Use ELF boot address so firmware at 0xFFF88000 avoids OP-TEE SRAM lockdown (issue #2) */
-	mcu_entry = (uint32_t)rproc->bootaddr;
-	if (mcu_entry == 0)
-		mcu_entry = 0xFFF84000; /* fallback for BIN or legacy ELF */
+	/* Base of the vector table, not the ELF entry point: the M0 takes its
+	 * initial SP and reset vector from here. */
+	uint32_t mcu_entry = RK3506_MCU_CODE_ADDR;
 
 	dev_info(&rproc->dev, "Starting M0 MCU at 0x%08X...", mcu_entry);
 
@@ -119,12 +133,14 @@ static int rk3506_rproc_load(struct rproc *rproc, const struct firmware *fw)
 {
 	rk3506_mcu_t *mcu = rproc->priv;
 
-	if (fw->size > RK3506_MCU_TCM_SIZE) {
+	void __iomem *dst = mcu->tcm_virt + (RK3506_MCU_CODE_ADDR - RK3506_MCU_TCM_ADDR);
+
+	if (fw->size > RK3506_MCU_CODE_SIZE) {
 		dev_err(&rproc->dev, "M0 MCU FW is too big: size=%u", (uint32_t)fw->size);
 		return -EINVAL;
 	}
-	dev_info(&rproc->dev, "Loading FW: virt_addr=%p, size=%u", mcu->tcm_virt, (uint32_t)fw->size);
-	memcpy_toio(mcu->tcm_virt, fw->data, fw->size);
+	dev_info(&rproc->dev, "Loading FW: virt_addr=%p, size=%u", dst, (uint32_t)fw->size);
+	memcpy_toio(dst, fw->data, fw->size);
 	return 0;
 }
 
@@ -135,9 +151,13 @@ static void *my_da_to_va(struct rproc *rproc, u64 da, size_t len, bool *is_iomem
 	rk3506_mcu_t *mcu = rproc->priv;
 	void __iomem *va;
 
-	/* TCM at 0xFFF84000, size 0x8000; ELF may use 0xFFF88000 (second half).
-	 * Audio shmem at 0x03C00000 is mapped only by picocalc_snd_m0 (WC). */
-	if (da >= RK3506_MCU_TCM_ADDR && (da + len) <= (RK3506_MCU_TCM_ADDR + RK3506_MCU_TCM_SIZE)) {
+	/* M0-local addresses (image linked at 0) land at RK3506_MCU_CODE_ADDR.
+	 * Absolute SRAM addresses are accepted too, for segments an image wants
+	 * placed outside the window the M0 sees at 0. The audio ring in the
+	 * same SRAM bank is mapped separately by picocalc_snd_m0 (WC). */
+	if (da + len <= RK3506_MCU_CODE_SIZE) {
+		va = mcu->tcm_virt + (RK3506_MCU_CODE_ADDR - RK3506_MCU_TCM_ADDR) + da;
+	} else if (da >= RK3506_MCU_TCM_ADDR && (da + len) <= (RK3506_MCU_TCM_ADDR + RK3506_MCU_TCM_SIZE)) {
 		va = mcu->tcm_virt + (da - RK3506_MCU_TCM_ADDR);
 	} else {
 		dev_err(&rproc->dev, "Invalid rproc address: 0x%08llX, len=%zu", (u64)da, len);
@@ -225,6 +245,13 @@ static int rk3506_rproc_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Error enabling clocks: %d", ret);
 		goto unmap_periph;
 	}
+
+	/* hclk_m0 is a gate on aclk_bus_root (CRU_CLKSEL_CON21), so the M0 runs
+	 * at whatever the bus runs at. Firmware with a per-tick cycle budget
+	 * (the audio firmware) is tuned against this number. */
+	if (mcu->num_clks > 0)
+		dev_info(&pdev->dev, "M0 core clock (hclk_m0): %lu Hz\n",
+			 clk_get_rate(mcu->clks[0].clk));
 
 	writel(0x0c000000, mcu->regs_CRU + 0x814);
 	writel(0xbcd3d80, mcu->regs_GRF + 0x090);

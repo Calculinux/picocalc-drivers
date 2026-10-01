@@ -12,6 +12,11 @@
  * m0_shmem and snd_pins are in picocalc-luckfox-lyra.dtsi (base DTB).
  * This overlay only adds the sound and remoteproc devices.
  *
+ * GPIO4_B2/B3 are 1.8 V pads. They reach the speaker/headphone path through
+ * an NC7WZ16 buffer powered from AXP2101 ALDO4, so ALDO4 has to be low enough
+ * for 1.8 V to count as a logic high (about 2.1 V; set by the STM32 firmware).
+ * See luckfox-lyra/docs/m0-audio.md.
+ *
  * To apply at runtime:
  *   mkdir -p /sys/kernel/config/device-tree/overlays/m0-audio
  *   cat /lib/firmware/overlays/m0-audio.dtbo > /sys/kernel/config/device-tree/overlays/m0-audio/dtbo
@@ -42,6 +47,12 @@
                 compatible = "rockchip,rk3506-mcu";
                 reg = <0xfff84000 0x8000>;
                 firmware-name = "rk3506-m0-audio.elf";
+                /* Vendor 6.1 CRU IDs: 74 HCLK_M0 (must stay first: the
+                 * driver reports its rate as the M0 core clock), 104
+                 * STCLK_M0, 76 PCLK_TIMER, 82 CLK_TIMER0_CH5 (the
+                 * firmware's tick; TIMER0_CH5 is M0 NVIC line 19).
+                 * Resets: 90 SRST_H_M0, 91 SRST_M0_JTAG,
+                 * 10 SRST_HRESETN_M0_AC. Mainline numbers these differently. */
                 clocks = <&cru 74>, <&cru 104>,
                          <&cru 76>, <&cru 82>;
                 resets = <&cru 90>, <&cru 91>,

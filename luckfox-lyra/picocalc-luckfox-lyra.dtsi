@@ -143,12 +143,14 @@
  *   - pwm-audio overlay: fsl,picocalc-snd-pwm (hardware mod)
  * See luckfox-lyra/overlays/m0-audio-overlay.dts and pwm-audio-overlay.dts.
  *
- * m0_shmem must be reserved at boot (not by a runtime overlay). 16 KB at
- * 0x03C00000: 64-byte header + 8192-byte ring. Firmware address is fixed.
+ * m0_shmem must be described at boot (not by a runtime overlay). It is the
+ * part of the system SRAM bank at 0xFFF88000 that follows the M0 firmware
+ * image: 64-byte header + 8192-byte ring at 0xFFF89000. Not DDR, so nothing
+ * is taken away from Linux; the address is fixed in the firmware (shmem.h).
  */
 &reserved_memory {
-	m0_shmem: m0-shmem@3c00000 {
-		reg = <0x03c00000 0x4000>;
+	m0_shmem: m0-shmem@fff89000 {
+		reg = <0xfff89000 0x3000>;
 		no-map;
 	};
 };
