@@ -339,6 +339,18 @@ input (clamp), underrun hold, an unaligned start index, clean return on STOP
 and preserved registers. It checks arithmetic and schedule, not timing; the
 idle loop and the handshake are only tested on hardware.
 
+## Checking the output level
+
+`m0level` (firmware directory; build it for the board) reads the two pins
+back from Linux while a stream plays and prints how much of the time each
+is high: the level the firmware is really producing, whatever the analogue
+side does with it. For a 16-bit sample x the duty should be
+0.5 + x * 7/8 / 65536. Measured, interpolating or holding, at a 187.5 or a
+375 MHz core clock: a DC level of +16384 / -8000 gives 0.7187 / 0.3932
+(0.7188 / 0.3932 expected), and a tone of amplitude 20000 an amplitude of
+0.2670 at 100 Hz and 0.265 at 1 kHz (0.2670 expected). Interpolation reads
+0.6 dB lower than holding at 10 kHz, as it should.
+
 ## Diagnosing ticks and dropouts
 
 A `PROFILE=1` firmware also keeps an event log in the SRAM after the ring:

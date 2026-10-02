@@ -55,6 +55,10 @@ m0trace: m0trace.c
 m0hammer: m0hammer.c
 	$(LINUX_CC) -O2 -Wall -Wextra -o $@ $<
 
+# The output level actually on the pins, read back from Linux
+m0level: m0level.c
+	$(LINUX_CC) -O2 -Wall -Wextra -o $@ $< -lm
+
 check_dsm: check_dsm.c $(HDRS)
 	$(HOSTCC) -O2 -Wall -Wextra -o $@ $< -lm
 
@@ -66,6 +70,6 @@ check-emu: $(ELF)
 	$(PYTHON) check_play.py $(ELF)
 
 clean:
-	rm -f $(OBJS) $(ELF) check_ring check_dsm m0trace m0hammer
+	rm -f $(OBJS) $(ELF) check_ring check_dsm m0trace m0hammer m0level
 
 .PHONY: all clean check check-emu
