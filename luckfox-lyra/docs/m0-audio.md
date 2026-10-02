@@ -387,16 +387,58 @@ the ring copy made them late by most of a microsecond a dozen times a
 second. Nothing in the driver can prevent this; whether it can be heard has
 not been checked.
 
+### Pops: what delays the pin write
+
+By ear, with the hiss gone: faint random pops with an ear against the
+speaker in normal use, and a lot of noise while the console is flooded with
+text. The diagnostic firmware times one GPIO4 write, 4096 times over 44 ms
+(`picocalc_m0_diag_fw`, writes not bufferable, TCM); normally every one
+takes 31 core cycles:
+
+| Linux doing | M0's GPIO write |
+|---|---|
+| nothing much | 31 cycles, 4096 of 4096 |
+| console flooded with text (display on SPI0 with DMA, D/C on GPIO0) | 75 % at 31, the rest up to 103 (0.38 us late), mean +9 |
+| reading the SD card on SPI1 (`mmc1`, mmc-spi) | 80-85 % at 31, the rest later, as with the display |
+| writing a GPIO data register as fast as possible | mean 411, up to 657 (3.3 us late); 2 % at 31 |
+| reading 61 MB from the SD card on the SDMMC controller (`mmc0`) | 31, 4096 of 4096 |
+| flood ping over Wi-Fi (USB) | 31, 4095 of 4096 |
+
+So traffic through the SPI controllers and Linux's GPIO writes hold up the
+M0's pin write, far longer than one host write takes; the SDMMC controller
+and USB do not. The TRM has no priority setting for the M0 on the bus. In
+normal use it is the display that matters: each redraw (the console's
+terminal program once a second, every keypress echoed) is a burst of late
+edges, a click. Simulated at 3 MHz under a -40 dBFS tone, a quarter of the
+pin writes late by up to 72 cycles puts the in-band noise at -22 dBFS for as
+long as it lasts; 2 % late, -32 dBFS.
+
+The M0 can see the delay (the write returns late when it is not
+bufferable), so the firmware could measure each one and put what a late
+edge cost back into the modulator, which shapes the error out of the audio
+band: simulated, -22 dBFS becomes -70. A first version is on the branch
+`m0-audio-comp-wip` and **does not work**: it corrects only on late ticks, in
+more cycles than a tick has to spare, so one late tick makes the next late
+or loses it. A working one has to do the correction on every tick, with the
+pin write blocking (25 cycles more than now), and needs a tick of about 128
+core cycles: 1.46 MHz, with the quiet-system noise floor near -64 dBFS
+instead of -79.5. Not worth it as it stands; it depends on getting the loop
+shorter first.
+
+`poptest.sh` in the test directory on the board plays silence in phases
+marked by beeps while it freezes the display, stops the keyboard polling,
+takes Wi-Fi down and floods the console, for telling by ear which matters.
+It stops the console's terminal service, which kills everything started
+from that console: it must be started through `systemd-run` or over SSH.
+
 Earlier observations, for the record: the same number of late ticks with the
 heartbeat LED trigger on or off; in simulation the modulator produces no
 burst of in-band noise when its input drops to digital silence.
 
 ## Open issues
 
-1. **Hiss** was audible on the board with the 63-cycle tick and the old ring
-   updates. Whether the even tick removes it is the first thing to listen
-   for (`tick_even`, `interp` and `ring_sync` can each be switched while
-   testing).
+1. **Hiss**: gone by ear with the even tick (it was plainly audible at 63
+   cycles per tick).
 2. **Quality.** Not measured. Nobody has yet listened critically or looked at
    the output on a scope or analyser, at any tick rate.
 3. **Pin timing with bufferable writes** is inferred, not observed (above).
@@ -411,10 +453,11 @@ burst of in-band noise when its input drops to digital silence.
 6. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.
-7. **Late ticks at each display redraw**, left over once the ring writes
-   were synchronised: see "What the ticking was". Far smaller than what was
-   fixed; whether they are audible has not been checked. A program that
-   redraws continuously while audio plays is the case to listen to.
+7. **Pops from late pin writes**: display redraws, the SPI SD card and
+   Linux's GPIO writes delay the M0's pin write; see "Pops: what delays the
+   pin write". Audible as faint random pops in normal use. A correction in
+   the firmware is possible in principle and too expensive in cycles as the
+   loop stands.
 8. **Bus mode** has not been run with `ring_sync` or with interpolation;
    the measurements are all TCM.
 9. **Pop when a stream ends** (and presumably when it starts): the pins go
