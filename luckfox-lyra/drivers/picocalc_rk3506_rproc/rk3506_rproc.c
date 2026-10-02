@@ -14,8 +14,8 @@
  *    compatible = "rockchip,rk3506-mcu";
  *    reg = <0xfff84000 0x8000>;
  *    firmware-name = "rk3506-m0-audio.elf";
- *    clocks = <&cru HCLK_M0>, <&cru STCLK_M0>,
- *             <&cru PCLK_TIMER>, <&cru CLK_TIMER0_CH5>;
+ *    clocks = <&cru HCLK_M0>, <&cru STCLK_M0>;   (HCLK_M0 first; plus any
+ *             peripheral clocks the firmware needs kept running)
  *    resets = <&cru SRST_H_M0>, <&cru SRST_M0_JTAG>, <&cru SRST_HRESETN_M0_AC>;
  *    reset-names = "h_m0", "m0_jtag", "hresetn_m0_ac";
  *  };
@@ -213,6 +213,10 @@ static int rk3506_rproc_probe(struct platform_device *pdev)
 
 	mcu = rproc->priv;
 	mcu->rproc = rproc;
+	/* Whoever uses the M0 decides when it runs. Booting at probe would
+	 * leave picocalc_snd_m0's rproc_boot() a no-op on a core that is
+	 * already up and idling, so its firmware would never see the stream. */
+	rproc->auto_boot = false;
 
 	mcu->num_clks = devm_clk_bulk_get_all(&pdev->dev, &mcu->clks);
 	if (mcu->num_clks < 0) {

@@ -41,15 +41,11 @@
 #define TICK_IRQ_BIT      (1u << TIMER0_CH5_IRQ)
 
 /* SysTick (core-internal; optional on a Cortex-M0) and the SCB pending bits */
-#define SYST_CSR          0xE000E010U
-#define SYST_RVR          0xE000E014U
-#define SYST_CVR          0xE000E018U
 #define SYST_CALIB        0xE000E01CU
 #define SYST_ENABLE       (1u << 0)
 #define SYST_TICKINT      (1u << 1)
 #define SYST_CLK_CORE     (1u << 2)
 #define SYST_MASK         0x00FFFFFFU
-#define SCB_ICSR          0xE000ED04U
 #define ICSR_PENDSTSET    (1u << 26)
 #define ICSR_PENDSTCLR    (1u << 25)
 

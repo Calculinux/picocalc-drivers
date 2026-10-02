@@ -27,9 +27,9 @@ __vectors:
 	.word	PendSV_Handler
 	.word	SysTick_Handler
 	@ External interrupts (TRM Table 4-4: 19 = TIMER0_CH5, 28-31 = INTMUX0-3).
-	@ The firmware takes none of them: the playback loop reads the timer
-	@ status bit itself (play.S). All 32 slots are still populated so a
-	@ stray enable cannot vector into whatever follows the table.
+	@ The firmware takes no exceptions at all: PRIMASK stays set and a
+	@ pending SysTick only wakes WFI (play.S). All 32 slots are still
+	@ populated so a stray enable cannot vector into whatever follows.
 	.rept 32
 	.word	Default_Handler
 	.endr

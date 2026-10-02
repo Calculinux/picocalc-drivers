@@ -52,12 +52,12 @@ gcc -O2 -o m0diag m0diag.c             # or cross-compile: make m0diag LINUX_CC=
 echo -n /tmp/m0test > /sys/module/firmware_class/parameters/path
 mkdir /sys/kernel/config/device-tree/overlays/m0diag
 cat m0-diag.dtbo > /sys/kernel/config/device-tree/overlays/m0diag/dtbo
-insmod rk3506_rproc.ko                 # boots the firmware named in the overlay
+insmod rk3506_rproc.ko
+echo start > /sys/class/remoteproc/remoteproc0/state     # loads and runs the firmware
 sleep 5
 ./m0diag
 
-echo stop  > /sys/class/remoteproc/remoteproc0/state     # and to run it again:
-echo start > /sys/class/remoteproc/remoteproc0/state
+echo stop  > /sys/class/remoteproc/remoteproc0/state     # stop/start to run it again
 ```
 
 To undo: `echo stop`, `rmmod rk3506_rproc`, `rmdir` the overlay directory,

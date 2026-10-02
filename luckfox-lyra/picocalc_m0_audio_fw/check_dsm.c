@@ -18,7 +18,8 @@
 #include "rk3506_regs.h"
 #include "shmem.h"
 
-#define TICKS       2000000U	/* 2 s per stimulus at 1 MHz */
+#define TICK_HZ     1000000U	/* any rate the firmware might run at */
+#define TICKS       2000000U	/* 2 s per stimulus */
 #define CLAMP       (1 << DSM_CLAMP_SHIFT)
 
 struct dsm {
@@ -75,8 +76,8 @@ static struct result run(int16_t (*gen)(uint32_t n, int32_t arg), int32_t arg)
 
 	for (t = 0; t < TICKS; t++) {
 		phase += M0_SAMPLE_RATE_HZ;
-		if (phase >= DS_RATE_HZ) {
-			phase -= DS_RATE_HZ;
+		if (phase >= TICK_HZ) {
+			phase -= TICK_HZ;
 			d.x = scale_in(gen(n++, arg));
 		}
 		ones += dsm_tick(&d);

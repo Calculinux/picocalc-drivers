@@ -3,20 +3,23 @@
  * PicoCalc M0 delta-sigma audio driver
  * Uses RK3506 Cortex-M0 core to drive GPIO4_B2/B3 from a shared ring buffer.
  * The header and ring live in system SRAM next to the M0 firmware image (the
- * m0_shmem reserved-memory node), so the M0 never reads DDR while playing.
+ * node memory-region points at), so the M0 never reads DDR while playing.
+ * One output bit per SysTick tick on the M0; this driver tells the firmware
+ * how many core clock cycles a tick is and how many ticks a sample lasts.
  */
 
 #include <asm/barrier.h>
 #include <asm/div64.h>
+#include <linux/clk.h>
 #include <linux/compiler.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/remoteproc.h>
-#include <linux/of_reserved_mem.h>
 #include <linux/workqueue.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -31,6 +34,22 @@
 /* Fixed M0 config: ALSA does SRC to this rate; ring size must match firmware */
 #define M0_FIXED_SAMPLE_RATE_HZ  48000U
 #define M0_FIXED_BUF_SIZE        8192U
+/* The firmware spreads the per-sample work over four ticks */
+#define M0_MIN_TICKS_PER_SAMPLE  5U
+#define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
+
+/*
+ * Output bit rate. Higher is better audio (about 12 dB per doubling) as long
+ * as the M0 finishes a tick's work in time. Measured at a 187.5 MHz core
+ * clock, running from SRAM over the bus: the heaviest tick needs about 295
+ * cycles, so 600 kHz (312 cycles) is the highest rate at which every tick
+ * fits. A firmware built with PROFILE=1 reports the worst tick and the
+ * number of overruns, printed here when playback stops. Takes effect at the
+ * next playback start.
+ */
+static unsigned int tick_hz = 600000;
+module_param(tick_hz, uint, 0644);
+MODULE_PARM_DESC(tick_hz, "M0 output bit rate in Hz (default 600000)");
 
 struct m0_audio_shmem {
 	volatile uint32_t magic;
@@ -43,7 +62,12 @@ struct m0_audio_shmem {
 	volatile uint32_t channels;
 	volatile uint32_t format;
 	volatile uint32_t flags;   /* M0_SHMEM_FLAG_WIC_WAKE etc. */
-	uint32_t          _reserved[6];
+	volatile uint32_t tick_cycles;   /* core clock cycles per tick */
+	volatile uint32_t ticks_base;    /* ticks per sample: whole part ... */
+	volatile uint32_t ticks_rem;     /* ... remainder ... */
+	volatile uint32_t ticks_den;     /* ... over this */
+	volatile uint32_t stat_min_cvr;  /* PROFILE firmware: see m0_report_profile() */
+	volatile uint32_t stat_overruns;
 	uint8_t           buffer[];
 };
 
@@ -58,6 +82,8 @@ struct picocalc_m0 {
 	struct snd_card *card;
 	struct snd_pcm_substream *substream;
 	struct rproc *rproc;
+	struct clk *core_clk;      /* hclk_m0: what the M0's SysTick counts */
+	uint32_t tick_cycles;      /* as last given to the firmware */
 	struct m0_audio_shmem *shmem;
 	void *shmem_virt;  /* WC mapping of the SRAM ring */
 	size_t shmem_size;
@@ -66,7 +92,10 @@ struct picocalc_m0 {
 	struct hrtimer timer;
 	ktime_t period_ktime;
 	uint32_t last_read_idx;
-	snd_pcm_uframes_t copied_frames; /* same wrap domain as appl_ptr (boundary) */
+	/* All three count frames in appl_ptr's wrap domain (runtime->boundary) */
+	snd_pcm_uframes_t copied_frames; /* handed to the M0 ring */
+	snd_pcm_uframes_t played_frames; /* consumed by the M0: the hw pointer */
+	snd_pcm_uframes_t elapsed_mark;  /* played_frames at the last period_elapsed */
 	bool running;
 	bool want_play;
 	bool rproc_up;
@@ -82,6 +111,57 @@ static uint32_t m0_ring_space(uint32_t write_idx, uint32_t read_idx, uint32_t bu
 	return read_idx - write_idx - 1;
 }
 
+/*
+ * Caller holds m->lock. A tick is a whole number of core clock cycles as
+ * close to tick_hz as that allows; a sample then lasts hclk / (cycles * rate)
+ * ticks, which the firmware realises as base ticks plus one more whenever
+ * the accumulated remainder reaches the divisor. Left at zero (firmware
+ * defaults) if the core clock is unknown or the request cannot be met.
+ */
+static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
+{
+	unsigned long hclk = m->core_clk ? clk_get_rate(m->core_clk) : 0;
+	uint32_t hz = READ_ONCE(tick_hz);
+	uint32_t cycles = 0, den = 0, base = 0;
+	u64 den64;
+
+	if (hclk && hz) {
+		cycles = DIV_ROUND_CLOSEST(hclk, hz);
+		den64 = (u64)cycles * M0_FIXED_SAMPLE_RATE_HZ;
+		if (cycles >= 2 && cycles <= M0_MAX_TICK_CYCLES && den64 <= U32_MAX) {
+			den = den64;
+			base = hclk / den;
+		}
+	}
+	if (base < M0_MIN_TICKS_PER_SAMPLE) {
+		if (hclk)
+			dev_warn(&m->pdev->dev,
+				 "tick_hz %u not usable with a %lu Hz core clock, using firmware defaults\n",
+				 hz, hclk);
+		cycles = den = base = 0;
+	}
+	m->tick_cycles = cycles;
+	m->shmem->tick_cycles = cycles;
+	m->shmem->ticks_base = base;
+	m->shmem->ticks_rem = den ? hclk % den : 0;
+	m->shmem->ticks_den = den;
+	m->shmem->stat_min_cvr = U32_MAX;
+	m->shmem->stat_overruns = 0;
+}
+
+/* What a PROFILE=1 firmware measured during the stream that just ended */
+static void m0_report_profile(struct picocalc_m0 *m)
+{
+	uint32_t min_cvr = m->shmem->stat_min_cvr;
+	uint32_t overruns = m->shmem->stat_overruns;
+
+	if (min_cvr == U32_MAX || !m->tick_cycles)
+		return;
+	dev_info(&m->pdev->dev,
+		 "M0 tick: longest %u of %u core cycles, %u ticks overran\n",
+		 m->tick_cycles - 1 - min_cvr, m->tick_cycles, overruns);
+}
+
 /* Caller holds m->lock. PLAY + zeroed indices only after M0 is down. */
 static void m0_init_header_locked(struct picocalc_m0 *m)
 {
@@ -90,6 +170,7 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 	if (!m->substream || !m->substream->runtime || !m->shmem)
 		return;
 	runtime = m->substream->runtime;
+	m0_set_tick_timing_locked(m);
 	m->shmem->magic = M0_AUDIO_MAGIC;
 	m->shmem->write_idx = 0;
 	m->shmem->read_idx = 0;
@@ -103,9 +184,29 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 	m->last_read_idx = 0;
 }
 
+static snd_pcm_uframes_t m0_frames_since(struct snd_pcm_runtime *runtime,
+					 snd_pcm_uframes_t now, snd_pcm_uframes_t then)
+{
+	return now >= then ? now - then : runtime->boundary - then + now;
+}
+
+/* Caller holds m->lock. Fold the M0's read_idx progress into played_frames. */
+static void m0_update_played_locked(struct picocalc_m0 *m, struct snd_pcm_runtime *runtime)
+{
+	uint32_t read_idx = m->shmem->read_idx;
+	uint32_t delta = (read_idx - m->last_read_idx) & (m->buf_size - 1);
+
+	m->last_read_idx = read_idx;
+	m->played_frames += bytes_to_frames(runtime, delta);
+	if (m->played_frames >= runtime->boundary)
+		m->played_frames -= runtime->boundary;
+}
+
 /*
- * Caller holds m->lock. Copy as much as the ring will take, so it stays
- * topped up between timer callbacks instead of running one period from empty.
+ * Caller holds m->lock. Top the ring up from the PCM buffer, so it does not
+ * run one period from empty. At most buffer_size - period_size frames are kept
+ * between the PCM buffer and the M0: the hw pointer (played_frames) must never
+ * move a whole buffer between two looks at it, or ALSA cannot tell where it is.
  * appl_ptr and copied_frames share runtime->boundary so a full PCM buffer is
  * not mistaken for empty.
  */
@@ -115,7 +216,7 @@ static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
 	struct snd_pcm_runtime *runtime;
 	uint32_t read_idx, write_idx, space, to_copy;
 	uint32_t buffer_bytes, buf_mask, rpos, dma_pos, left, chunk, frame_bytes;
-	snd_pcm_uframes_t appl, copied, avail_fr, to_fr, space_fr;
+	snd_pcm_uframes_t appl, copied, avail_fr, to_fr, space_fr, in_flight, max_flight;
 	uint8_t *ring;
 	const uint8_t *dma_area;
 
@@ -134,21 +235,25 @@ static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
 	dma_area = (const uint8_t *)runtime->dma_area;
 	buf_mask = m->buf_size - 1;
 
-	read_idx = m->shmem->read_idx;
+	m0_update_played_locked(m, runtime);
+	read_idx = m->last_read_idx;
 	dma_rmb();
 	write_idx = m->shmem->write_idx;
 
 	space = m0_ring_space(write_idx, read_idx, m->buf_size);
 	appl = READ_ONCE(runtime->control->appl_ptr);
 	copied = m->copied_frames;
-	if (appl >= copied)
-		avail_fr = appl - copied;
-	else
-		avail_fr = runtime->boundary - copied + appl;
+	avail_fr = m0_frames_since(runtime, appl, copied);
 	space_fr = space / frame_bytes;
 	to_fr = space_fr;
 	if (to_fr > avail_fr)
 		to_fr = avail_fr;
+	in_flight = m0_frames_since(runtime, copied, m->played_frames);
+	max_flight = runtime->buffer_size - runtime->period_size;
+	if (in_flight >= max_flight)
+		return;
+	if (to_fr > max_flight - in_flight)
+		to_fr = max_flight - in_flight;
 	to_copy = frames_to_bytes(runtime, to_fr);
 	if (!to_copy)
 		return;
@@ -212,6 +317,7 @@ static void m0_rproc_work(struct work_struct *work)
 				hrtimer_cancel(&m->timer);
 				rproc_shutdown(m->rproc);
 				m->rproc_up = false;
+				m0_report_profile(m);
 				continue;
 			}
 			hrtimer_cancel(&m->timer);
@@ -250,6 +356,7 @@ static void m0_rproc_work(struct work_struct *work)
 		if (m->rproc_up) {
 			rproc_shutdown(m->rproc);
 			m->rproc_up = false;
+			m0_report_profile(m);
 		}
 		spin_lock_irqsave(&m->lock, flags);
 		want = m->want_play;
@@ -265,7 +372,8 @@ static enum hrtimer_restart m0_timer_cb(struct hrtimer *t)
 	struct picocalc_m0 *m = container_of(t, struct picocalc_m0, timer);
 	struct snd_pcm_substream *ss;
 	unsigned long flags;
-	uint32_t read_idx, period_bytes, buf_mask;
+	struct snd_pcm_runtime *runtime;
+	snd_pcm_uframes_t since;
 	bool elapsed = false;
 
 	spin_lock_irqsave(&m->lock, flags);
@@ -274,15 +382,13 @@ static enum hrtimer_restart m0_timer_cb(struct hrtimer *t)
 		spin_unlock_irqrestore(&m->lock, flags);
 		return HRTIMER_NORESTART;
 	}
-	m0_copy_to_ring_locked(m);
-	period_bytes = m->shmem->period_bytes;
-	buf_mask = m->buf_size - 1;
-	read_idx = m->shmem->read_idx;
-	dma_rmb();
-	/* The masked difference is at most buf_size - 1, so this can only fire
-	 * for periods shorter than the ring; hw.period_bytes_max enforces that. */
-	if (((read_idx - m->last_read_idx) & buf_mask) >= period_bytes) {
-		m->last_read_idx = read_idx;
+	runtime = ss->runtime;
+	m0_copy_to_ring_locked(m); /* also brings played_frames up to date */
+	since = m0_frames_since(runtime, m->played_frames, m->elapsed_mark);
+	if (since >= runtime->period_size) {
+		m->elapsed_mark += since - since % runtime->period_size;
+		if (m->elapsed_mark >= runtime->boundary)
+			m->elapsed_mark -= runtime->boundary;
 		elapsed = true;
 	}
 	spin_unlock_irqrestore(&m->lock, flags);
@@ -311,8 +417,8 @@ static int m0_pcm_open(struct snd_pcm_substream *ss)
 		.channels_max = 2,
 		.buffer_bytes_max = 32768,
 		.period_bytes_min = 1024,
-		/* Must stay below the ring size: see the period check in
-		 * m0_timer_cb(). Half the ring also leaves a period of margin. */
+		/* Half the ring: a period of data can then always be queued
+		 * ahead of the M0 while another is being played. */
 		.period_bytes_max = M0_FIXED_BUF_SIZE / 2,
 		.periods_min = 2,
 		.periods_max = 16,
@@ -377,6 +483,8 @@ static int m0_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 			break;
 		}
 		m->copied_frames = 0;
+		m->played_frames = 0;
+		m->elapsed_mark = 0;
 		/* Header/PLAY are written in work after M0 is confirmed down. */
 		if (m->rproc_up && m->shmem)
 			m->shmem->ctrl = M0_CTRL_STOP;
@@ -408,11 +516,20 @@ static int m0_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 static snd_pcm_uframes_t m0_pcm_pointer(struct snd_pcm_substream *ss)
 {
 	struct picocalc_m0 *m = snd_pcm_substream_chip(ss);
+	struct snd_pcm_runtime *runtime = ss->runtime;
+	snd_pcm_uframes_t pos;
+	unsigned long flags;
 
-	/* Copy-to-ring model: hw_ptr is frames handed to the M0 ring */
-	if (!ss->runtime->buffer_size)
+	if (!runtime->buffer_size)
 		return 0;
-	return m->copied_frames % ss->runtime->buffer_size;
+	/* The hw pointer is what the M0 has actually played (it publishes its
+	 * ring read index every 8 frames), not what has been queued for it. */
+	spin_lock_irqsave(&m->lock, flags);
+	if (m->running && m->shmem)
+		m0_update_played_locked(m, runtime);
+	pos = m->played_frames % runtime->buffer_size;
+	spin_unlock_irqrestore(&m->lock, flags);
+	return pos;
 }
 
 static const struct snd_pcm_ops m0_pcm_ops = {
@@ -432,7 +549,7 @@ static int m0_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *np = dev->of_node;
 	struct picocalc_m0 *m;
-	struct reserved_mem *rmem;
+	struct resource res;
 	struct device_node *rproc_np;
 	struct device_node *mem_np;
 	int ret;
@@ -465,26 +582,36 @@ static int m0_probe(struct platform_device *pdev)
 		ret = -EINVAL;
 		goto put_rproc;
 	}
-	rmem = of_reserved_mem_lookup(mem_np);
+	/* Any node with a reg will do: the ring is SRAM, not memory Linux
+	 * manages, so it need not be a boot-time reserved-memory entry and an
+	 * overlay can describe it. */
+	ret = of_address_to_resource(mem_np, 0, &res);
 	of_node_put(mem_np);
-	if (!rmem) {
-		dev_err(dev, "missing memory-region / reserved-mem\n");
+	if (ret) {
+		dev_err(dev, "memory-region has no usable reg\n");
+		goto put_rproc;
+	}
+	if (resource_size(&res) < M0_HEADER_SIZE + M0_FIXED_BUF_SIZE) {
+		dev_err(dev, "memory-region too small (%pR)\n", &res);
 		ret = -EINVAL;
 		goto put_rproc;
 	}
-	if (rmem->size < M0_HEADER_SIZE + M0_FIXED_BUF_SIZE) {
-		dev_err(dev, "memory-region too small (%zu)\n", (size_t)rmem->size);
-		ret = -EINVAL;
-		goto put_rproc;
-	}
-	m->shmem_size = rmem->size;
+	m->shmem_size = resource_size(&res);
 	/* SRAM, not system RAM: this is an ioremap_wc underneath */
-	m->shmem_virt = devm_memremap(dev, rmem->base, rmem->size, MEMREMAP_WC);
+	m->shmem_virt = devm_memremap(dev, res.start, resource_size(&res), MEMREMAP_WC);
 	if (!m->shmem_virt) {
 		ret = -ENOMEM;
 		goto put_rproc;
 	}
 	m->shmem = (struct m0_audio_shmem *)m->shmem_virt;
+
+	/* Optional: without it the firmware falls back to its built-in timing */
+	m->core_clk = devm_clk_get_optional(dev, NULL);
+	if (IS_ERR(m->core_clk)) {
+		ret = PTR_ERR(m->core_clk);
+		goto put_rproc;
+	}
+	of_property_read_u32(np, "tick-rate-hz", &tick_hz);
 
 	if (of_property_read_u32(np, "ring-buffer-bytes", &m->buf_size))
 		m->buf_size = M0_FIXED_BUF_SIZE;

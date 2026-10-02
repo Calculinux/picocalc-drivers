@@ -12,11 +12,11 @@ CFLAGS  = -mcpu=cortex-m0 -mthumb -Os -ffunction-sections -fdata-sections \
           -Wall -Wextra -nostdlib -I.
 LDFLAGS = -T rk3506-m0-audio.ld -nostdlib -Wl,--gc-sections
 
-# make TICK_WFI=1: sleep in WFI between ticks instead of polling the timer
-# status bit (see play.S). Polling is the default because it depends on
-# nothing but the timer.
-ifeq ($(TICK_WFI),1)
-CFLAGS += -DM0_TICK_WFI
+# make PROFILE=1: record the longest tick and count overruns (see play.S);
+# the host driver reports them when playback stops. Costs a few cycles per
+# tick, so not for normal use.
+ifeq ($(PROFILE),1)
+CFLAGS += -DM0_PROFILE
 endif
 
 OBJS = startup.o main.o play.o resource_table.o
@@ -27,7 +27,7 @@ all: $(ELF)
 $(ELF): $(OBJS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
 
-HDRS = rk3506_regs.h shmem.h
+HDRS = rk3506_regs.h shmem.h play.h
 
 %.o: %.c $(HDRS)
 	$(CC) $(CFLAGS) -c -o $@ $<
