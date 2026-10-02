@@ -9,7 +9,8 @@
  * this module halves each of those first (so nothing is ever above its usual
  * rate), then sets clk_gpll_div to GPLL / 4: the others are back where they
  * were and aclk_bus_root is at 375 MHz. Unloading undoes it in the opposite
- * order. All through the clock framework, so the rates Linux reports stay true.
+ * order. All through the clock framework, so the rates Linux reports stay
+ * true; while loaded, none of the other clocks can be set above its old rate.
  */
 #include <linux/clk.h>
 #include <linux/clk-provider.h>
@@ -94,10 +95,17 @@ static int __init m0clk_init(void)
 		i = ARRAY_SIZE(sib);
 		goto undo;
 	}
-	for (i = 0; i < ARRAY_SIZE(sib); i++)
+	for (i = 0; i < ARRAY_SIZE(sib); i++) {
+		/* Their parent is twice as fast now: nobody may take that as
+		 * leave to run one of them faster than it ever was. Setting a
+		 * limit makes the framework go back to the last rate asked for,
+		 * which is half; so ask for the old rate again after it. */
+		clk_set_max_rate(sib_clk[i], sib_rate[i]);
+		clk_set_rate(sib_clk[i], sib_rate[i]);
 		if (clk_get_rate(sib_clk[i]) != sib_rate[i])
 			pr_warn("m0clk: %s is now %lu, was %lu\n", sib[i].name,
 				clk_get_rate(sib_clk[i]), sib_rate[i]);
+	}
 	report("after");
 	return 0;
 
@@ -111,7 +119,9 @@ static void __exit m0clk_exit(void)
 {
 	int i;
 
-	clk_set_rate(gpll_div, SLOW_HZ);
+	for (i = 0; i < ARRAY_SIZE(sib); i++)
+		clk_set_max_rate(sib_clk[i], ULONG_MAX);
+	clk_set_rate(gpll_div, SLOW_HZ);	/* the others are at half for a moment */
 	for (i = 0; i < ARRAY_SIZE(sib); i++)
 		clk_set_rate(sib_clk[i], sib_rate[i]);
 	report("restored");

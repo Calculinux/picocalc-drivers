@@ -162,8 +162,10 @@ through a divider of its own. Halving every one of those and then setting
 `clk_gpll_div` to GPLL / 4 leaves them all where they were and puts the M0 at
 375 MHz, with the GPIO clock exactly a quarter of it. `picocalc_m0_diag_fw/
 m0clk` is a module that does that through the clock framework when loaded
-and undoes it when removed. **An experiment**: the TRM gives no limit for this
-clock.
+and undoes it when removed; while it is loaded none of those other clocks
+can be set above its old rate (their parent being twice as fast, a driver
+could otherwise be handed twice the clock it expects). **An experiment**: the
+TRM gives no limit for this clock.
 
 Measured on the board at 375 MHz, firmware as TCM:
 
@@ -177,11 +179,14 @@ Measured on the board at 375 MHz, firmware as TCM:
 
 The audio firmware plays at 375 MHz with a 124-cycle tick and keeps exact
 pace; the display and its DMA work; the delays a display flood causes are
-the same in nanoseconds. That is all the testing it has had. The board
-**hung once** at 375 MHz, while the display's SPI controller was being
-unbound and bound to another driver (the same operation had worked at
-375 MHz minutes earlier); whether the clock was the cause is not known.
-Nothing is known about margins, temperature or power.
+the same in nanoseconds. A minute with audio playing, the console flooded
+and the SPI SD card being read passed without kernel errors (51.7 C), and
+the clock was switched up and down several times with the M0 running. That
+is all the testing it has had. The board **hung once** at 375 MHz, while the
+display's SPI controller was being unbound and bound to another driver, with
+an earlier version of the module that did not yet cap the other clocks (the
+same operation had worked at 375 MHz minutes earlier); whether the clock was
+the cause is not known. Nothing is known about margins or power.
 
 What it would buy: the uncorrected loop needs 44 to 56 of the 124 cycles. A
 correction for late pin writes (below) needs the blocking write, 49 cycles
@@ -459,6 +464,12 @@ pin write blocking (25 cycles more than now), and needs a tick of about 128
 core cycles: 1.46 MHz, with the quiet-system noise floor near -64 dBFS
 instead of -79.5. Not worth it as it stands; it depends on getting the loop
 shorter first.
+
+**The SPI SD card is the worst offender.** While `mmc1` is being read the M0
+does not just get late edges, it falls about 2 % behind (20 ms a second,
+the same at 187.5 and 375 MHz): the SPI driver moves that card's data with
+the CPU, in long runs of back-to-back register accesses, and the M0 is shut
+out for whole ticks at a time. Not yet looked into.
 
 **The display: DMA burst length.** The kernel's `spi-rockchip` sends pixel
 data by DMA in bursts of a quarter of the FIFO, and the M0's pin write waits
