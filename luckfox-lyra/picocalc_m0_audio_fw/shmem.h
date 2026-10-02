@@ -20,7 +20,9 @@
  * SysTick slowed to one wake every M0_IDLE_CYCLES core cycles (a few ms),
  * asleep in WFI in between, looking at ctrl on each wake.
  *
- *   host: wait for m0_state == IDLE, fill in the header, ctrl = PLAY
+ *   host: wait for m0_state == IDLE, fill in the header, zero the ring
+ *         frame just before read_idx (it is what plays until the first
+ *         frame is fetched, and on an underrun straight away), ctrl = PLAY
  *   M0:   sees PLAY at its next idle wake, m0_state = PLAY, plays
  *   host: ctrl = STOP
  *   M0:   sees STOP within one sample, drives the pins low, m0_state = IDLE
@@ -61,9 +63,10 @@
 #define M0_SHMEM_STAT_MIN_CVR  56
 #define M0_SHMEM_STAT_OVERRUNS 60
 
-/* One sample must last at least this many ticks (play.S spreads the per-sample
- * work over the last four ticks of a sample). */
-#define M0_MIN_TICKS_PER_SAMPLE 5
+/* One sample must last at least this many ticks: play.S gives each step of
+ * the per-sample work a tick of its own (11 in a PROFILE build) and needs one
+ * more. */
+#define M0_MIN_TICKS_PER_SAMPLE 12
 
 #ifndef __ASSEMBLER__
 typedef struct {
@@ -81,15 +84,14 @@ typedef struct {
 	 * Tick timing, set by the host, which knows the M0 core clock (hclk_m0):
 	 *   tick_cycles  core clock cycles per tick (one output bit per tick)
 	 *   ticks_base   whole ticks per sample = hclk / (tick_cycles * sample_rate)
-	 *   ticks_rem    remainder of that division
-	 *   ticks_den    its divisor, tick_cycles * sample_rate
-	 * A sample lasts ticks_base ticks, plus one whenever the accumulated
-	 * remainder reaches ticks_den. All zero: firmware defaults.
+	 *   ticks_frac   the fractional part of that, in units of 2^-32 tick
+	 * A sample lasts ticks_base ticks, plus one whenever ticks_frac, added up
+	 * once per sample, overflows 32 bits. All zero: firmware defaults.
 	 */
 	volatile uint32_t tick_cycles;
 	volatile uint32_t ticks_base;
-	volatile uint32_t ticks_rem;
-	volatile uint32_t ticks_den;
+	volatile uint32_t ticks_frac;
+	volatile uint32_t _reserved;
 	/*
 	 * Written by a PROFILE=1 firmware build, read by the host: the lowest
 	 * SysTick count seen at the end of a tick's work (the tick's work took

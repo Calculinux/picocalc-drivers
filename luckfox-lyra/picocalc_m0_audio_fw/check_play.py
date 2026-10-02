@@ -5,11 +5,10 @@ write with an independent model of play.S.
 
 Needs: pip install unicorn pyelftools   (run via `make check-emu`)
 
-WFI is replaced by a no-op and SysTick always reads "pending", so each loop
-iteration is one tick. GPIO4 DR writes are recorded. The ring is pre-filled
-and kept non-empty except in the underrun test. This checks the arithmetic
-and the per-sample schedule; timing on the real core is what PROFILE=1 and
-picocalc_m0_diag_fw are for.
+WFI is replaced by a no-op, so each pass through a tick is one tick. GPIO4 DR
+writes are recorded. The ring is pre-filled and kept non-empty except in the
+underrun test. This checks the arithmetic and the per-sample schedule; timing
+on the real core is what PROFILE=1 and picocalc_m0_diag_fw are for.
 """
 import math
 import random
@@ -17,7 +16,7 @@ import struct
 import sys
 
 from elftools.elf.elffile import ELFFile
-from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
+from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS, UC_HOOK_MEM_WRITE
 from unicorn.arm_const import (UC_CPU_ARM_CORTEX_M0, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_R4,
                                UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7, UC_ARM_REG_R8,
                                UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11)
@@ -29,22 +28,21 @@ HDR = 64
 RING = 8192
 STACK_TOP = CODE_BASE + CODE_SIZE
 PPB = 0xE000E000
-SCB_ICSR = 0xE000ED04
-PENDSTSET = 1 << 26
 GPIO4_DR = 0xFF1E0000
 RET_ADDR = 0x10000000
 CTRL, WRITE_IDX, READ_IDX = 4, 8, 12
-PS_TICKS_BASE = 28                         # m0_play_state: base, rem, den
+PS_FRAC, PS_PLAIN = 4, 8                    # m0_play_state: what main.c sets
 
 SAMPLE_RATE = 48000
-BATCH = 8
 FS_SHIFT, CLAMP_SHIFT = 15, 20
 MASK32 = 0xFFFFFFFF
+IDX_MASK = RING - 4
 
 
 def timing(core_hz, tick_cycles):
+    """(whole ticks per sample, fraction in 2^-32 tick), as the host computes them."""
     den = tick_cycles * SAMPLE_RATE
-    return core_hz // den, core_hz % den, den
+    return core_hz // den, ((core_hz % den) << 32) // den
 
 
 def s32(v):
@@ -57,64 +55,85 @@ def scale(x):
 
 
 class Model:
-    """Tick-level model of play.S, written from its header comment."""
+    """Tick-level model of play.S, written from its header comment.
 
-    def __init__(self, frames, read_idx, write_idx_fn, tm):
+    Each of the first `steps` ticks of a sample does one step after its
+    modulator pass; the remaining ticks are plain."""
+
+    def __init__(self, frames, read_idx, write_idx_fn, tm, steps):
         self.frames = frames            # list of (l, r), index = ring offset / 4
-        self.read_idx = read_idx & (RING - 4)
         self.write_idx_fn = write_idx_fn
-        self.base, self.rem, self.den = tm
+        self.base, self.frac = tm
+        self.steps = steps
+        self.cur = ((read_idx & IDX_MASK) - 4) & IDX_MASK
+        self.widx = 0
+        self.frame = (0, 0)
+        self.pub = read_idx & IDX_MASK
+        self.published = read_idx
+        self.acc = 0
         self.x = [0, 0]
-        self.nxt = [0, 0]
-        self.next_ticks = self.base
-        self.left = self.base
-        self.err = 0
-        self.batch = 0
-        self.fetched = False
         self.i1 = [0, 0]
         self.i2 = [0, 0]
         self.g = [1 << FS_SHIFT, -(1 << FS_SHIFT)]
         self.word = 0x0C000000
-        self.published = []
+        self.pos = 0                    # tick number within the sample
+        self.length = None              # ticks in this sample, known from step 2
         self.tick_no = 0
+        self.stopped = False
 
-    def tick(self):
+    def clamp(self, ch):
+        lim = 1 << CLAMP_SHIFT
+        if not -lim <= self.i2[ch] < lim:
+            self.i2[ch] = lim - 1 if self.i2[ch] >= 0 else -lim
+
+    def step(self, n, ctrl):
+        if n == 1:
+            if ctrl != 1:
+                self.stopped = True
+        elif n == 2:
+            self.acc += self.frac
+            carry = self.acc >> 32
+            self.acc &= MASK32
+            self.length = self.base + carry
+        elif n == 3:
+            self.widx = self.write_idx_fn(self.tick_no)
+        elif n == 4:
+            nxt = (self.cur + 4) & IDX_MASK
+            if nxt != self.widx:
+                self.cur = nxt
+        elif n == 5:
+            self.frame = self.frames[self.cur // 4]
+        elif n == 6:
+            self.x[0] = scale(self.frame[0])
+            self.clamp(0)
+        elif n == 7:
+            self.x[1] = scale(self.frame[1])
+            self.clamp(1)
+        elif n == 8:
+            self.pub = (self.cur + 4) & IDX_MASK
+        elif n == 9:
+            self.published = self.pub
+        # steps 10, 11 (PROFILE builds) publish statistics only
+
+    def tick(self, ctrl):
+        """Returns the GPIO word written at this tick."""
         out = self.word
-        self.left -= 1
-        if self.left == 0:
-            self.x = list(self.nxt)
-            self.left = self.next_ticks
-        elif self.left == 3:
-            self.err += self.rem
-            self.next_ticks = self.base
-            if self.err >= self.den:
-                self.err -= self.den
-                self.next_ticks += 1
-        elif self.left == 2:
-            self.fetched = self.read_idx != self.write_idx_fn(self.tick_no)
-            if self.fetched:
-                l, r = self.frames[self.read_idx // 4]
-                self.nxt = [scale(l), scale(r)]
-        elif self.left == 1 and self.fetched:
-            self.read_idx = (self.read_idx + 4) & (RING - 4)
-            self.batch += 1
-            if self.batch >= BATCH:
-                self.batch = 0
-                self.published.append(self.read_idx)
         word = 0x0C000C00
         for ch, bit in ((0, 10), (1, 11)):
             self.i1[ch] = s32(self.i1[ch] + self.x[ch] - self.g[ch])
             y = s32(self.i2[ch] + self.i1[ch])
             s = -1 if y < 0 else 0
             self.g[ch] = (2 * s + 1) << FS_SHIFT
-            i2 = s32(y - self.g[ch])
-            lim = 1 << CLAMP_SHIFT
-            if not -lim <= i2 < lim:
-                i2 = lim - 1 if i2 >= 0 else -lim
-            self.i2[ch] = i2
+            self.i2[ch] = s32(y - self.g[ch])
             if s:
                 word -= 1 << bit
         self.word = word
+        self.pos += 1
+        if self.pos <= self.steps:
+            self.step(self.pos, ctrl)
+        if self.length is not None and self.pos >= self.length:
+            self.pos = 0
+            self.length = None
         self.tick_no += 1
         return out
 
@@ -136,46 +155,47 @@ def load(path):
         symtab = elf.get_section_by_name('.symtab')
         entry = symtab.get_symbol_by_name('m0_play')[0]['st_value']
         state = symtab.get_symbol_by_name('m0_play_state')[0]['st_value']
-    uc.mem_write(SCB_ICSR, struct.pack('<I', PENDSTSET))
-    return uc, entry, state
+        steps = symtab.get_symbol_by_name('m0_step_ticks')[0]['st_value']
+    return uc, entry, state, steps
 
 
 def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
     """Returns the number of mismatches."""
-    uc, entry, state_addr = load(path)
+    uc, entry, state_addr, steps = load(path)
     for i, (l, r) in enumerate(frames):
         uc.mem_write(SHMEM + HDR + 4 * i, struct.pack('<hh', l, r))
-    # write_idx = 2 can never equal a frame-aligned read_idx: ring never empty.
+    # write_idx = 2 can never equal a frame-aligned index: ring never empty.
     never_empty = 2
     uc.mem_write(SHMEM + CTRL, struct.pack('<III', 1, never_empty, read_idx))
-    uc.mem_write(state_addr + PS_TICKS_BASE, struct.pack('<III', *tm))
+    assert tm[0] > steps, 'sample shorter than its step ticks'
+    uc.mem_write(state_addr + PS_FRAC, struct.pack('<II', tm[1], tm[0] - steps))
 
     words = []
+    ctrl_at = []                        # ctrl as the firmware would read it after tick n
     state = {'stop_at': ticks}
 
     def write_idx_at(tick):
-        if underrun_after is not None and tick >= underrun_after:
-            return state.get('freeze_idx', never_empty)
-        return never_empty
-
-    def on_icsr(uc, access, addr, size, value, data):
-        uc.mem_write(SCB_ICSR, struct.pack('<I', PENDSTSET))   # always a tick pending
+        # exactly what the firmware reads in the same tick
+        return struct.unpack('<I', uc.mem_read(SHMEM + WRITE_IDX, 4))[0]
 
     def on_gpio(uc, access, addr, size, value, data):
         words.append(value & MASK32)
         n = len(words)
         if underrun_after is not None and n == underrun_after:
-            # empty the ring: write_idx := the firmware's current read position
-            state['freeze_idx'] = model.read_idx
-            uc.mem_write(SHMEM + WRITE_IDX, struct.pack('<I', model.read_idx))
+            # the host "stops writing": two frames ahead of the one being
+            # played, so the ring runs empty within two samples whichever
+            # step of the sample this tick happens to be
+            uc.mem_write(SHMEM + WRITE_IDX, struct.pack('<I', (model.cur + 8) & IDX_MASK))
         if n >= state['stop_at']:
             uc.mem_write(SHMEM + CTRL, struct.pack('<I', 0))
+        ctrl_at.append(0 if n >= state['stop_at'] else 1)
+        # keep the model in step so the hooks above can look at its state
+        expect.append(model.tick(ctrl_at[-1]))
 
-    uc.hook_add(UC_HOOK_MEM_READ, on_icsr, begin=SCB_ICSR, end=SCB_ICSR + 3)
-    uc.hook_add(UC_HOOK_MEM_WRITE, on_icsr, begin=SCB_ICSR, end=SCB_ICSR + 3)
     uc.hook_add(UC_HOOK_MEM_WRITE, on_gpio, begin=GPIO4_DR, end=GPIO4_DR + 3)
 
-    model = Model(frames, read_idx, write_idx_at, tm)
+    model = Model(frames, read_idx, write_idx_at, tm, steps)
+    expect = []
     saved = {UC_ARM_REG_R4: 0x44444444, UC_ARM_REG_R5: 0x55555555, UC_ARM_REG_R6: 0x66666666,
              UC_ARM_REG_R7: 0x77777777, UC_ARM_REG_R8: 0x88888888, UC_ARM_REG_R9: 0x99999999,
              UC_ARM_REG_R10: 0xAAAAAAAA, UC_ARM_REG_R11: 0xBBBBBBBB}
@@ -186,7 +206,6 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
     uc.emu_start(entry | 1, RET_ADDR, count=ticks * 400 + 100000)
 
     bad = 0
-    expect = [model.tick() for _ in range(len(words))]
     for i, (got, want) in enumerate(zip(words, expect)):
         if got != want:
             if bad < 5:
@@ -196,20 +215,22 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
         print(f'  {name}: only {len(words)} ticks before return')
         bad += 1
     # m0_play must have returned (STOP seen within one sample) and kept r4-r11/sp
-    if len(words) > ticks + 2 * (tm[0] + 1):
-        print(f'  {name}: did not stop: {len(words)} ticks')
+    if not model.stopped:
+        print(f'  {name}: firmware returned after {len(words)} ticks, model has not stopped')
+        bad += 1
+    if len(words) > ticks + tm[0] + 1:
+        print(f'  {name}: did not stop within a sample: {len(words)} ticks')
         bad += 1
     for reg, val in saved.items():
         if uc.reg_read(reg) != val:
             print(f'  {name}: callee-saved register clobbered')
             bad += 1
     if uc.reg_read(UC_ARM_REG_SP) != STACK_TOP:
-        print(f'  {name}: stack not balanced')
+        print(f'  {name}: stack pointer not restored')
         bad += 1
     pub = struct.unpack('<I', uc.mem_read(SHMEM + READ_IDX, 4))[0]
-    want_pub = model.published[-1] if model.published else read_idx
-    if pub != want_pub:
-        print(f'  {name}: published read_idx {pub}, model {want_pub}')
+    if pub != model.published:
+        print(f'  {name}: published read_idx {pub}, model {model.published}')
         bad += 1
     ones_l = sum((w >> 10) & 1 for w in words) / max(len(words), 1)
     print(f'{name:36s} {len(words):7d} ticks  left duty {ones_l:.4f}  {"FAIL" if bad else "ok"}')
@@ -224,19 +245,19 @@ def main():
     noise = [(rnd.randint(-32768, 32767), rnd.randint(-32768, 32767)) for _ in range(n)]
     rails = [(rnd.choice((-32768, 32767)), rnd.choice((-32768, 32767))) for _ in range(n)]
     dc = [(16384, -8000)] * n
-    t750k = timing(187500000, 250)      # 15.625 ticks per sample
-    t1m = timing(187500000, 188)        # 20.78
-    t5 = (5, 0, 48000)                  # the fewest ticks per sample allowed
+    t600k = timing(187500000, 312)      # 12.52 ticks per sample: the shortest allowed
+    t1m2 = timing(187500000, 156)       # 25.04
+    t2m4 = timing(187500000, 78)        # 50.08
     bad = 0
-    bad += run(path, 'silence', [(0, 0)] * n, 20000, t750k)
-    bad += run(path, 'dc', dc, 60000, t750k)
-    bad += run(path, 'sine, 750 kHz', sine, 150000, t750k)
-    bad += run(path, 'sine, ~1 MHz', sine, 150000, t1m)
-    bad += run(path, 'sine, 5 ticks per sample', sine, 60000, t5)
-    bad += run(path, 'noise, wraps the ring', noise, 150000, t750k, read_idx=RING - 40)
-    bad += run(path, 'rail to rail (clamps)', rails, 150000, t1m)
-    bad += run(path, 'underrun holds', sine, 60000, t750k, underrun_after=30000)
-    bad += run(path, 'unaligned read_idx', sine, 20000, t750k, read_idx=0x12346)
+    bad += run(path, 'silence', [(0, 0)] * n, 20000, t1m2)
+    bad += run(path, 'dc', dc, 60000, t1m2)
+    bad += run(path, 'sine, 600 kHz', sine, 150000, t600k)
+    bad += run(path, 'sine, 1.2 MHz', sine, 150000, t1m2)
+    bad += run(path, 'sine, 2.4 MHz', sine, 150000, t2m4)
+    bad += run(path, 'noise, wraps the ring', noise, 250000, t1m2, read_idx=RING - 40)
+    bad += run(path, 'rail to rail (clamps)', rails, 250000, t2m4)
+    bad += run(path, 'underrun holds', sine, 60000, t1m2, underrun_after=30000)
+    bad += run(path, 'unaligned read_idx', sine, 20000, t1m2, read_idx=0x12346)
     if bad:
         print(f'check_play: {bad} FAILED')
         return 1

@@ -1,23 +1,36 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* m0_play() and the state it keeps in memory (play.S). Word offsets into
- * m0_play_state; main.c fills in the tick timing before calling m0_play(). */
+/* m0_play() and the state it keeps in memory (play.S). Byte offsets into
+ * m0_play_state; main.c fills in the sample timing before calling m0_play().
+ * While m0_play() runs, SP points at this block. */
 
 #ifndef M0_PLAY_H
 #define M0_PLAY_H
 
-#define PS_NEXT_L      0   /* prefetched left sample, already scaled */
-#define PS_NEXT_R      4
-#define PS_NEXT_TICKS  8   /* how many ticks that sample lasts */
-#define PS_READ_IDX    12  /* ring read index, bytes */
-#define PS_ERR         16  /* accumulated remainder (Bresenham) */
-#define PS_BATCH       20  /* samples since read_idx was published */
-#define PS_FETCHED     24  /* nonzero: this sample's frame came out of the ring */
-#define PS_TICKS_BASE  28  /* set by main.c: see ticks_* in shmem.h */
-#define PS_TICKS_REM   32
-#define PS_TICKS_DEN   36
-#define PS_MIN_CVR     40  /* PROFILE: lowest SysTick count seen at end of work */
-#define PS_OVERRUNS    44  /* PROFILE: ticks that ran into the next one */
-#define PS_SIZE        48
+#define PS_ACC        0   /* fractional ticks accumulated (2^-32 of a tick) */
+#define PS_FRAC       4   /* set by main.c: added to PS_ACC once per sample */
+#define PS_PLAIN      8   /* set by main.c: plain ticks per sample before any carry */
+#define PS_CUR        12  /* ring offset of the frame being played */
+#define PS_WIDX       16  /* snapshot of the host's write_idx */
+#define PS_FRAME      20  /* that frame: left in [15:0], right in [31:16] */
+#define PS_PUB        24  /* read_idx to publish: the next frame to fetch */
+#define PS_SAVED_SP   28
+#define PS_MIN_CVR    32  /* PROFILE: lowest SysTick count seen at end of work */
+#define PS_OVERRUNS   36  /* PROFILE: ticks that ran into the next one */
+/* Constants kept here so the steps can load them SP-relative */
+#define PS_K_SHMEM    40  /* M0_SHMEM_ADDR */
+#define PS_K_RING     44  /* address of ring byte 0 */
+#define PS_K_MASK     48  /* ring index mask, frame aligned */
+#define PS_K_CLAMP    52  /* largest i2 the clamp allows */
+#define PS_K_CVR      56  /* &SYST_CVR */
+#define PS_SIZE       60
+
+/* Ticks at the start of every sample that each carry one step of the
+ * per-sample work (play.S); the rest of the sample is plain ticks. */
+#ifdef M0_PROFILE
+#define M0_STEP_TICKS 11
+#else
+#define M0_STEP_TICKS 9
+#endif
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>

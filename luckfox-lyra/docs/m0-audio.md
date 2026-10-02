@@ -127,15 +127,29 @@ firmware.
 
 ## Playback loop (`play.S`)
 
-`m0_play()` owns all registers and keeps both modulators' state in them. Per
-tick: WFI, **write the GPIO word computed on the previous tick**, clear the
-pending bit, count down to the next sample, run both modulators. The last
-four ticks of each sample share out the per-sample work so that no tick
-carries all of it: check `ctrl` and work out the next sample's length; read
-the next frame from the ring; advance and publish `read_idx`; swap the frame in.
+`m0_play()` owns every register, SP included (it points at the loop's small
+state block, so loads from it need no address register), and keeps both
+modulators' state in registers. A tick is: WFI, **write the GPIO word
+computed on the previous tick**, clear the pending bit, run both modulators.
 
-Measured with a `PROFILE=1` build (the loop records the longest tick and
-counts overruns; the driver prints them when a stream ends), two-second tone:
+The per-sample work is cut into nine steps of at most about a dozen cycles
+(stop check; sample length; snapshot `write_idx`; move to the next frame
+unless the ring is empty; fetch; left sample in and clamp; right sample in
+and clamp; compute `read_idx`; publish it). Each of the first nine ticks of a
+sample carries one step as straight-line code, so no tick is much longer
+than a plain one and nothing is dispatched; the rest of the sample is plain
+ticks in a counted loop. Left and right change one tick apart. The clamp
+runs once per sample rather than every tick: simulated with the worst inputs
+the state then peaks at 2^24, against a wrap at 2^31.
+
+Cycle counts from the listing, as TCM: about 60 for the tick itself, 65 for a
+plain tick with its loop count, at most about 75 for a step tick. Not yet
+measured on the board.
+
+The figures below are for the **previous** loop (per-sample work on four
+ticks, clamp on every tick), measured with its `PROFILE=1` build (the loop
+records the longest tick and counts overruns; the driver prints them when a
+stream ends), two-second tone:
 
 | Mode | `tick_hz` | Cycles per tick | Ticks that overran |
 |---|---|---|---|
@@ -188,8 +202,8 @@ ALDO4's actual value has not been measured.
 
 ## Host side
 
-- The hw pointer is what the M0 has played (its ring read index), not what
-  has been queued. At most `buffer_size - period_size` frames are queued
+- The hw pointer is what the M0 has played (its ring read index, published
+  every frame), not what has been queued. At most `buffer_size - period_size` frames are queued
   ahead, so the pointer cannot move a whole buffer between two looks.
 - `period_bytes_max` is half the ring.
 - `sync_stop` waits for the worker (and with it the M0's return to idle) and
@@ -220,11 +234,11 @@ loop and the handshake are only tested on hardware.
    design overwrites in the first SRAM bank.
 3. **Quality.** Not measured. Nobody has yet listened critically or looked at
    the output on a scope or analyser.
-4. **More speed.** In TCM mode a plain tick is about 90 cycles, of which the
-   modulator is a third and the GPIO write another third. Running the
-   modulator on the A7 and leaving the M0 to shift out a precomputed bit
-   stream would shorten the tick further; raising `aclk_bus_root` to 250 MHz
-   (GPLL / 6) would add a third but changes the bus clock for the whole SoC.
+4. **More speed.** Of the roughly 60 cycles in a tick, the GPIO write is 33
+   and cannot be shortened, and the two modulators are 19. What is left is
+   running the modulator on the A7 (the M0 would only shift out a precomputed
+   bit stream), which costs A7 time, or raising `aclk_bus_root` to 250 MHz
+   (GPLL / 6), which adds a third but changes the bus clock for the whole SoC.
 5. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.

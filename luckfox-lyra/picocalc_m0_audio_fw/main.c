@@ -31,8 +31,9 @@ _Static_assert(M0_IDLE_CYCLES <= SYST_MAX + 1U, "idle period does not fit SysTic
 /* Tick timing when the host gives none (see rk3506_regs.h) */
 #define DEF_DEN   (M0_DEFAULT_TICK_CYCLES * M0_SAMPLE_RATE_HZ)
 #define DEF_BASE  (M0_DEFAULT_CORE_HZ / DEF_DEN)
-#define DEF_REM   (M0_DEFAULT_CORE_HZ % DEF_DEN)
+#define DEF_FRAC  ((uint32_t)(((unsigned long long)(M0_DEFAULT_CORE_HZ % DEF_DEN) << 32) / DEF_DEN))
 _Static_assert(DEF_BASE >= M0_MIN_TICKS_PER_SAMPLE, "default tick rate too low");
+_Static_assert(M0_MIN_TICKS_PER_SAMPLE > M0_STEP_TICKS, "a sample needs a plain tick too");
 
 __attribute__((always_inline)) static inline void gpio_write_both(uint32_t bit_l, uint32_t bit_r)
 {
@@ -60,19 +61,15 @@ static void tick_start(const m0_audio_shmem_t *shmem)
 {
 	uint32_t cycles = shmem->tick_cycles;
 	uint32_t base = shmem->ticks_base;
-	uint32_t rem = shmem->ticks_rem;
-	uint32_t den = shmem->ticks_den;
+	uint32_t frac = shmem->ticks_frac;
 
-	if (cycles < 2U || cycles > SYST_MAX + 1U || base < M0_MIN_TICKS_PER_SAMPLE ||
-	    !den || rem >= den) {
+	if (cycles < 2U || cycles > SYST_MAX + 1U || base < M0_MIN_TICKS_PER_SAMPLE) {
 		cycles = M0_DEFAULT_TICK_CYCLES;
 		base = DEF_BASE;
-		rem = DEF_REM;
-		den = DEF_DEN;
+		frac = DEF_FRAC;
 	}
-	m0_play_state[PS_TICKS_BASE / 4] = base;
-	m0_play_state[PS_TICKS_REM / 4] = rem;
-	m0_play_state[PS_TICKS_DEN / 4] = den;
+	m0_play_state[PS_FRAC / 4] = frac;
+	m0_play_state[PS_PLAIN / 4] = base - M0_STEP_TICKS;
 	tick_set(cycles);
 }
 

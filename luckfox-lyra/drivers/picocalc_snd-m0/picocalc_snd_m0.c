@@ -22,6 +22,7 @@
 #include <linux/hrtimer.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -43,17 +44,16 @@
 /* Fixed M0 config: ALSA does SRC to this rate; ring size must match firmware */
 #define M0_FIXED_SAMPLE_RATE_HZ  48000U
 #define M0_FIXED_BUF_SIZE        8192U
-/* The firmware spreads the per-sample work over four ticks */
-#define M0_MIN_TICKS_PER_SAMPLE  5U
+/* The firmware gives each step of its per-sample work a tick of its own */
+#define M0_MIN_TICKS_PER_SAMPLE  12U
 #define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
 
 /*
  * Output bit rate. Higher is better audio (about 12 dB per doubling) as long
- * as the M0 finishes a tick's work in time. Measured at a 187.5 MHz core
- * clock: the heaviest tick needs about 295 cycles with the firmware in bus
- * mode and about 155 as TCM, so every tick fits up to 600 kHz and 1.2 MHz
- * respectively. The default is the bus-mode figure; the m0-audio overlay,
- * which selects TCM, raises it with tick-rate-hz. A firmware built with
+ * as the M0 finishes a tick's work in time, which depends on the core clock
+ * and on whether the firmware runs as TCM (docs/m0-audio.md has measured
+ * figures). The default is safe for bus mode; the m0-audio overlay, which
+ * selects TCM, raises it with tick-rate-hz. A firmware built with
  * PROFILE=1 reports the worst tick and the number of overruns, printed here
  * when a stream ends. Takes effect at the next playback start.
  */
@@ -74,8 +74,8 @@ struct m0_audio_shmem {
 	volatile uint32_t flags;   /* M0_SHMEM_FLAG_WIC_WAKE etc. */
 	volatile uint32_t tick_cycles;   /* core clock cycles per tick */
 	volatile uint32_t ticks_base;    /* ticks per sample: whole part ... */
-	volatile uint32_t ticks_rem;     /* ... remainder ... */
-	volatile uint32_t ticks_den;     /* ... over this */
+	volatile uint32_t ticks_frac;    /* ... and fraction, in 2^-32 tick */
+	volatile uint32_t _reserved;
 	volatile uint32_t stat_min_cvr;  /* PROFILE firmware: see m0_report_profile() */
 	volatile uint32_t stat_overruns;
 	uint8_t           buffer[];
@@ -125,7 +125,7 @@ static uint32_t m0_ring_space(uint32_t write_idx, uint32_t read_idx, uint32_t bu
  * Caller holds m->lock. A tick is a whole number of core clock cycles as
  * close to tick_hz as that allows; a sample then lasts hclk / (cycles * rate)
  * ticks, which the firmware realises as base ticks plus one more whenever
- * the accumulated remainder reaches the divisor. Left at zero (firmware
+ * the fraction, accumulated in 32 bits, carries. Left at zero (firmware
  * defaults) if the core clock is unknown or the request cannot be met.
  */
 static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
@@ -153,8 +153,7 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 	m->tick_cycles = cycles;
 	m->shmem->tick_cycles = cycles;
 	m->shmem->ticks_base = base;
-	m->shmem->ticks_rem = den ? hclk % den : 0;
-	m->shmem->ticks_den = den;
+	m->shmem->ticks_frac = den ? div_u64((u64)(hclk % den) << 32, den) : 0;
 	m->shmem->stat_min_cvr = U32_MAX;
 	m->shmem->stat_overruns = 0;
 }
@@ -182,6 +181,9 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 		return;
 	runtime = m->substream->runtime;
 	m0_set_tick_timing_locked(m);
+	/* The frame before read_idx is what plays until the first frame is
+	 * fetched, and straight away if the ring starts out empty. */
+	memset(m->shmem->buffer + m->buf_size - 4, 0, 4);
 	m->shmem->magic = M0_AUDIO_MAGIC;
 	m->shmem->write_idx = 0;
 	m->shmem->read_idx = 0;
@@ -528,7 +530,7 @@ static snd_pcm_uframes_t m0_pcm_pointer(struct snd_pcm_substream *ss)
 	if (!runtime->buffer_size)
 		return 0;
 	/* The hw pointer is what the M0 has actually played (it publishes its
-	 * ring read index every 8 frames), not what has been queued for it. */
+	 * ring read index every frame), not what has been queued for it. */
 	spin_lock_irqsave(&m->lock, flags);
 	if (m->running && m->shmem)
 		m0_update_played_locked(m, runtime);
