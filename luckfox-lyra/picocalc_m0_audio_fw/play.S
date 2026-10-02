@@ -11,10 +11,14 @@
  *   SysTick, on the core clock, with its exception enabled but masked by
  *   PRIMASK: the pending exception wakes WFI and is never taken. Measured on
  *   an RK3506 (picocalc_m0_diag_fw): the wake is a constant 3 cycles after
- *   the reload and a GPIO write a constant 33 cycles, with no spurious wakes
- *   in thousands of ticks, so the loop does not re-check why it woke. The
- *   GPIO write is the first instruction after WFI: every output edge lands
- *   the same number of core cycles after its tick, whatever else the tick does.
+ *   the reload and a GPIO write lands a constant time after its instruction,
+ *   with no spurious wakes in thousands of ticks, so the loop does not
+ *   re-check why it woke. The GPIO write is the first instruction after WFI:
+ *   every output edge lands the same number of core cycles after its tick,
+ *   whatever else the tick does. main.c makes the M0's bus writes
+ *   "bufferable", so that write costs the loop about 5 cycles, not 32; the
+ *   modulators run while it completes, and the first bus access of any step
+ *   comes late enough in the tick not to queue behind it.
  *
  * ONE TICK (the TICK macro)
  *      wfi
@@ -64,11 +68,14 @@
  *
  * COST
  *   Do not count cycles from the listing alone: in bus mode this image runs
- *   at about 2.5 cycles per instruction (1 as TCM), and the GPIO write is 33
- *   either way. Build with PROFILE=1: every tick then records the lowest
+ *   at about 2.5 cycles per instruction (1 as TCM). Build with PROFILE=1: every tick then records the lowest
  *   SysTick count seen at the end of its work and whether it ran into the
  *   next tick, and the host driver reports both when a stream ends. That
  *   costs about 17 cycles per tick, 9 of which are included in the figure.
+ *   Measured that way at a 187.5 MHz core clock: as TCM every tick fits in
+ *   59 cycles (3.2 MHz) and not in 57; in bus mode in 156 (1.2 MHz) and not
+ *   in 134. A tick that overruns only delays its own edge and the next tick
+ *   starts late; none are lost unless the work exceeds two ticks.
  *
  * REGISTERS
  *   r0 i1_l   r1 i2_l           r8  x_l           r11 scratch / parked GPIO word

@@ -57,9 +57,9 @@
  * PROFILE=1 reports the worst tick and the number of overruns, printed here
  * when a stream ends. Takes effect at the next playback start.
  */
-static unsigned int tick_hz = 600000;
+static unsigned int tick_hz = 1000000;
 module_param(tick_hz, uint, 0644);
-MODULE_PARM_DESC(tick_hz, "M0 output bit rate in Hz (default 600000)");
+MODULE_PARM_DESC(tick_hz, "M0 output bit rate in Hz (default 1000000)");
 
 struct m0_audio_shmem {
 	volatile uint32_t magic;

@@ -2,7 +2,7 @@
 
 Status: **plays on hardware** (Luckfox Lyra RK3506G2 in a PicoCalc,
 Calculinux 6.1.99, 2026-10-02): test tones through the ALSA device, at a
-1.2 MHz output bit rate with the firmware running as TCM, or 600 kHz in bus
+3 MHz output bit rate with the firmware running as TCM, or 1 MHz in bus
 mode. Audio quality has not been measured or judged yet; see
 [Open issues](#open-issues).
 
@@ -41,18 +41,18 @@ execute-never.) The same image runs in either mode:
 | image at | `0xFFF88000` | `0xFFF84000` |
 | code fetch | over the SoC bus | private port: tightly-coupled memory |
 | straight-line instruction | 2.5 cycles | 1 cycle |
-| heaviest tick | about 295 cycles | about 155 cycles |
-| highest tick rate that fits | 600 kHz | 1.2 MHz |
-| ticks stretched by other bus traffic | about one per Linux ring update | under ten a second |
+| highest tick rate at which every tick fits | 1.2 MHz | 3.2 MHz |
+| ticks stretched by other bus traffic | about one per Linux ring update | a few tens a second |
 | firmware reload | any time | **not until reboot** |
 
 In TCM mode OP-TEE switches the SRAM from `0xFFF84000` to `0xFFF8C000` to the
 M0's private port; Linux reads zeros from it afterwards and there is no call
 to switch back. The loader therefore loads the image once, pins itself in
 memory, and on later stop/start only resets the M0, which re-runs the image
-still in the TCM. The `m0-audio` overlay selects TCM mode; remove
-`rockchip,tcm` and set `tick-rate-hz = <600000>` to develop firmware without
-rebooting.
+still in the TCM. A warm reboot returns the SRAM to bus mode (the next boot's
+DDR-init stage loads into it again). The `m0-audio` overlay selects TCM mode;
+remove `rockchip,tcm` and set `tick-rate-hz = <1000000>` to develop firmware
+without rebooting.
 
 System SRAM, `0xFFF80000..0xFFF8C000`, three 16 KB banks behind one bus port:
 
@@ -68,7 +68,7 @@ DDR-init stage (a 17 KB+ image loaded at `0xFFF81000`); nothing uses it
 afterwards as far as is known, and both this and the upstream loader
 overwrite it. **Suspend-to-RAM has not been tested with it overwritten.**
 Keep the ring in SRAM, not DDR: with the ring in DDR 30 % of ticks overran
-at 600 kHz, because M0 accesses to DDR are slow.
+at 600 kHz (with an earlier, slower loop), because M0 accesses to DDR are slow.
 
 ## Keep-alive and idle
 
@@ -93,14 +93,30 @@ Measured at `hclk_m0` = 187.5 MHz (GPLL 1500 MHz / 8):
 |---|---|---|
 | straight-line instruction | 2.5 | 1 |
 | two-instruction loop with a taken branch | 10 | 4 |
-| GPIO4 DR write, start to finish | 33, constant | 2 |
-| TIMER0 register read, start to finish | 30, constant | 2 |
+| GPIO4 DR write, as the M0 sees it | 32, or 7 with bufferable writes | 2 |
+| GPIO4 DR write then read of the same register | 63, or 59 with bufferable writes | 4 |
+| TIMER0 or GPIO4 register read | 30-32, constant | 2 |
 | core-internal register (NVIC, SysTick) | 2 | 2 |
 | SRAM read at its absolute address / through the address-0 window | 6 / 2 | 2 |
+
+(Each figure includes about two cycles of the measurement itself.)
 
 `hclk_m0` is a gate on `aclk_bus_root` (`CRU_CLKSEL_CON21`): the M0 runs at
 the bus clock and cannot be raised on its own. `clk_gpll_div_100m` is
 93.75 MHz here, not 100, and Linux gates it when it has no user.
+
+### Bufferable writes
+
+`GRF_SOC_CON0` bit 12, `mcu_hprot_bufferable`, makes the interconnect
+acknowledge the M0's bus writes at once and complete them behind its back. A
+GPIO write then holds the M0 for about 5 cycles instead of 30. The write
+still lands at a fixed time after its instruction: a read of the same
+register queued behind it returns after 59 cycles in 4093 of 4096 samples,
+against 63 without the bit. The firmware sets the bit at start-up and runs
+the modulators while the write completes; the first bus access of any
+per-sample step comes late enough in the tick not to queue behind it.
+(Whether the pin edge itself sits at a constant delay has only been inferred
+from that read-back timing, not seen on a scope.)
 
 ## Tick: SysTick and WFI
 
@@ -111,16 +127,16 @@ taken. Measured:
 - wake is a constant 3 cycles after the SysTick reload;
 - consecutive timer-woken wakes are exactly the same number of cycles apart
   (zero spread over 4096);
-- a GPIO write takes a constant 33 cycles.
+- no spurious wakes in thousands of ticks.
 
-So every output edge lands the same number of core cycles after its tick, and
-a tick costs no peripheral access apart from that one GPIO write. Polling a
-TIMER0 status bit instead costs 30 cycles per look and jitters by about
-280 ns; TIMER0 also needs its clock parent selected and enabled by Linux.
+The GPIO write is the first instruction after the wake, so every output edge
+lands the same number of core cycles after its tick. Polling a TIMER0 status
+bit instead costs 30 cycles per look and jitters by about 280 ns; TIMER0 also
+needs its clock parent selected and enabled by Linux.
 
 The driver tells the firmware how many core cycles a tick is and how many
-ticks a sample lasts (whole part plus a remainder spread Bresenham-style),
-from `clk_get_rate()` of `hclk_m0` and its `tick_hz` parameter (also
+ticks a sample lasts (a whole part plus a 32-bit fraction whose carries add a
+tick), from `clk_get_rate()` of `hclk_m0` and its `tick_hz` parameter (also
 `tick-rate-hz` in the device tree). `tick_hz` can be changed at runtime and
 applies from the next stream, so rates can be tried without touching the
 firmware.
@@ -142,47 +158,48 @@ ticks in a counted loop. Left and right change one tick apart. The clamp
 runs once per sample rather than every tick: simulated with the worst inputs
 the state then peaks at 2^24, against a wrap at 2^31.
 
-Cycle counts from the listing, as TCM: about 60 for the tick itself, 65 for a
-plain tick with its loop count, at most about 75 for a step tick. Not yet
-measured on the board.
-
-The figures below are for the **previous** loop (per-sample work on four
-ticks, clamp on every tick), measured with its `PROFILE=1` build (the loop
-records the longest tick and counts overruns; the driver prints them when a
-stream ends), two-second tone:
+Measured with a `PROFILE=1` build (every tick records the longest tick so far
+and whether it ran into the next; the driver prints both when a stream ends;
+the profiling itself costs about 17 cycles per tick), two-second tone:
 
 | Mode | `tick_hz` | Cycles per tick | Ticks that overran |
 |---|---|---|---|
-| bus | 600 kHz | 313 | about 100 (stretched ticks only) |
-| bus | 650 kHz | 288 | 7 % of all ticks |
-| bus | 750 kHz | 250 | 32 % |
-| TCM | 1.0 MHz | 188 | 14 |
-| TCM | 1.2 MHz | 156 | 18 |
-| TCM | 1.25 MHz | 150 | 0.5 % (the tick that publishes `read_idx`) |
-| TCM | 1.3 MHz | 144 | 4 % |
-| TCM | 1.5 MHz | 125 | 15 % |
-| TCM | 2.0 MHz | 94 | 69 % (plain ticks no longer fit) |
+| bus | 1.0 MHz | 188 | 95 (stretched ticks only) |
+| bus | 1.2 MHz | 156 | 195 |
+| bus | 1.4 MHz | 134 | 68 % of all ticks |
+| TCM | 2.0 MHz | 94 | 24 |
+| TCM | 3.0 MHz | 63 | 27-71 |
+| TCM | 3.2 MHz | 59 | 80 |
+| TCM | 3.3 MHz | 57 | 6 % of all ticks |
+| TCM | 3.6 MHz | 52 | 41 % |
 
 An overrun delays that tick's edge and the next tick starts late; ticks are
-not lost unless the work exceeds two ticks.
+not lost unless the work exceeds two ticks. For comparison, the first working
+loop (interrupt-free but with the per-sample work on four ticks, a clamp on
+every tick and unbuffered writes) fitted at 600 kHz in bus mode and 1.2 MHz
+as TCM.
 
 ## Modulator
 
 Per channel, `FS = 32768`, `G = +FS` when the output bit is 1, else `-FS`:
 
 ```
-i1 += x - G_prev;  y = i2 + i1;  bit = (y >= 0);  G = bit ? +FS : -FS;  i2 = clamp(y - G)
+i1 += x - G_prev;  y = i2 + i1;  bit = (y >= 0);  G = bit ? +FS : -FS;  i2 = y - G
 ```
 
-A standard second-order modulator with unity signal gain. Both stages use the
-same full-scale feedback; input is scaled by 7/8; `i2` is clamped to 32x full
-scale, because scaling alone does not stop full-scale noise from running the
-state into int32 wrap. `check_dsm.c` mirrors the arithmetic and asserts this.
+with `i2` clamped once per sample. A standard second-order modulator with
+unity signal gain. Both stages use the same full-scale feedback; input is
+scaled by 7/8; the clamp is there because scaling alone does not stop
+full-scale noise from running the state into int32 wrap. `check_dsm.c`
+mirrors the arithmetic and asserts this.
 
 Simulated in-band SNR (1 kHz tone, 20 Hz-20 kHz, ideal edges) is about 49 dB
-at -3 dBFS for a 1 MHz tick, changing by about 12 dB per doubling: roughly
-40 dB at 600 kHz and 52 dB at 1.2 MHz. That is a simulation of the modulator
-alone, not a measurement of this board.
+at -3 dBFS for a 1 MHz tick and 60 dB at 2 MHz. It flattens above that in
+the simulation, because sample changes are snapped to the tick grid, and on
+real hardware rise/fall asymmetry of the 1-bit output costs more the more
+edges there are. So the best-sounding rate may be below the fastest that
+fits; `tick_hz` is there to find out. None of this is a measurement of the
+board's output.
 
 ## Electrical: ALDO4
 
@@ -203,9 +220,13 @@ ALDO4's actual value has not been measured.
 ## Host side
 
 - The hw pointer is what the M0 has played (its ring read index, published
-  every frame), not what has been queued. At most `buffer_size - period_size` frames are queued
-  ahead, so the pointer cannot move a whole buffer between two looks.
+  every frame), not what has been queued. At most `buffer_size - period_size`
+  frames are queued ahead, so the pointer cannot move a whole buffer between
+  two looks.
 - `period_bytes_max` is half the ring.
+- The frame before the start position is zeroed at stream start: it is what
+  the firmware plays until it has fetched a frame, and what it repeats on an
+  underrun there.
 - `sync_stop` waits for the worker (and with it the M0's return to idle) and
   the timer before the PCM buffer can be freed.
 
@@ -218,29 +239,27 @@ make check-emu       # runs m0_play() from the ELF in Unicorn against a model;
                      # needs: pip install unicorn pyelftools
 ```
 
-`check-emu` compares every GPIO write over 900,000 ticks at three tick
-ratios: silence, DC, sine, noise across the ring wrap, rail-to-rail input
-(clamp), underrun hold, an unaligned start index, clean return on STOP and
-preserved registers. It checks arithmetic and schedule, not timing; the idle
-loop and the handshake are only tested on hardware.
+`check-emu` compares every GPIO write over more than a million ticks at
+three tick rates: silence, DC, sine, noise across the ring wrap, rail-to-rail
+input (clamp), underrun hold, an unaligned start index, clean return on STOP
+and preserved registers. It checks arithmetic and schedule, not timing; the
+idle loop and the handshake are only tested on hardware.
 
 ## Open issues
 
-1. **Reboot after TCM.** Not yet tested: that a warm reboot returns the SRAM
-   to bus mode (the next boot's DDR-init stage loads into it), and that the
-   overlay then loads the firmware again. Others report that it does.
-2. **Suspend.** Untested in either mode: what suspend-to-RAM does to the TCM
+1. **Quality.** Not measured. Nobody has yet listened critically or looked at
+   the output on a scope or analyser, at any tick rate.
+2. **Pin timing with bufferable writes** is inferred, not observed (above).
+3. **Suspend.** Untested in either mode: what suspend-to-RAM does to the TCM
    contents and the M0, and whether anything needs the boot-stage code this
    design overwrites in the first SRAM bank.
-3. **Quality.** Not measured. Nobody has yet listened critically or looked at
-   the output on a scope or analyser.
-4. **More speed.** Of the roughly 60 cycles in a tick, the GPIO write is 33
-   and cannot be shortened, and the two modulators are 19. What is left is
-   running the modulator on the A7 (the M0 would only shift out a precomputed
-   bit stream), which costs A7 time, or raising `aclk_bus_root` to 250 MHz
-   (GPLL / 6), which adds a third but changes the bus clock for the whole SoC.
+4. **More speed.** A tick is now about 40 cycles as TCM, half of it the two
+   modulators. What is left is running the modulator on the A7 (the M0 would
+   only shift out a precomputed bit stream), which costs A7 time, or raising
+   `aclk_bus_root` to 250 MHz (GPLL / 6), which adds a third but changes the
+   bus clock for the whole SoC.
 5. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.
-6. **Residual stretched ticks** in TCM mode (under ten a second): unidentified.
+6. **Stretched ticks** in TCM mode (a few tens a second): unidentified.
 7. **ALDO4 margin**, above.

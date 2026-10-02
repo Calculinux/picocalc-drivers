@@ -11,7 +11,7 @@
 
 #define M0_DIAG_ADDR      0xFFF81000U
 #define M0_DIAG_MAGIC     0x4D304447U  /* "M0DG" */
-#define M0_DIAG_VERSION   3U
+#define M0_DIAG_VERSION   4U
 
 /* The firmware writes the stage BEFORE starting it, so a hang or fault
  * leaves the stage it happened in. */
@@ -38,7 +38,7 @@ enum m0_diag_stage {
 #define M0_DIAG_LAT_PERIOD     1000U    /* timer counts between latency ticks */
 #define M0_DIAG_LAT_N          4096U
 #define M0_DIAG_SLOW_PERIOD    100000U  /* timer counts between slow ticks */
-#define M0_DIAG_SLOW_N         1000U
+#define M0_DIAG_SLOW_N         200U
 #define M0_DIAG_SYST_PERIOD    2000U    /* core clock cycles between SysTick ticks */
 #define M0_DIAG_HIST           64U
 #define M0_DIAG_STAMP_CENTRE   32U      /* histogram bin of the first interval */
@@ -97,6 +97,13 @@ struct m0_diag {
 	 * at a different point of the timer period each time */
 	struct m0_diag_lat acc_gpio;   /* str to GPIO4 DR */
 	struct m0_diag_lat acc_timer;  /* ldr from TIMER0_CH5 INTSTAT */
+	/* For GRF_SOC_CON0.mcu_hprot_bufferable: does a write return before it
+	 * has landed, and when does it land? A read of the same peripheral cannot
+	 * complete before the write ahead of it. */
+	struct m0_diag_lat acc_gpio_rd;    /* ldr from GPIO4 DR */
+	struct m0_diag_lat acc_gpio_wr_rd; /* str then ldr, GPIO4 DR */
+	struct m0_diag_lat acc_gpio_wr_wr; /* str then str, GPIO4 DR */
+	uint32_t grf_soc_con0;             /* as the M0 read it during ACCESS */
 };
 
 #endif /* M0_DIAG_H */

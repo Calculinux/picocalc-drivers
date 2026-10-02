@@ -90,22 +90,24 @@
 
 /* Tick timing comes from the host in the shared header (shmem.h): it knows
  * the core clock rate, the firmware does not. These are used only when the
- * header carries none: 187.5 MHz / 312 = 601 kHz.
+ * header carries none: 187.5 MHz / 188 = 997 kHz, which fits in either mode.
  *
  * The M0 core clock is hclk_m0, a plain gate on aclk_bus_root
  * (CRU_CLKSEL_CON21, shared with the rest of the bus domain), so it cannot
  * be raised for the M0 alone. In bus mode code runs at about 2.5 cycles per
- * instruction (1 as TCM), and a GPIO write takes 33; see play.S for what a
- * tick costs and build with PROFILE=1 to measure it. */
+ * instruction (1 as TCM); see play.S for what a tick costs and build with
+ * PROFILE=1 to measure it. */
 #define M0_DEFAULT_CORE_HZ      187500000U
-#define M0_DEFAULT_TICK_CYCLES  312U
+#define M0_DEFAULT_TICK_CYCLES  188U
 
 /* Modulator: both stages use +/-full-scale (1 << DSM_FS_SHIFT) feedback.
  * The second integrator is clamped to +/-(1 << DSM_CLAMP_SHIFT), 32x full
  * scale: normal programme stays below ~11x, while full-scale noise or
  * Nyquist-rate square waves would otherwise run the state into int32 wrap.
  * Simulated at a 1 MHz tick this gives about 49 dB SNR over 20 Hz-20 kHz at
- * -3 dBFS (8-9 bits); each doubling of the tick rate is worth about 12 dB. */
+ * -3 dBFS (8-9 bits), and each doubling of the tick rate is worth up to
+ * about 12 dB, less as other effects (sample changes snapped to the tick
+ * grid, edge asymmetry) start to matter. */
 #define DSM_FS_SHIFT      15
 #define DSM_CLAMP_SHIFT   20
 
@@ -114,6 +116,14 @@
  * Write-enable: bits 31:16; to write bit N set bit (N+16).
  * Bit 4 is grf_con_mcu_sleepholdreqn (reset 1) — do not confuse with rxev. */
 #define GRF_BASE              0xFF288000U
+/* GRF_SOC_CON0 bit 12, mcu_hprot_bufferable: the M0's bus writes are
+ * acknowledged at once and completed by the interconnect. Measured: a GPIO
+ * write then costs the M0 about 5 cycles instead of 32, and still lands a
+ * constant time later (a read queued behind it returns after the same total
+ * time as before). The next bus access waits for it, so leave about 30
+ * cycles between a write and the following access to pay nothing. */
+#define GRF_SOC_CON0          0x0000U
+#define GRF_CON0_MCU_BUFFERABLE 0x10001000U
 #define GRF_SOC_CON37         0x0094U
 #define GRF_CON37_RXEV_BIT    3U   /* grf_con_mcu_rxev: sets the event register, completes WFE */
 #define GRF_CON37_WICENREQ_BIT 5U  /* grf_con_mcu_wicenreq: request WIC-based deep sleep */

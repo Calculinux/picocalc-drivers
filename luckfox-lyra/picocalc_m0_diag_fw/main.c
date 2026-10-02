@@ -58,6 +58,8 @@ uint32_t diag_wait_wfi(uint32_t timer_base);
 uint32_t diag_wfi_read(volatile uint32_t *reg);
 uint32_t diag_time_str(volatile uint32_t *cvr, volatile uint32_t *addr, uint32_t val);
 uint32_t diag_time_ldr(volatile uint32_t *cvr, volatile uint32_t *addr);
+uint32_t diag_time_str_ldr(volatile uint32_t *cvr, volatile uint32_t *addr, uint32_t val);
+uint32_t diag_time_str_str(volatile uint32_t *cvr, volatile uint32_t *addr, uint32_t val);
 
 static volatile struct m0_diag *const res = (volatile struct m0_diag *)M0_DIAG_ADDR;
 
@@ -77,6 +79,11 @@ static void stopwatch_start(void)
 	REG(TIMER0_CH4_BASE + TIMER_LOAD0) = 0xFFFFFFFFU;
 	REG(TIMER0_CH4_BASE + TIMER_LOAD1) = 0;
 	REG(TIMER0_CH4_BASE + TIMER_CTRL) = TIMER_FREE_NOINT;
+	/* The count read back lags the counter by a few timer clocks. With
+	 * bufferable bus writes a read can follow the restart closely enough
+	 * to see the old count; wait until the new one shows. */
+	while (REG(TIMER0_CH4_BASE + TIMER_CURR0) > 0x00100000U)
+		;
 }
 
 static uint32_t stopwatch(void)
@@ -251,8 +258,10 @@ static void wfi_stamp(volatile struct m0_diag_lat *l)
 static void access_time(void)
 {
 	volatile uint32_t *cvr = (volatile uint32_t *)SYST_CVR;
+	volatile uint32_t *gpio = (volatile uint32_t *)(GPIO4_BASE + GPIO_DR_L);
 	uint32_t v;
 
+	res->grf_soc_con0 = REG(GRF_BASE);
 	tick_start(M0_DIAG_LAT_PERIOD - 1U);
 	while (res->acc_gpio.n < M0_DIAG_LAT_N) {
 		if (diag_wait_wfi(TIMER0_CH5_BASE) == 0xFFFFFFFFU)
@@ -263,6 +272,12 @@ static void access_time(void)
 		lat_add(&res->acc_gpio, v, v);
 		v = diag_time_ldr(cvr, (volatile uint32_t *)(TIMER0_CH5_BASE + TIMER_INTSTAT)) & SYST_MASK;
 		lat_add(&res->acc_timer, v, v);
+		v = diag_time_ldr(cvr, gpio) & SYST_MASK;
+		lat_add(&res->acc_gpio_rd, v, v);
+		v = diag_time_str_ldr(cvr, gpio, GPIO4_DR_WRITE(0u, 0u)) & SYST_MASK;
+		lat_add(&res->acc_gpio_wr_rd, v, v);
+		v = diag_time_str_str(cvr, gpio, GPIO4_DR_WRITE(0u, 0u)) & SYST_MASK;
+		lat_add(&res->acc_gpio_wr_wr, v, v);
 	}
 }
 

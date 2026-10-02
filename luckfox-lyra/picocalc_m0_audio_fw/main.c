@@ -75,6 +75,10 @@ static void tick_start(const m0_audio_shmem_t *shmem)
 
 static void hardware_init(void)
 {
+	/* Let bus writes complete behind our back: the GPIO write in every tick
+	 * then costs a few cycles instead of 32 (see rk3506_regs.h). */
+	REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_BUFFERABLE;
+
 	/* CRU: ungate GPIO4 (pclk + dbclk). Nothing else is needed: the tick is
 	 * inside the core. */
 	REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;

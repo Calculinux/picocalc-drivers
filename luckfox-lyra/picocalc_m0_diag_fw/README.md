@@ -16,12 +16,12 @@ so a hang or fault names the stage it happened in.
 | 2 CAL | times fixed loops against TIMER0_CH4 | real cycles per instruction, per GPIO write, timer read, SRAM read, core-internal write |
 | 3 PERIOD | 10,000 expiries with LOAD = 999 | whether the timer period is LOAD + 1 or LOAD counts |
 | 4 POLL_LAT | 4096 ticks, polling | expiry-to-detect latency when polling, with histogram |
-| 5 POLL_SLOW | 1000 slow ticks, polling | toggles GPIO4_B2: an audible tone on pin 31 for about a second |
-| 6 WFI_SLOW | 1000 slow ticks, WFI | whether WFI sleeps and is woken by the masked timer interrupt; tone again |
+| 5 POLL_SLOW | 200 slow ticks, polling | toggles GPIO4_B2: a short audible tone on pin 31 |
+| 6 WFI_SLOW | 200 slow ticks, WFI | whether WFI sleeps and is woken by the masked timer interrupt; tone again |
 | 7 WFI_LAT | 4096 ticks, WFI | latency as the timer's own counter reports it |
 | 8 SYST_PROBE | start SysTick | whether the core has a SysTick timer; core clock rate |
 | 9 WFI_STAMP | 4096 timer-woken WFI wakes | interval between wakes, stamped with SysTick: the wake jitter itself |
-| 10 ACCESS | 4096 GPIO writes and timer reads | how many cycles one access takes, and whether that varies |
+| 10 ACCESS | 4096 each: GPIO write, timer read, GPIO read, write-then-read, write-then-write | how many cycles an access takes, whether that varies, and when a write really lands |
 | 11 SYST_TICK | 4096 SysTick ticks | whether SysTick wakes WFI, and that wake's latency |
 | 12 RUN | slow WFI heartbeat, forever | absolute timer rate against Linux's clock; pin quiet |
 
@@ -29,7 +29,7 @@ Everything that might not work on a given SoC comes after everything that
 needs only the timer, and the SysTick stages cannot hang (a TIMER0 tick runs
 alongside as a backstop).
 
-Stages 5 and 6 put a square wave of about 470 Hz on pin 31, a second each.
+Stages 5 and 6 put a square wave of about 470 Hz on pin 31, a fifth of a second each.
 That is the PicoCalc's left audio input, so it is loud; it is also the
 quickest check that the pin, the NC7WZ16 buffer and its supply pass the
 1.8 V signal.
@@ -62,6 +62,14 @@ echo stop  > /sys/class/remoteproc/remoteproc0/state     # stop/start to run it 
 
 To undo: `echo stop`, `rmmod rk3506_rproc`, `rmdir` the overlay directory,
 and clear the firmware path (`echo -n > .../firmware_class/parameters/path`).
+
+To try `mcu_hprot_bufferable` (GRF_SOC_CON0 bit 12, write-enable bit 28),
+set or clear it from Linux between runs and compare the ACCESS figures:
+
+```sh
+./peek -w 0xFF288000 0x10001000    # on   (peek.c: a /dev/mem word read/write helper)
+./peek -w 0xFF288000 0x10000000    # off
+```
 
 `m0diag -r` prints only the SoC registers and works with any firmware (or
 none): whether the M0 is sleeping or locked up (`GRF_SOC_STATUS2`), and the
@@ -99,7 +107,11 @@ core clock rates from `/sys/kernel/debug/clk/clk_summary`, or from `-t HZ` and
 | timer period | LOAD + 1 |
 | straight-line instruction | 2.5 cycles (1 with no wait states) |
 | two-instruction loop with a taken branch | 10 cycles (4) |
-| GPIO4 DR write | 28 cycles extra in a loop; 33 start to finish, spread 0 |
+| GPIO4 DR write | 28 cycles extra in a loop; 32-33 start to finish, spread 0 |
+| GPIO4 DR write, `mcu_hprot_bufferable` set | 7 start to finish: the write returns at once |
+| GPIO4 DR write then read | 63; with the bit set 59, in 4093 of 4096 samples: the write still lands at a fixed delay |
+| GPIO4 DR write then write | 64; with the bit set 45 |
+| reboot after TCM mode | the SRAM is back on the bus; firmware loads again |
 | TIMER0 status read | 24 cycles extra in a loop; 30 start to finish, spread 0 |
 | core-internal (NVIC) write | 2 cycles |
 | SRAM read at its absolute address / through the low window | 6 / 2 cycles |
@@ -112,8 +124,9 @@ core clock rates from `/sys/kernel/debug/clk/clk_summary`, or from `-t HZ` and
 | NC7WZ16 buffer with a 1.8 V input | passes it at the stock ALDO4 setting (loud tone) |
 
 Consequences for the audio firmware: tick from SysTick and wait in WFI (no
-jitter, and no peripheral access per tick apart from the GPIO write); budget
-cycles with the measured costs, not the textbook ones.
+jitter, and no peripheral access per tick apart from the GPIO write); make
+bus writes bufferable so that write costs a few cycles; budget cycles with
+the measured costs, not the textbook ones.
 
 ## Emulator check
 

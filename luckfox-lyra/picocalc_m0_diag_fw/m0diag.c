@@ -313,6 +313,11 @@ int main(int argc, char **argv)
 			"core cycles", cpu_hz, 0);
 		latency("One TIMER0 status read, start to finish", &d->acc_timer,
 			"core cycles", cpu_hz, 0);
+		printf("\nGRF_SOC_CON0 as the M0 saw it: %08x -> mcu_hprot_bufferable = %u\n",
+		       d->grf_soc_con0, (d->grf_soc_con0 >> 12) & 1);
+		latency("One GPIO4 DR read", &d->acc_gpio_rd, "core cycles", cpu_hz, 0);
+		latency("GPIO4 DR write then read", &d->acc_gpio_wr_rd, "core cycles", cpu_hz, 0);
+		latency("GPIO4 DR write then write", &d->acc_gpio_wr_wr, "core cycles", cpu_hz, 0);
 		printf("  (each includes one SysTick read, about 2 cycles; a spread of 0 means the\n"
 		       "  bus adds no jitter to when a write lands)\n");
 	}

@@ -51,10 +51,11 @@
                 /* 74 = HCLK_M0, the M0 core clock its SysTick counts: the
                  * driver derives the tick timing from its rate. */
                 clocks = <&cru 74>;
-                /* Output bit rate; see tick_hz in the driver. 1.2 MHz is
-                 * the most that fits with the firmware running as TCM
-                 * (rockchip,tcm below); without it use 600000. */
-                tick-rate-hz = <1200000>;
+                /* Output bit rate; see tick_hz in the driver. With the
+                 * firmware running as TCM (rockchip,tcm below) every tick
+                 * fits up to 3.2 MHz at a 187.5 MHz core clock; without
+                 * TCM, up to 1.2 MHz (use 1000000). */
+                tick-rate-hz = <3000000>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&snd_pins>;
             };
@@ -63,9 +64,9 @@
                 compatible = "rockchip,rk3506-mcu";
                 reg = <0xfff84000 0x8000>;
                 firmware-name = "rk3506-m0-audio.elf";
-                /* Run the firmware as tightly-coupled memory: twice the
-                 * speed, hence twice the bit rate. The firmware can then
-                 * not be loaded again until the next reboot (the driver
+                /* Run the firmware as tightly-coupled memory: 2.5 times
+                 * the speed, hence the higher bit rate. The firmware can
+                 * then not be loaded again until the next reboot (the driver
                  * keeps it running between streams). Remove this and lower
                  * tick-rate-hz to reload firmware freely while developing. */
                 rockchip,tcm;

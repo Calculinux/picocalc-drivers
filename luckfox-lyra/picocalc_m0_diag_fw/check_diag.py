@@ -36,7 +36,8 @@ HEAD = ['magic', 'version', 'stage', 'fault', 'heartbeat',
 LAT = ['n', 'min', 'max', 'sum', 'spurious', 'pend']
 HIST = 64
 F = {name: 4 * i for i, name in enumerate(HEAD)}
-for j, block in enumerate(['poll', 'wfi', 'stamp', 'syst', 'acc_gpio', 'acc_timer']):
+for j, block in enumerate(['poll', 'wfi', 'stamp', 'syst', 'acc_gpio', 'acc_timer',
+                           'acc_gpio_rd', 'acc_gpio_wr_rd', 'acc_gpio_wr_wr']):
     for i, name in enumerate(LAT):
         F[f'{block}_{name}'] = 4 * (len(HEAD) + j * (len(LAT) + HIST) + i)
 RUN_STAGE = 12
@@ -139,7 +140,7 @@ def main():
             bad.append(msg)
 
     expect(r['magic'] == 0x4D304447, 'magic')
-    expect(r['version'] == 3, f"version {r['version']}")
+    expect(r['version'] == 4, f"version {r['version']}")
     expect(r['stage'] == RUN_STAGE, f"stage {r['stage']}, want {RUN_STAGE} (RUN)")
     expect(r['syst_present'] == 0, 'SysTick found, but the emulator has none')
     expect(r['fault'] == 0, 'fault flag set')
@@ -161,13 +162,13 @@ def main():
         expect(hi > lo, f'{name} latency shows no spread, model varies it')
         expect(lo * n <= total <= hi * n, f'{name} sum {total}')
     expect(r['poll_spurious'] == 0, 'poll spurious')
-    expect(r['poll_slow_ticks'] == 1000, f"poll_slow_ticks {r['poll_slow_ticks']}")
-    expect(r['wfi_slow_ticks'] == 1000, f"wfi_slow_ticks {r['wfi_slow_ticks']}")
+    expect(r['poll_slow_ticks'] == 200, f"poll_slow_ticks {r['poll_slow_ticks']}")
+    expect(r['wfi_slow_ticks'] == 200, f"wfi_slow_ticks {r['wfi_slow_ticks']}")
     # wfi is a nop here: every poll that finds nothing counts as spurious
     expect(r['wfi_slow_spurious'] > 0 and r['wfi_spurious'] > 0, 'no spurious WFI counted')
     # B2 alternates on every tick of the two slow stages and is quiet otherwise
     toggles = sum(1 for a, b in zip(b2, b2[1:]) if a != b)
-    expect(1996 <= toggles <= 2000, f'B2 toggled {toggles} times, want about 2000')
+    expect(396 <= toggles <= 400, f'B2 toggled {toggles} times, want about 400')
     # the latency histograms must account for every sample
     for name in ('poll', 'wfi'):
         base = RES + F[name + '_n'] + 4 * len(LAT)

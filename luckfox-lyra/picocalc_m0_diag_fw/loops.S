@@ -136,3 +136,31 @@ diag_time_ldr:
 	subs	r0, r3, r0
 	bx	lr
 	.size	diag_time_ldr, . - diag_time_ldr
+
+/* uint32_t diag_time_str_ldr(volatile uint32_t *cvr, volatile uint32_t *addr, uint32_t val):
+ * a store and then a load of the same register, timed as one */
+	.global	diag_time_str_ldr
+	.thumb_func
+	.type	diag_time_str_ldr, %function
+diag_time_str_ldr:
+	ldr	r3, [r0]
+	str	r2, [r1]
+	ldr	r2, [r1]
+	ldr	r0, [r0]
+	subs	r0, r3, r0
+	bx	lr
+	.size	diag_time_str_ldr, . - diag_time_str_ldr
+
+/* uint32_t diag_time_str_str(volatile uint32_t *cvr, volatile uint32_t *addr, uint32_t val):
+ * two stores back to back, timed as one */
+	.global	diag_time_str_str
+	.thumb_func
+	.type	diag_time_str_str, %function
+diag_time_str_str:
+	ldr	r3, [r0]
+	str	r2, [r1]
+	str	r2, [r1]
+	ldr	r0, [r0]
+	subs	r0, r3, r0
+	bx	lr
+	.size	diag_time_str_str, . - diag_time_str_str
