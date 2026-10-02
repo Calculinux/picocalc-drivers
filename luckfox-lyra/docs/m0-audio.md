@@ -310,9 +310,28 @@ when a stream ends says how many updates were synchronised. With too few
 plain ticks in a sample (a slow tick in bus mode) there is no room and the
 driver writes unsynchronised.
 
-What is left with `ring_sync` on: now and then a few plain ticks late, at
-multiples of 1.0133 s (304 jiffies), so tied to something Linux does about
-once a second, and to the pin write rather than the SRAM. Not yet identified.
+What is left with `ring_sync` on is the display. A few ticks are late at
+multiples of 1.0133 s, which is how often the console's terminal program
+redraws; stop it and the bare console cursor blinks instead, and the late
+ticks move to multiples of 203 ms. The heartbeat LED and the battery
+monitor make no difference. The cause is the same kind of thing as before,
+on another bus: host *writes* to peripheral registers get in the way of the
+M0's pin write, which it makes every tick.
+
+| Host activity (`m0hammer`, `ring_sync` on) | Late ticks | M0 behind |
+|---|---|---|
+| nothing extra (terminal redrawing once a second) | 0-1.5 a second | 0-2 us/s |
+| writing a GPIO data register (bank 0 or 4, masked no-op) 16.5 million times a second | 250000 a second | 341000 us/s |
+| the same 1000 times a second | 1 a second | 1 us/s |
+| writing `GRF_SOC_CON0` (masked no-op) 16.5 million times a second | as nothing extra | 0 |
+| reading a GPIO or SPI register 5 million times a second | 0.4-2.7 a second | 0 |
+
+So a host GPIO write costs the M0 about 21 ns when they meet, and a redraw
+(SPI transfer plus the display's D/C pin on GPIO0) makes two to four
+consecutive ticks late about once: pin edges tens of nanoseconds late, where
+the ring copy made them late by most of a microsecond a dozen times a
+second. Nothing in the driver can prevent this; whether it can be heard has
+not been checked.
 
 Earlier observations, for the record: the same number of late ticks with the
 heartbeat LED trigger on or off; in simulation the modulator produces no
@@ -334,9 +353,10 @@ burst of in-band noise when its input drops to digital silence.
 5. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.
-6. **Late ticks about once a second** (a few plain ticks, at multiples of
-   304 jiffies), left over once the ring writes were synchronised: see
-   "What the ticking was". Whether they are audible has not been checked.
+6. **Late ticks at each display redraw**, left over once the ring writes
+   were synchronised: see "What the ticking was". Far smaller than what was
+   fixed; whether they are audible has not been checked. A program that
+   redraws continuously while audio plays is the case to listen to.
 7. **`ring_sync` in bus mode** is untested; the measurements are all TCM.
 8. **Pop when a stream ends** (and presumably when it starts): the pins go
    from the 50% pattern of silence to low, a DC step through the output
