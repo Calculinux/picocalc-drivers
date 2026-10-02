@@ -22,7 +22,7 @@ from unicorn.arm_const import (UC_CPU_ARM_CORTEX_M0, UC_ARM_REG_SP, UC_ARM_REG_L
                                UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11)
 
 # Hardware constants, written out independently of the firmware headers.
-CODE_BASE, CODE_SIZE = 0x00000000, 0x1000   # M0 view of its image
+CODE_BASE, CODE_SIZE = 0x00000000, 0x2000   # M0 view of its image
 SHMEM = 0xFFF81000
 HDR = 64
 RING = 8192
@@ -32,6 +32,9 @@ GPIO4_DR = 0xFF1E0000
 RET_ADDR = 0x10000000
 CTRL, WRITE_IDX, READ_IDX = 4, 8, 12
 PS_FRAC, PS_PLAIN = 4, 8                    # m0_play_state: what main.c sets
+PS_SHIFT, PS_DX_MASK = 72, 76
+BUS_STEPS, STEPS = 6, 15                    # a PROFILE build has three more after the bus steps
+MAX_SHIFT = 6
 TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
 TRACE_UNDERRUN = 30
 
@@ -62,7 +65,7 @@ class Model:
     Each of the first `steps` ticks of a sample does one step after its
     modulator pass; the remaining ticks are plain."""
 
-    def __init__(self, frames, read_idx, write_idx_fn, tm, steps):
+    def __init__(self, frames, read_idx, write_idx_fn, tm, steps, shift, interp):
         self.frames = frames            # list of (l, r), index = ring offset / 4
         self.write_idx_fn = write_idx_fn
         self.base, self.frac = tm
@@ -73,10 +76,18 @@ class Model:
         self.pub = read_idx & IDX_MASK
         self.published = read_idx
         self.acc = 0
-        self.x = [0, 0]
+        self.shift = shift
+        self.interp = interp
+        self.fs = 1 << (FS_SHIFT + shift)
+        self.x = [0, 0]                 # modulator input, in 2^-shift LSB
+        self.dx = [0, 0]                # and what it changes by per tick
+        self.new = [0, 0]               # the sample just fetched (scaled 7/8)
+        self.prev = [0, 0]              # the one before it
+        self.next_x = [0, 0]
+        self.next_dx = [0, 0]
         self.i1 = [0, 0]
         self.i2 = [0, 0]
-        self.g = [1 << FS_SHIFT, -(1 << FS_SHIFT)]
+        self.g = [self.fs, -self.fs]
         self.word = 0x0C000000
         self.empties = []               # sample numbers at which the ring was empty
         self.sample_no = 0
@@ -86,42 +97,68 @@ class Model:
         self.stopped = False
 
     def clamp(self, ch):
-        lim = 1 << CLAMP_SHIFT
+        lim = 1 << (CLAMP_SHIFT + self.shift)
         if not -lim <= self.i2[ch] < lim:
             self.i2[ch] = lim - 1 if self.i2[ch] >= 0 else -lim
 
+    def sample_in(self, ch):
+        self.new[ch] = scale(self.frame[ch])
+        self.next_dx[ch] = self.new[ch] - self.prev[ch]
+
+    def sample_start(self, ch):
+        self.next_x[ch] = self.prev[ch] << self.shift
+        self.prev[ch] = self.new[ch]
+
+    def sample_go(self, ch):
+        self.x[ch] = self.next_x[ch]
+        self.dx[ch] = self.next_dx[ch] if self.interp else 0
+
     def step(self, n, ctrl):
+        profile = self.steps - STEPS    # 3 in a PROFILE build
         if n == 1:
             if ctrl != 1:
                 self.stopped = True
         elif n == 2:
-            self.acc += self.frac
-            carry = self.acc >> 32
-            self.acc &= MASK32
-            self.length = self.base + carry
-        elif n == 3:
             self.widx = self.write_idx_fn(self.tick_no)
-        elif n == 4:
+        elif n == 3:
             nxt = (self.cur + 4) & IDX_MASK
             if nxt != self.widx:
                 self.cur = nxt
             else:
                 self.empties.append(self.sample_no)
-        elif n == 5:
+        elif n == 4:
             self.frame = self.frames[self.cur // 4]
-        elif n == 6:
-            self.x[0] = scale(self.frame[0])
-            self.clamp(0)
-        elif n == 7:
-            self.x[1] = scale(self.frame[1])
-            self.clamp(1)
-        elif n == 8:
+        elif n == 5:
             self.pub = (self.cur + 4) & IDX_MASK
-        elif n == 9:
+        elif n == 6:
             self.published = self.pub
-        elif n == 12:
-            self.sample_no += 1
-        # steps 10, 11 (PROFILE builds) publish statistics only
+        elif n <= BUS_STEPS + profile:
+            # PROFILE builds: two steps publish statistics, the third counts
+            if n == BUS_STEPS + 3:
+                self.sample_no += 1
+        else:
+            n -= BUS_STEPS + profile
+            if n == 1:
+                self.acc += self.frac
+                carry = self.acc >> 32
+                self.acc &= MASK32
+                self.length = self.base + carry
+            elif n == 2:
+                self.sample_in(0)
+            elif n == 3:
+                self.sample_start(0)
+            elif n == 4:
+                self.sample_in(1)
+            elif n == 5:
+                self.sample_start(1)
+            elif n == 6:
+                self.sample_go(0)
+            elif n == 7:
+                self.sample_go(1)
+            elif n == 8:
+                self.clamp(0)
+            elif n == 9:
+                self.clamp(1)
 
     def tick(self, ctrl):
         """Returns the GPIO word written at this tick."""
@@ -129,9 +166,10 @@ class Model:
         word = 0x0C000C00
         for ch, bit in ((0, 10), (1, 11)):
             self.i1[ch] = s32(self.i1[ch] + self.x[ch] - self.g[ch])
+            self.x[ch] = s32(self.x[ch] + self.dx[ch])
             y = s32(self.i2[ch] + self.i1[ch])
             s = -1 if y < 0 else 0
-            self.g[ch] = (2 * s + 1) << FS_SHIFT
+            self.g[ch] = -self.fs - 1 if s else self.fs     # FS ^ s
             self.i2[ch] = s32(y - self.g[ch])
             if s:
                 word -= 1 << bit
@@ -158,7 +196,7 @@ def load(path):
         elf = ELFFile(f)
         for seg in elf.iter_segments():
             if seg['p_type'] == 'PT_LOAD' and seg['p_filesz']:
-                assert seg['p_paddr'] + seg['p_memsz'] <= CODE_SIZE, 'image outside the 4 KB window'
+                assert seg['p_paddr'] + seg['p_memsz'] <= CODE_SIZE, 'image outside the 8 KB window'
                 uc.mem_write(seg['p_paddr'], seg.data().replace(b'\x30\xbf', b'\x00\xbf'))  # wfi -> nop
         symtab = elf.get_section_by_name('.symtab')
         entry = symtab.get_symbol_by_name('m0_play')[0]['st_value']
@@ -167,9 +205,17 @@ def load(path):
     return uc, entry, state, steps
 
 
-def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
+def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=True):
     """Returns the number of mismatches."""
     uc, entry, state_addr, steps = load(path)
+    # as main.c does: the smallest shift the longest sample fits in
+    shift = 0
+    while (1 << shift) < tm[0] + 1:
+        shift += 1
+    if shift > MAX_SHIFT:
+        interp = False
+    if not interp:
+        shift = 0
     for i, (l, r) in enumerate(frames):
         uc.mem_write(SHMEM + HDR + 4 * i, struct.pack('<hh', l, r))
     # write_idx = 2 can never equal a frame-aligned index: ring never empty.
@@ -177,6 +223,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
     uc.mem_write(SHMEM + CTRL, struct.pack('<III', 1, never_empty, read_idx))
     assert tm[0] > steps, 'sample shorter than its step ticks'
     uc.mem_write(state_addr + PS_FRAC, struct.pack('<II', tm[1], tm[0] - steps))
+    uc.mem_write(state_addr + PS_SHIFT, struct.pack('<II', shift, MASK32 if interp else 0))
 
     words = []
     ctrl_at = []                        # ctrl as the firmware would read it after tick n
@@ -202,7 +249,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
 
     uc.hook_add(UC_HOOK_MEM_WRITE, on_gpio, begin=GPIO4_DR, end=GPIO4_DR + 3)
 
-    model = Model(frames, read_idx, write_idx_at, tm, steps)
+    model = Model(frames, read_idx, write_idx_at, tm, steps, shift, interp)
     expect = []
     saved = {UC_ARM_REG_R4: 0x44444444, UC_ARM_REG_R5: 0x55555555, UC_ARM_REG_R6: 0x66666666,
              UC_ARM_REG_R7: 0x77777777, UC_ARM_REG_R8: 0x88888888, UC_ARM_REG_R9: 0x99999999,
@@ -240,7 +287,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
     if pub != model.published:
         print(f'  {name}: published read_idx {pub}, model {model.published}')
         bad += 1
-    if steps >= 12:
+    if steps > STEPS:
         # PROFILE build: nothing overruns here, so the log is the empty-ring events
         total = struct.unpack('<I', uc.mem_read(TRACE, 4))[0]
         if total != len(model.empties):
@@ -264,17 +311,26 @@ def main():
     noise = [(rnd.randint(-32768, 32767), rnd.randint(-32768, 32767)) for _ in range(n)]
     rails = [(rnd.choice((-32768, 32767)), rnd.choice((-32768, 32767))) for _ in range(n)]
     dc = [(16384, -8000)] * n
-    t600k = timing(187500000, 300)      # 13.02 ticks per sample: the shortest allowed
+    t915k = timing(187500000, 205)      # 19.05 ticks per sample: the shortest allowed
     t1m2 = timing(187500000, 156)       # 25.04
     t2m4 = timing(187500000, 78)        # 50.08
+    t2m9 = timing(187500000, 64)        # 61.04
+    t3m0 = timing(187500000, 62)        # 63.004: now and then 64 ticks, all the shift allows
+    t3m7 = timing(187500000, 50)        # 78.1: too many ticks to interpolate
     bad = 0
     bad += run(path, 'silence', [(0, 0)] * n, 20000, t1m2)
     bad += run(path, 'dc', dc, 60000, t1m2)
-    bad += run(path, 'sine, 625 kHz', sine, 150000, t600k)
+    bad += run(path, 'sine, 915 kHz', sine, 150000, t915k)
     bad += run(path, 'sine, 1.2 MHz', sine, 150000, t1m2)
+    bad += run(path, 'sine, 1.2 MHz, held', sine, 150000, t1m2, interp=False)
     bad += run(path, 'sine, 2.4 MHz', sine, 150000, t2m4)
+    bad += run(path, 'sine, 2.9 MHz', sine, 250000, t2m9)
+    bad += run(path, 'sine, 3.0 MHz', sine, 250000, t3m0)
+    bad += run(path, 'sine, 3.75 MHz (holds)', sine, 250000, t3m7)
     bad += run(path, 'noise, wraps the ring', noise, 250000, t1m2, read_idx=RING - 40)
+    bad += run(path, 'noise, 3.0 MHz', noise, 400000, t3m0)
     bad += run(path, 'rail to rail (clamps)', rails, 250000, t2m4)
+    bad += run(path, 'rail to rail, 3.0 MHz', rails, 400000, t3m0)
     bad += run(path, 'underrun holds', sine, 60000, t1m2, underrun_after=30000)
     bad += run(path, 'unaligned read_idx', sine, 20000, t1m2, read_idx=0x12346)
     if bad:

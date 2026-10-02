@@ -14,7 +14,7 @@
  *   TCM mode   loaded at 0xFFF84000; OP-TEE turns that SRAM into the M0's
  *              tightly-coupled memory (1 cycle per instruction) and Linux
  *              cannot reach it again until reboot
- * Image, data, bss and stack all fit in the first 4 KB of the window; the
+ * Image, data, bss and stack all fit in the first 8 KB of the window; the
  * shared header and ring are elsewhere (shmem.h).
  */
 OUTPUT_ARCH(arm)
@@ -22,10 +22,10 @@ ENTRY(Reset_Handler)
 
 MEMORY
 {
-	RAM (rwx) : ORIGIN = 0x00000000, LENGTH = 0x1000
+	RAM (rwx) : ORIGIN = 0x00000000, LENGTH = 0x2000
 }
 
-/* Stack grows down from the end of the 4 KB window; the image needs under 1 KB. */
+/* Stack grows down from the end of the 8 KB window; the image needs about half. */
 _stack_top = ORIGIN(RAM) + LENGTH(RAM);
 
 SECTIONS

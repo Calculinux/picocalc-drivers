@@ -102,8 +102,9 @@
 
 /* Modulator: both stages use +/-full-scale (1 << DSM_FS_SHIFT) feedback.
  * The second integrator is clamped to +/-(1 << DSM_CLAMP_SHIFT), 32x full
- * scale: normal programme stays below ~11x, while full-scale noise or
- * Nyquist-rate square waves would otherwise run the state into int32 wrap.
+ * scale (in the modulator's units, see PS_SHIFT): normal programme stays
+ * below ~11x, while full-scale noise or Nyquist-rate square waves would
+ * otherwise run the state into int32 wrap.
  * Simulated at a 1 MHz tick this gives about 49 dB SNR over 20 Hz-20 kHz at
  * -3 dBFS (8-9 bits), and each doubling of the tick rate is worth up to
  * about 12 dB, less as other effects (sample changes snapped to the tick

@@ -28,12 +28,13 @@
 #define SAMPLE_RATE       48000
 
 static const char *const step_name[] = {
-	[1] = "stop check", [2] = "sample length", [3] = "read write_idx (bus)",
-	[4] = "next frame", [5] = "fetch frame (bus)", [6] = "left in, clamp",
-	[7] = "right in, clamp", [8] = "compute read_idx", [9] = "publish read_idx (bus)",
-	[10] = "publish longest tick (bus)", [11] = "publish overruns (bus)",
-	[12] = "count sample", [M0_TRACE_UNDERRUN] = "RING EMPTY",
-	[M0_TRACE_PLAIN] = "plain tick",
+	[1] = "stop check (bus)", [2] = "read write_idx (bus)", [3] = "next frame",
+	[4] = "fetch frame (bus)", [5] = "compute read_idx", [6] = "publish read_idx (bus)",
+	[7] = "publish longest tick (bus)", [8] = "publish overruns (bus)",
+	[9] = "count sample", [10] = "sample length", [11] = "left in",
+	[12] = "left start", [13] = "right in", [14] = "right start",
+	[15] = "left go", [16] = "right go", [17] = "clamp left", [18] = "clamp right",
+	[M0_TRACE_UNDERRUN] = "RING EMPTY", [M0_TRACE_PLAIN] = "plain tick",
 };
 
 int main(int argc, char **argv)

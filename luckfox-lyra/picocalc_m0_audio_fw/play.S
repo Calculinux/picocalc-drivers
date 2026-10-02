@@ -4,8 +4,8 @@
  * WHY A LOOP AND NOT AN INTERRUPT HANDLER
  *   Exception entry and exit cost 32 cycles on a Cortex-M0, and a handler has
  *   to load and store every piece of state it touches. The M0 does nothing
- *   else while playing, so m0_play() owns every register, SP included, and
- *   keeps the modulator state in them.
+ *   else while playing, so m0_play() owns every register, SP and LR included,
+ *   and keeps the modulator state in them.
  *
  * THE TICK
  *   SysTick, on the core clock, with its exception enabled but masked by
@@ -19,6 +19,9 @@
  *   "bufferable", so that write costs the loop about 5 cycles, not 32; the
  *   modulators run while it completes, and the first bus access of any step
  *   comes late enough in the tick not to queue behind it.
+ *   The GPIO block is clocked at half the core clock, so a tick must be an
+ *   even number of core cycles or every other edge comes out a cycle late
+ *   (the host sees to that).
  *
  * ONE TICK (the TICK macro)
  *      wfi
@@ -26,11 +29,12 @@
  *      clear SysTick's pending bit
  *      both modulators, next GPIO word
  *
- * THE MODULATOR (per channel; FS = 32768; G = +FS for an output 1, -FS for 0)
+ * THE MODULATOR (per channel; G = +FS for an output 1, -FS - 1 for a 0)
  *      i1 += x                      @ i1 already has the previous -G in it
+ *      x  += dx                     @ on towards the next sample
  *      y   = i2 + i1
  *      s   = y >> 31                @ 0: output 1, -1: output 0
- *      G   = FS + (s << 16)
+ *      G   = FS ^ s
  *      i2  = y - G
  *      i1 -= G
  *   which is the standard MOD2: out = x + (1 - z^-1)^2 * e (unity signal gain,
@@ -38,27 +42,46 @@
  *   A single-bit MOD2 is only well behaved short of full scale, so samples are
  *   scaled by 7/8 as they are fetched, and i2 is clamped so that no input
  *   (full-scale noise, Nyquist-rate squares) can run the state into int32
- *   wrap. The clamp runs once per sample, not per tick: in simulation the
- *   worst inputs then reach 2^24 at most. check_dsm.c mirrors this arithmetic
- *   bit-exactly; run `make check` after any change here.
+ *   wrap. The clamp runs once per sample, not per tick. check_dsm.c mirrors
+ *   this arithmetic bit-exactly; run `make check` after any change here.
+ *
+ * BETWEEN SAMPLES
+ *   Everything is in units of 2^-shift of an input LSB (PS_SHIFT; FS is
+ *   32768 << shift), where 2^shift is at least the number of ticks in a
+ *   sample. Each sample x starts at the previous sample's value and dx is the
+ *   difference to the new one, in LSBs: after n ticks x has gone n / 2^shift
+ *   of the way, with no multiply and no rounding. It is set to the exact
+ *   value again every sample, so nothing accumulates; what is left of the way
+ *   when the sample ends (none if it lasts 2^shift ticks) is taken in one
+ *   step. The output is therefore one sample late. With PS_DX_MASK zero dx
+ *   stays zero and each sample is held; main.c then sets the shift to zero
+ *   too (a held full-scale square drives i2 about 30 times further than a
+ *   ramped one, and the headroom is wanted).
  *
  * ONE SAMPLE
  *   The per-sample work is cut into M0_STEP_TICKS steps of at most a dozen
  *   cycles, and each of the first M0_STEP_TICKS ticks of a sample carries one,
  *   as straight-line code: no tick is much longer than a plain one and there
  *   is nothing to dispatch. Then come the plain ticks, in a counted loop.
+ *   The steps that use the shared SRAM come first, together, so the host
+ *   knows when it is not in use:
  *      1  stop if ctrl says so
- *      2  how many plain ticks this sample has
- *      3  snapshot the host's write_idx
- *      4  move on to the next frame, unless that is where the host is writing
- *      5  fetch the current frame
- *      6  left sample in; clamp left
- *      7  right sample in; clamp right
- *      8  work out read_idx
- *      9  publish read_idx
- *     (10-12 in PROFILE builds: publish the profile figures, count the sample)
- *   Left and right change one tick apart. On an underrun step 4 stays on the
- *   same frame, step 5 fetches it again and the output holds; at the start of
+ *      2  snapshot the host's write_idx
+ *      3  move on to the next frame, unless that is where the host is writing
+ *      4  fetch the current frame
+ *      5  work out read_idx
+ *      6  publish read_idx
+ *     (7-9 in PROFILE builds: publish the profile figures, count the sample)
+ *   and then, numbered on from there:
+ *      how many plain ticks this sample has
+ *      left:  new sample and its difference to the last one
+ *      left:  where x starts
+ *      right: the same two
+ *      left:  x and dx into their registers
+ *      right: the same
+ *      clamp left, clamp right
+ *   Left and right change one tick apart. On an underrun step 3 stays on the
+ *   same frame, step 4 fetches it again and the output holds; at the start of
  *   a stream that frame is the one before read_idx, which the host zeroes.
  *
  * SAMPLE LENGTH
@@ -68,23 +91,26 @@
  *
  * COST
  *   Do not count cycles from the listing alone: in bus mode this image runs
- *   at about 2.5 cycles per instruction (1 as TCM). Build with PROFILE=1: every tick then records the lowest
- *   SysTick count seen at the end of its work and whether it ran into the
- *   next tick, and the host driver reports both when a stream ends. That
- *   costs about 17 cycles per tick, 9 of which are included in the figure.
- *   It also logs every overrun and every empty-ring event with the sample
- *   number it happened in (shmem.h, M0_TRACE_ADDR); m0trace reads the log.
- *   Measured that way at a 187.5 MHz core clock: as TCM every tick fits in
- *   59 cycles (3.2 MHz) and not in 57; in bus mode in 156 (1.2 MHz) and not
- *   in 134. A tick that overruns only delays its own edge and the next tick
+ *   at about 2.5 cycles per instruction (1 as TCM). Build with PROFILE=1:
+ *   every tick then records the lowest SysTick count seen at the end of its
+ *   work and whether it ran into the next tick, and the host driver reports
+ *   both when a stream ends. That costs about 17 cycles per tick, 9 of which
+ *   are included in the figure. It also logs every overrun and every
+ *   empty-ring event with the sample number it happened in (shmem.h,
+ *   M0_TRACE_ADDR); m0trace reads the log. docs/m0-audio.md has the measured
+ *   figures. A tick that overruns only delays its own edge and the next tick
  *   starts late; none are lost unless the work exceeds two ticks.
  *
  * REGISTERS
- *   r0 i1_l   r1 i2_l           r8  x_l           r11 scratch / parked GPIO word
- *   r3 i1_r   r4 i2_r           r9  x_r           r12 GPIO word, both high
- *   r2 FS     r5 plain ticks    r10 &SCB_ICSR     lr  GPIO4 DR address
- *   r6, r7 scratch              sp  m0_play_state
+ *   r0 i1_l   r1 i2_l           r8  x_l    r10 dx_l    r11 scratch / parked GPIO word
+ *   r3 i1_r   r4 i2_r           r9  x_r    lr  dx_r    r12 GPIO word, both high
+ *   r2 FS     r5 plain ticks    r6, r7 scratch         sp  m0_play_state
  *   Entering a tick, r7 holds the GPIO word to write and r6 the GPIO address.
+ *
+ * LAYOUT
+ *   The loop is longer than a Thumb branch reaches in a PROFILE build, so the
+ *   plain-tick loop sits in the middle of it: steps 1 onwards, a hop over the
+ *   plain loop, the remaining steps, back to the plain loop, back to step 1.
  */
 
 #include "rk3506_regs.h"
@@ -97,8 +123,8 @@
 
 	.equ	GPIO4_DR_ADDR, GPIO4_BASE + GPIO_DR_L
 	.equ	RING_IDX_MASK, M0_RING_BYTES - M0_FRAME_BYTES
-	.equ	DSM_CLAMP_MAX, (1 << DSM_CLAMP_SHIFT) - 1
 	.equ	PENDST_TO_SIGN, 31 - ICSR_PENDSTSET_BIT
+	.equ	S, M0_BUS_STEPS + M0_PROFILE_STEPS	@ number of the last SRAM step
 
 /* For check_play.py, which has to know how this build schedules a sample */
 	.global	m0_step_ticks
@@ -115,26 +141,28 @@ m0_play_state:
 	.macro	TICK
 	wfi
 	str	r7, [r6]		@ OUTPUT: bits from the previous tick
-	mov	r7, r10
+	ldr	r7, [sp, #PS_K_ICSR]
 	movs	r6, #1
 	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
 	str	r6, [r7]		@ tick taken: clear SysTick's pending bit
 
 	add	r0, r8			@ LEFT  i1 += x
+	add	r8, r10			@       x += dx
 	adds	r1, r1, r0		@       y = i2 + i1
 	asrs	r7, r1, #31		@       s = 0 (bit 1) or -1 (bit 0)
-	lsls	r6, r7, #16
-	adds	r6, r6, r2		@       G = FS + (s << 16)
+	mov	r6, r7
+	eors	r6, r2			@       G = FS ^ s
 	subs	r1, r1, r6		@       i2 = y - G
 	subs	r0, r0, r6		@       i1 -= G
 	lsls	r7, r7, #GPIO4_B2_BIT	@       0, or -(1 << 10) to clear B2
 	mov	r11, r7
 
-	add	r3, r9			@ RIGHT, same with r3/r4 and B3
+	add	r3, r9			@ RIGHT, same with r3/r4, r9/lr and B3
+	add	r9, lr
 	adds	r4, r4, r3
 	asrs	r7, r4, #31
-	lsls	r6, r7, #16
-	adds	r6, r6, r2
+	mov	r6, r7
+	eors	r6, r2
 	subs	r4, r4, r6
 	subs	r3, r3, r6
 	lsls	r7, r7, #GPIO4_B3_BIT
@@ -155,7 +183,7 @@ m0_play_state:
 	adds	r6, r6, r7
 	ldr	r7, [sp, #PS_SAMPLE_NO]
 	lsls	r7, r7, #5
-	adds	r7, #\code
+	adds	r7, #(\code)
 	str	r7, [r6, #4]
 	.endm
 
@@ -164,7 +192,7 @@ m0_play_state:
  * tick so far. Uses r6, r7. */
 	.macro	PROFILE_TICK code
 #ifdef M0_PROFILE
-	mov	r7, r10
+	ldr	r7, [sp, #PS_K_ICSR]
 	ldr	r6, [r7]
 	lsls	r6, r6, #PENDST_TO_SIGN
 	bpl	1f
@@ -192,12 +220,15 @@ m0_play_state:
 	.macro	STEP_END code
 	PROFILE_TICK \code
 	mov	r7, r11
-	mov	r6, lr
+	ldr	r6, [sp, #PS_K_GPIO]
 	.endm
 
-/* Saturate an i2 that has left the clamp window to +MAX or -MAX-1. Uses r6. */
+/* Saturate an i2 that has left the clamp window to +MAX or -MAX-1.
+ * Uses r6, r7. */
 	.macro	CLAMP reg
-	asrs	r6, \reg, #DSM_CLAMP_SHIFT	@ in range iff this is 0 or -1
+	ldr	r7, [sp, #PS_CLAMP_SH]
+	mov	r6, \reg
+	asrs	r6, r7			@ in range iff this is 0 or -1
 	adds	r6, #1
 	lsrs	r6, r6, #1
 	beq	1f
@@ -205,6 +236,28 @@ m0_play_state:
 	ldr	r6, [sp, #PS_K_CLAMP]
 	eors	\reg, r6
 1:
+	.endm
+
+/* New sample for one channel, r6 = the 16-bit sample sign-extended: scale
+ * it, PS_DX = its difference to the previous one, PS_N = it. */
+	.macro	SAMPLE_IN n, v, dx
+	asrs	r7, r6, #3
+	subs	r6, r6, r7		@ x -= x >> 3 (7/8 headroom)
+	ldr	r7, [sp, #\v]
+	subs	r7, r6, r7
+	str	r7, [sp, #\dx]
+	str	r6, [sp, #\n]
+	.endm
+
+/* PS_X = the previous sample in modulator units; the new one becomes the
+ * previous. */
+	.macro	SAMPLE_START n, v, x
+	ldr	r7, [sp, #\v]
+	ldr	r6, [sp, #PS_SHIFT]
+	lsls	r7, r6
+	str	r7, [sp, #\x]
+	ldr	r6, [sp, #\n]
+	str	r6, [sp, #\v]
 	.endm
 
 	.section .ramfunc, "ax", %progbits
@@ -234,10 +287,12 @@ m0_play:
 	str	r0, [sp, #PS_K_RING]
 	ldr	r2, =RING_IDX_MASK
 	str	r2, [sp, #PS_K_MASK]
-	ldr	r0, =DSM_CLAMP_MAX
-	str	r0, [sp, #PS_K_CLAMP]
 	ldr	r0, =SYST_CVR
 	str	r0, [sp, #PS_K_CVR]
+	ldr	r0, =SCB_ICSR
+	str	r0, [sp, #PS_K_ICSR]
+	ldr	r0, =GPIO4_DR_ADDR
+	str	r0, [sp, #PS_K_GPIO]
 #ifdef M0_PROFILE
 	ldr	r0, =M0_TRACE_ADDR
 	str	r0, [sp, #PS_K_TRACE]
@@ -258,25 +313,50 @@ m0_play:
 	str	r0, [sp, #PS_WIDX]
 	str	r0, [sp, #PS_FRAME]
 	str	r0, [sp, #PS_OVERRUNS]
+	str	r0, [sp, #PS_NL]
+	str	r0, [sp, #PS_VL]
+	str	r0, [sp, #PS_DXL]
+	str	r0, [sp, #PS_XL]
+	str	r0, [sp, #PS_NR]
+	str	r0, [sp, #PS_VR]
+	str	r0, [sp, #PS_DXR]
+	str	r0, [sp, #PS_XR]
 	mvns	r1, r0
 	str	r1, [sp, #PS_MIN_CVR]
 
-	mov	r8, r0			@ x_l = x_r = 0
+	mov	r8, r0			@ x = dx = 0
 	mov	r9, r0
+	mov	r10, r0
+	mov	lr, r0
+	ldr	r6, [sp, #PS_SHIFT]
+	movs	r2, #1
+	adds	r6, #DSM_CLAMP_SHIFT
+	str	r6, [sp, #PS_CLAMP_SH]
+	mov	r1, r2
+	lsls	r1, r6
+	subs	r1, #1
+	str	r1, [sp, #PS_K_CLAMP]	@ (1 << (clamp shift + shift)) - 1
+	subs	r6, #DSM_CLAMP_SHIFT - DSM_FS_SHIFT
+	lsls	r2, r6			@ FS = 32768 << shift
 	movs	r1, #0			@ i2
 	movs	r4, #0
-	movs	r2, #1
-	lsls	r2, r2, #DSM_FS_SHIFT	@ FS
 	negs	r0, r2			@ i1_l = -G, G = +FS
 	mov	r3, r2			@ i1_r = -G, G = -FS: the idle patterns interleave
-	ldr	r6, =SCB_ICSR
-	mov	r10, r6
 	ldr	r6, =GPIO4_DR_B23_HIGH
 	mov	r12, r6
-	ldr	r6, =GPIO4_DR_ADDR
-	mov	lr, r6
+	ldr	r6, [sp, #PS_K_GPIO]
 	ldr	r7, =GPIO4_DR_B23_LOW	@ first tick writes both low
 	b	.L_sample
+
+.L_stop:
+	ldr	r6, [sp, #PS_SAVED_SP]
+	mov	sp, r6
+	pop	{r4-r7}
+	mov	r8, r4
+	mov	r9, r5
+	mov	r10, r6
+	mov	r11, r7
+	pop	{r4-r7, pc}
 
 	.ltorg
 
@@ -285,28 +365,16 @@ m0_play:
 	ldr	r7, [sp, #PS_K_SHMEM]
 	ldr	r6, [r7, #M0_SHMEM_CTRL]
 	cmp	r6, #M0_CTRL_PLAY
-	beq	1f
-	b	.L_stop
-1:
+	bne	.L_stop
 	STEP_END 1
 
-	STEP				@ 2: plain ticks in this sample
-	ldr	r6, [sp, #PS_ACC]
-	ldr	r7, [sp, #PS_FRAC]
-	adds	r6, r6, r7		@ carry out = one extra tick
-	str	r6, [sp, #PS_ACC]
-	ldr	r5, [sp, #PS_PLAIN]
-	movs	r7, #0			@ (leaves the carry alone)
-	adcs	r5, r7
-	STEP_END 2
-
-	STEP				@ 3: where is the host writing
+	STEP				@ 2: where is the host writing
 	ldr	r7, [sp, #PS_K_SHMEM]
 	ldr	r6, [r7, #M0_SHMEM_WRITE_IDX]
 	str	r6, [sp, #PS_WIDX]
-	STEP_END 3
+	STEP_END 2
 
-	STEP				@ 4: next frame, unless the ring is empty
+	STEP				@ 3: next frame, unless the ring is empty
 	ldr	r7, [sp, #PS_CUR]
 	adds	r7, #M0_FRAME_BYTES
 	ldr	r6, [sp, #PS_K_MASK]
@@ -323,66 +391,60 @@ m0_play:
 	str	r7, [sp, #PS_CUR]
 #endif
 1:
-	STEP_END 4
+	STEP_END 3
 
-	STEP				@ 5: fetch it: L in [15:0], R in [31:16]
+	STEP				@ 4: fetch it: L in [15:0], R in [31:16]
 	ldr	r7, [sp, #PS_CUR]
 	ldr	r6, [sp, #PS_K_RING]
 	ldr	r6, [r6, r7]
 	str	r6, [sp, #PS_FRAME]
-	STEP_END 5
+	STEP_END 4
 
-	STEP				@ 6: left
-	ldr	r6, [sp, #PS_FRAME]
-	sxth	r6, r6
-	asrs	r7, r6, #3
-	subs	r6, r6, r7		@ x -= x >> 3 (7/8 headroom)
-	mov	r8, r6
-	CLAMP	r1
-	STEP_END 6
-
-	STEP				@ 7: right
-	ldr	r6, [sp, #PS_FRAME]
-	asrs	r6, r6, #16
-	asrs	r7, r6, #3
-	subs	r6, r6, r7
-	mov	r9, r6
-	CLAMP	r4
-	STEP_END 7
-
-	STEP				@ 8: read_idx = the frame after the current one
+	STEP				@ 5: read_idx = the frame after the current one
 	ldr	r6, [sp, #PS_CUR]
 	adds	r6, #M0_FRAME_BYTES
 	ldr	r7, [sp, #PS_K_MASK]
 	ands	r6, r7
 	str	r6, [sp, #PS_PUB]
-	STEP_END 8
+	STEP_END 5
 
-	STEP				@ 9: tell the host
+	STEP				@ 6: tell the host
 	ldr	r6, [sp, #PS_PUB]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_READ_IDX]
-	STEP_END 9
+	STEP_END 6
 
 #ifdef M0_PROFILE
-	STEP				@ 10
+	STEP				@ 7
 	ldr	r6, [sp, #PS_MIN_CVR]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_STAT_MIN_CVR]
-	STEP_END 10
+	STEP_END 7
 
-	STEP				@ 11
+	STEP				@ 8
 	ldr	r6, [sp, #PS_OVERRUNS]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_STAT_OVERRUNS]
-	STEP_END 11
+	STEP_END 8
 
-	STEP				@ 12
+	STEP				@ 9
 	ldr	r6, [sp, #PS_SAMPLE_NO]
 	adds	r6, #1
 	str	r6, [sp, #PS_SAMPLE_NO]
-	STEP_END 12
+	STEP_END 9
 #endif
+	/* No more SRAM accesses in this sample. */
+
+	STEP				@ S+1: plain ticks in this sample
+	ldr	r6, [sp, #PS_ACC]
+	ldr	r7, [sp, #PS_FRAC]
+	adds	r6, r6, r7		@ carry out = one extra tick
+	str	r6, [sp, #PS_ACC]
+	ldr	r5, [sp, #PS_PLAIN]
+	movs	r7, #0			@ (leaves the carry alone)
+	adcs	r5, r7
+	STEP_END S + 1
+	b	.L_steps2
 
 .L_plain:				@ r5 plain ticks, at least one
 	TICK
@@ -390,21 +452,59 @@ m0_play:
 	mov	r11, r7
 	STEP_END M0_TRACE_PLAIN
 #else
-	mov	r6, lr
+	ldr	r6, [sp, #PS_K_GPIO]
 #endif
 	subs	r5, #1
 	bne	.L_plain
 	b	.L_sample
 
-.L_stop:
-	ldr	r6, [sp, #PS_SAVED_SP]
-	mov	sp, r6
-	pop	{r4-r7}
-	mov	r8, r4
-	mov	r9, r5
+.L_steps2:
+	STEP				@ S+2: left sample
+	ldr	r6, [sp, #PS_FRAME]
+	sxth	r6, r6
+	SAMPLE_IN PS_NL, PS_VL, PS_DXL
+	STEP_END S + 2
+
+	STEP				@ S+3
+	SAMPLE_START PS_NL, PS_VL, PS_XL
+	STEP_END S + 3
+
+	STEP				@ S+4: right sample
+	ldr	r6, [sp, #PS_FRAME]
+	asrs	r6, r6, #16
+	SAMPLE_IN PS_NR, PS_VR, PS_DXR
+	STEP_END S + 4
+
+	STEP				@ S+5
+	SAMPLE_START PS_NR, PS_VR, PS_XR
+	STEP_END S + 5
+
+	STEP				@ S+6: left starts on its way to the new sample
+	ldr	r6, [sp, #PS_XL]
+	mov	r8, r6
+	ldr	r6, [sp, #PS_DXL]
+	ldr	r7, [sp, #PS_DX_MASK]
+	ands	r6, r7
 	mov	r10, r6
-	mov	r11, r7
-	pop	{r4-r7, pc}
+	STEP_END S + 6
+
+	STEP				@ S+7: right
+	ldr	r6, [sp, #PS_XR]
+	mov	r9, r6
+	ldr	r6, [sp, #PS_DXR]
+	ldr	r7, [sp, #PS_DX_MASK]
+	ands	r6, r7
+	mov	lr, r6
+	STEP_END S + 7
+
+	STEP				@ S+8
+	CLAMP	r1
+	STEP_END S + 8
+
+	STEP				@ S+9
+	CLAMP	r4
+	STEP_END S + 9
+	b	.L_plain
 
 	.ltorg
 	.size	m0_play, . - m0_play

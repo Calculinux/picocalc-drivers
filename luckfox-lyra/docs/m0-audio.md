@@ -41,7 +41,7 @@ execute-never.) The same image runs in either mode:
 | image at | `0xFFF88000` | `0xFFF84000` |
 | code fetch | over the SoC bus | private port: tightly-coupled memory |
 | straight-line instruction | 2.5 cycles | 1 cycle |
-| highest tick rate at which every tick fits | 1.2 MHz | 3.2 MHz |
+| highest tick rate at which every tick fits (before interpolation was added) | 1.2 MHz | 3.2 MHz |
 | ticks stretched by other bus traffic | about one per Linux ring update | a few tens a second |
 | firmware reload | any time | **not until reboot** |
 
@@ -141,6 +141,17 @@ tick), from `clk_get_rate()` of `hclk_m0` and its `tick_hz` parameter (also
 applies from the next stream, so rates can be tried without touching the
 firmware.
 
+**A tick must be an even number of core cycles.** The GPIO block is clocked
+by `pclk_gpio4`, 93.75 MHz, half the M0's 187.5 MHz, so a pin can only
+change on every second core cycle. With an odd count (the 63 cycles that
+3 MHz first came out as) every other bit is a core cycle, 5.3 ns, late. A
+regular error like that brings the modulator's ultrasonic noise down into
+the audio band: in simulation the noise under a -40 dBFS tone goes from
+-79 dBFS to -40 dBFS. The driver therefore rounds to an even count
+(`tick_even`, on by default; turn it off to hear the difference). Not yet
+confirmed by ear or measurement on the board; the clock rates are from
+`clk_summary`.
+
 ## Playback loop (`play.S`)
 
 `m0_play()` owns every register, SP included (it points at the loop's small
@@ -148,15 +159,43 @@ state block, so loads from it need no address register), and keeps both
 modulators' state in registers. A tick is: WFI, **write the GPIO word
 computed on the previous tick**, clear the pending bit, run both modulators.
 
-The per-sample work is cut into nine steps of at most about a dozen cycles
-(stop check; sample length; snapshot `write_idx`; move to the next frame
-unless the ring is empty; fetch; left sample in and clamp; right sample in
-and clamp; compute `read_idx`; publish it). Each of the first nine ticks of a
-sample carries one step as straight-line code, so no tick is much longer
-than a plain one and nothing is dispatched; the rest of the sample is plain
-ticks in a counted loop. Left and right change one tick apart. The clamp
-runs once per sample rather than every tick: simulated with the worst inputs
-the state then peaks at 2^24, against a wrap at 2^31.
+The per-sample work is cut into fifteen steps of at most about a dozen
+cycles. The six that use the shared SRAM come first (stop check; snapshot
+`write_idx`; move to the next frame unless the ring is empty; fetch; compute
+`read_idx`; publish it), so the host knows when the SRAM is not in use; then
+sample length, two steps per channel to work out where the input starts and
+what it steps by, one per channel to load those, one per channel to clamp.
+Each of the first fifteen ticks of a sample carries one step as
+straight-line code, so no tick is much longer than a plain one and nothing
+is dispatched; the rest of the sample is plain ticks in a counted loop. Left
+and right change one tick apart. The clamp runs once per sample rather than
+every tick. A `PROFILE=1` build has three more steps, after the SRAM ones.
+
+### Between samples
+
+The modulator's input does not jump from one sample to the next: every tick
+it moves a step towards the new sample. Everything is kept in units of
+2^-shift of an input LSB, 2^shift being the smallest power of two a sample's
+ticks fit in (64 at 3 MHz); the step is then simply the difference between
+the two samples, with no multiply and no rounding, and after n ticks the
+input has gone n/2^shift of the way. It is set exactly every sample, so
+nothing accumulates; what is left of the way at the end of the sample (1/64
+at 62 cycles per tick, where a sample is 63 ticks) is taken in one go. The
+output is one sample later than before.
+
+What that buys, simulated at 62 cycles per tick with a 1 kHz tone: the
+images at 47 and 49 kHz go from -72 to -89 dBFS at -40 dBFS, and from -35 to
+-67 dBFS at -3 dBFS. **The noise in the audio band does not change**
+(-79 dBFS and -68 dBFS respectively): holding a sample adds images, not
+hiss. Linear interpolation also rolls the top of the band off a little more
+than holding does (about 5 dB at 20 kHz instead of 2.6, 0.6 dB more at
+10 kHz). It tames the modulator, too: on full-scale random squares the
+second integrator peaks at 15 times full scale, against 400 when holding.
+
+`interp=0` on the sound module makes the firmware hold each sample, to
+compare (next stream). More than 64 ticks per sample (a tick shorter than
+62 cycles) also means hold: the state has no room for a larger shift. That
+makes 62 cycles, 3.02 MHz, the fastest tick worth using at 187.5 MHz.
 
 Measured with a `PROFILE=1` build (every tick records the longest tick so far
 and whether it ran into the next; the driver prints both when a stream ends;
@@ -173,6 +212,12 @@ the profiling itself costs about 17 cycles per tick), two-second tone:
 | TCM | 3.3 MHz | 57 | 6 % of all ticks |
 | TCM | 3.6 MHz | 52 | 41 % |
 
+Those figures are from before interpolation, which costs four more cycles
+per tick. With it, in TCM: a `PROFILE=1` build fits in 64 cycles and not in
+62; a normal build, about 18 cycles lighter, keeps exact pace at 62 (0 us
+behind over 10 s). So profile at `tick_hz=2929688` or below. Bus mode has
+not been run since.
+
 An overrun delays that tick's edge and the next tick starts late; ticks are
 not lost unless the work exceeds two ticks. For comparison, the first working
 loop (interrupt-free but with the per-sample work on four ticks, a clamp on
@@ -181,10 +226,12 @@ as TCM.
 
 ## Modulator
 
-Per channel, `FS = 32768`, `G = +FS` when the output bit is 1, else `-FS`:
+Per channel, `FS = 32768 << shift`, `G = +FS` when the output bit is 1, else
+`-FS - 1` (one's complement: an offset of 2^-shift LSB, and one instruction
+fewer than a shift that depends on `shift`):
 
 ```
-i1 += x - G_prev;  y = i2 + i1;  bit = (y >= 0);  G = bit ? +FS : -FS;  i2 = y - G
+i1 += x - G_prev;  x += dx;  y = i2 + i1;  bit = (y >= 0);  G = bit ? FS : ~FS;  i2 = y - G
 ```
 
 with `i2` clamped once per sample. A standard second-order modulator with
@@ -194,12 +241,19 @@ full-scale noise from running the state into int32 wrap. `check_dsm.c`
 mirrors the arithmetic and asserts this.
 
 Simulated in-band SNR (1 kHz tone, 20 Hz-20 kHz, ideal edges) is about 49 dB
-at -3 dBFS for a 1 MHz tick and 60 dB at 2 MHz. It flattens above that in
-the simulation, because sample changes are snapped to the tick grid, and on
-real hardware rise/fall asymmetry of the 1-bit output costs more the more
-edges there are. So the best-sounding rate may be below the fastest that
-fits; `tick_hz` is there to find out. None of this is a measurement of the
-board's output.
+at -3 dBFS for a 1 MHz tick, 60 dB at 2 MHz and 65 dB at 3 MHz; under a
+-40 dBFS tone the noise at 3 MHz is -79 dBFS. Edges are not ideal. Simulated
+at 3 MHz under the -40 dBFS tone:
+
+| Pin timing | In-band noise |
+|---|---|
+| ideal | -79 dBFS |
+| rising edges 1 ns later than falling ones | -69 dBFS |
+| every other bit 5.3 ns late (odd cycles per tick, see above) | -40 dBFS |
+
+Rise/fall asymmetry of the 1-bit output costs more the more edges there are,
+so the best-sounding rate may be below the fastest that fits; `tick_hz` is
+there to find out. None of this is a measurement of the board's output.
 
 ## Electrical: ALDO4
 
@@ -339,26 +393,31 @@ burst of in-band noise when its input drops to digital silence.
 
 ## Open issues
 
-1. **Quality.** Not measured. Nobody has yet listened critically or looked at
+1. **Hiss** was audible on the board with the 63-cycle tick and the old ring
+   updates. Whether the even tick removes it is the first thing to listen
+   for (`tick_even`, `interp` and `ring_sync` can each be switched while
+   testing).
+2. **Quality.** Not measured. Nobody has yet listened critically or looked at
    the output on a scope or analyser, at any tick rate.
-2. **Pin timing with bufferable writes** is inferred, not observed (above).
-3. **Suspend.** Untested in either mode: what suspend-to-RAM does to the TCM
+3. **Pin timing with bufferable writes** is inferred, not observed (above).
+4. **Suspend.** Untested in either mode: what suspend-to-RAM does to the TCM
    contents and the M0, and whether anything needs the boot-stage code this
    design overwrites in the first SRAM bank.
-4. **More speed.** A tick is now about 40 cycles as TCM, half of it the two
+5. **More speed.** A tick is now about 40 cycles as TCM, half of it the two
    modulators. What is left is running the modulator on the A7 (the M0 would
    only shift out a precomputed bit stream), which costs A7 time, or raising
    `aclk_bus_root` to 250 MHz (GPLL / 6), which adds a third but changes the
    bus clock for the whole SoC.
-5. **Sample timing.** Sample changes are snapped to the tick grid. A bus
+6. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.
-6. **Late ticks at each display redraw**, left over once the ring writes
+7. **Late ticks at each display redraw**, left over once the ring writes
    were synchronised: see "What the ticking was". Far smaller than what was
    fixed; whether they are audible has not been checked. A program that
    redraws continuously while audio plays is the case to listen to.
-7. **`ring_sync` in bus mode** is untested; the measurements are all TCM.
-8. **Pop when a stream ends** (and presumably when it starts): the pins go
+8. **Bus mode** has not been run with `ring_sync` or with interpolation;
+   the measurements are all TCM.
+9. **Pop when a stream ends** (and presumably when it starts): the pins go
    from the 50% pattern of silence to low, a DC step through the output
    capacitor. Needs a ramp between the two.
-9. **ALDO4 margin**, above.
+10. **ALDO4 margin**, above.

@@ -51,10 +51,12 @@
                 /* 74 = HCLK_M0, the M0 core clock its SysTick counts: the
                  * driver derives the tick timing from its rate. */
                 clocks = <&cru 74>;
-                /* Output bit rate; see tick_hz in the driver. With the
-                 * firmware running as TCM (rockchip,tcm below) every tick
-                 * fits up to 3.2 MHz at a 187.5 MHz core clock; without
-                 * TCM, up to 1.2 MHz (use 1000000). */
+                /* Output bit rate; see tick_hz in the driver, which makes
+                 * the tick an even number of core cycles: 62 at a 187.5 MHz
+                 * core clock, the shortest at which the firmware still
+                 * interpolates between samples. That needs the firmware
+                 * running as TCM (rockchip,tcm below); without, use
+                 * 1000000. A PROFILE=1 firmware needs 2929688 or less. */
                 tick-rate-hz = <3000000>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&snd_pins>;

@@ -19,7 +19,7 @@ from unicorn import (Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS, UC_HOOK_MEM
                      UC_HOOK_MEM_WRITE, UC_HOOK_BLOCK)
 from unicorn.arm_const import UC_CPU_ARM_CORTEX_M0, UC_ARM_REG_SP
 
-CODE_BASE, CODE_SIZE = 0x00000000, 0x1000
+CODE_BASE, CODE_SIZE = 0x00000000, 0x2000   # image and stack: the audio firmware's linker script
 RES = 0xFFF81000
 CH4, CH5 = 0xFF254000, 0xFF255000
 LOAD0, CURR0, CTRL, INTSTAT = 0x00, 0x08, 0x10, 0x18

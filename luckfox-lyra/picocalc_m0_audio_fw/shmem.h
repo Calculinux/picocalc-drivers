@@ -46,7 +46,7 @@
  * Either way the M0 sees its image at address 0 (rk3506-m0-audio.ld).
  *   0xFFF81000  this header (64 B) + 8192 B ring
  * Both sides use the absolute address: the M0 as a plain data access, the
- * host through the node its memory-region property points at (mapped WC).
+ * host through the node its memory-region property points at.
  * (At boot this area holds the remains of the DDR-init stage; it is free.)
  */
 #define M0_SHMEM_ADDR     M0_U32(0xFFF81000)
@@ -64,15 +64,18 @@
 #define M0_SHMEM_STAT_OVERRUNS 60
 
 /* One sample must last at least this many ticks: play.S gives each step of
- * the per-sample work a tick of its own (12 in a PROFILE build) and needs one
+ * the per-sample work a tick of its own (18 in a PROFILE build) and needs one
  * more. */
-#define M0_MIN_TICKS_PER_SAMPLE 13
+#define M0_MIN_TICKS_PER_SAMPLE 19
+
+/* flags */
+#define M0_FLAG_NO_INTERP 1   /* hold each sample; default is to ramp to the next */
 
 /*
  * Event log of a PROFILE=1 firmware, in the SRAM after the ring; read it with
  * m0trace. Word 0 counts the events since the stream started; event n is in
  * word 1 + (n & (M0_TRACE_ENTRIES - 1)), as (sample number << 5) | code:
- *   1..12  that step tick was still working when the next tick fell due
+ *   1..18  that step tick was still working when the next tick fell due
  *   31     a plain tick was
  *   30     the ring was empty when the firmware wanted the next frame
  */
@@ -92,7 +95,7 @@ typedef struct {
 	volatile uint32_t sample_rate;
 	volatile uint32_t channels;
 	volatile uint32_t format;
-	volatile uint32_t flags;   /* unused */
+	volatile uint32_t flags;   /* M0_FLAG_* */
 	/*
 	 * Tick timing, set by the host, which knows the M0 core clock (hclk_m0):
 	 *   tick_cycles  core clock cycles per tick (one output bit per tick)

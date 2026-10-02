@@ -45,7 +45,8 @@
 #define M0_FIXED_SAMPLE_RATE_HZ  48000U
 #define M0_FIXED_BUF_SIZE        8192U
 /* The firmware gives each step of its per-sample work a tick of its own */
-#define M0_MIN_TICKS_PER_SAMPLE  13U
+#define M0_MIN_TICKS_PER_SAMPLE  19U
+#define M0_FLAG_NO_INTERP        1U
 #define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
 
 /*
@@ -62,6 +63,30 @@ module_param(tick_hz, uint, 0644);
 MODULE_PARM_DESC(tick_hz, "M0 output bit rate in Hz (default 1000000)");
 
 /*
+ * The GPIO block the M0 writes its pins through is clocked at half the M0's
+ * core clock, so a pin can only change on every second core cycle. With an
+ * odd number of core cycles per tick every other bit comes out a core cycle
+ * late, and a regular error like that brings the modulator's ultrasonic noise
+ * down into the audio band (in simulation: from -79 to -40 dBFS at 63
+ * cycles). So the tick is made an even number of cycles. Off: the nearest
+ * number, even or odd, to hear the difference. Next playback start.
+ */
+static bool tick_even = true;
+module_param(tick_even, bool, 0644);
+MODULE_PARM_DESC(tick_even, "Round the tick to an even number of core clock cycles (default on)");
+
+/*
+ * Between two samples the firmware moves its modulator input towards the
+ * new one a little every tick, instead of holding each sample for its whole
+ * length. That takes the images of the signal around multiples of the sample
+ * rate down by 15 to 30 dB; the noise in the audio band is the same. Off:
+ * hold, to compare. Next playback start.
+ */
+static bool interp = true;
+module_param(interp, bool, 0644);
+MODULE_PARM_DESC(interp, "Interpolate between samples (default on)");
+
+/*
  * When the ring is written. The M0 touches the shared SRAM in the first few
  * ticks of every sample and nothing but its pins in the rest. Our writes to
  * that SRAM hold its accesses up (our reads do not), by enough to make the
@@ -75,9 +100,10 @@ static bool ring_sync = true;
 module_param(ring_sync, bool, 0644);
 MODULE_PARM_DESC(ring_sync, "Write the ring only between the M0's own accesses to it (default on)");
 
-/* Ticks at the start of a sample in which the firmware uses the SRAM: nine,
- * and three more in a PROFILE build, which we cannot tell apart from here. */
-#define M0_STEP_TICKS     9U
+/* Ticks at the start of a sample in which the firmware uses the SRAM: six
+ * (read_idx is written in the sixth), and three more in a PROFILE build,
+ * which we cannot tell apart from here. play.h: M0_BUS_STEPS. */
+#define M0_STEP_TICKS     6U
 #define M0_PROFILE_TICKS  3U
 #define M0_SAMPLE_NS      (NSEC_PER_SEC / M0_FIXED_SAMPLE_RATE_HZ)
 /* Words written between two looks at the clock */
@@ -93,7 +119,7 @@ struct m0_audio_shmem {
 	volatile uint32_t sample_rate;
 	volatile uint32_t channels;
 	volatile uint32_t format;
-	volatile uint32_t flags;   /* M0_SHMEM_FLAG_WIC_WAKE etc. */
+	volatile uint32_t flags;   /* M0_FLAG_* */
 	volatile uint32_t tick_cycles;   /* core clock cycles per tick */
 	volatile uint32_t ticks_base;    /* ticks per sample: whole part ... */
 	volatile uint32_t ticks_frac;    /* ... and fraction, in 2^-32 tick */
@@ -169,7 +195,10 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 	u64 den64;
 
 	if (hclk && hz) {
-		cycles = DIV_ROUND_CLOSEST(hclk, hz);
+		if (READ_ONCE(tick_even))
+			cycles = 2 * DIV_ROUND_CLOSEST(hclk, 2 * (unsigned long)hz);
+		else
+			cycles = DIV_ROUND_CLOSEST(hclk, hz);
 		den64 = (u64)cycles * M0_FIXED_SAMPLE_RATE_HZ;
 		if (cycles >= 2 && cycles <= M0_MAX_TICK_CYCLES && den64 <= U32_MAX) {
 			den = den64;
@@ -190,8 +219,8 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		uint32_t tick_ns = div_u64((u64)cycles * NSEC_PER_SEC, hclk);
 		uint32_t guard_ns = tick_ns + 300;
 
-		/* read_idx is written in the last step tick; the next sample's
-		 * first is at least base - M0_STEP_TICKS ticks later. */
+		/* read_idx is written in the last of those ticks; the next
+		 * sample's first is at least base - M0_STEP_TICKS ticks later. */
 		m->sync_skip_ns = M0_PROFILE_TICKS * tick_ns + 200;
 		if (base > M0_STEP_TICKS &&
 		    (u64)(base - M0_STEP_TICKS) * tick_ns > m->sync_skip_ns + guard_ns + 2000)
@@ -330,6 +359,7 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 	m->shmem->sample_rate = M0_FIXED_SAMPLE_RATE_HZ;
 	m->shmem->channels = 2;
 	m->shmem->format = M0_FMT_S16_LE;
+	m->shmem->flags = READ_ONCE(interp) ? 0 : M0_FLAG_NO_INTERP;
 	m->shmem->ctrl = M0_CTRL_PLAY;
 	dma_wmb();
 	m->last_read_idx = 0;

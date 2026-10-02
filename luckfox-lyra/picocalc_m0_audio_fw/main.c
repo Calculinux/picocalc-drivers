@@ -62,14 +62,31 @@ static void tick_start(const m0_audio_shmem_t *shmem)
 	uint32_t cycles = shmem->tick_cycles;
 	uint32_t base = shmem->ticks_base;
 	uint32_t frac = shmem->ticks_frac;
+	uint32_t shift = 0, interp = ~0U;
 
 	if (cycles < 2U || cycles > SYST_MAX + 1U || base < M0_MIN_TICKS_PER_SAMPLE) {
 		cycles = M0_DEFAULT_TICK_CYCLES;
 		base = DEF_BASE;
 		frac = DEF_FRAC;
 	}
+	/* The input steps 2^-shift of the way to the next sample per tick: the
+	 * smallest shift that does not overshoot in the longest sample. */
+	while ((1U << shift) < base + 1U)
+		shift++;
+	if (shift > M0_MAX_SHIFT) {
+		shift = M0_MAX_SHIFT;
+		interp = 0;
+	}
+	if (shmem->flags & M0_FLAG_NO_INTERP)
+		interp = 0;
+	/* Holding needs no fraction, and a held full-scale square drives the
+	 * state far further than a ramped one: keep the headroom. */
+	if (!interp)
+		shift = 0;
 	m0_play_state[PS_FRAC / 4] = frac;
 	m0_play_state[PS_PLAIN / 4] = base - M0_STEP_TICKS;
+	m0_play_state[PS_SHIFT / 4] = shift;
+	m0_play_state[PS_DX_MASK / 4] = interp;
 	tick_set(cycles);
 }
 

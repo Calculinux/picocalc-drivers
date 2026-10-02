@@ -7,8 +7,8 @@
 #define M0_PLAY_H
 
 #define PS_ACC        0   /* fractional ticks accumulated (2^-32 of a tick) */
-#define PS_FRAC       4   /* set by main.c: added to PS_ACC once per sample */
-#define PS_PLAIN      8   /* set by main.c: plain ticks per sample before any carry */
+#define PS_FRAC       4   /* set by caller: added to PS_ACC once per sample */
+#define PS_PLAIN      8   /* set by caller: plain ticks per sample before any carry */
 #define PS_CUR        12  /* ring offset of the frame being played */
 #define PS_WIDX       16  /* snapshot of the host's write_idx */
 #define PS_FRAME      20  /* that frame: left in [15:0], right in [31:16] */
@@ -25,22 +25,48 @@
 #define PS_SAMPLE_NO  60  /* PROFILE: samples since the stream started */
 #define PS_EVENTS     64  /* PROFILE: events logged so far */
 #define PS_K_TRACE    68  /* PROFILE: M0_TRACE_ADDR */
-#define PS_SIZE       72
+#define PS_SHIFT      72  /* set by caller: the modulator works in units of 2^-shift LSB */
+#define PS_DX_MASK    76  /* set by caller: ~0 to interpolate, 0 to hold each sample */
+#define PS_K_ICSR     80  /* &SCB_ICSR */
+#define PS_K_GPIO     84  /* GPIO4 data register */
+#define PS_CLAMP_SH   88  /* i2 is in range iff i2 >> this is 0 or -1 */
+/* Per channel: the sample just fetched and the one before it (7/8 scaled),
+ * and what the next stretch of ticks starts from and steps by */
+#define PS_NL         92
+#define PS_VL         96
+#define PS_DXL        100
+#define PS_XL         104
+#define PS_NR         108
+#define PS_VR         112
+#define PS_DXR        116
+#define PS_XR         120
+#define PS_SIZE       128
 
-/* Ticks at the start of every sample that each carry one step of the
- * per-sample work (play.S); the rest of the sample is plain ticks. */
+/*
+ * Ticks at the start of every sample that each carry one step of the
+ * per-sample work (play.S); the rest of the sample is plain ticks. The first
+ * M0_BUS_STEPS (and the M0_PROFILE_STEPS after them) are the only ones that
+ * touch the shared SRAM; the host times its ring writes by that.
+ */
+#define M0_BUS_STEPS  6
 #ifdef M0_PROFILE
-#define M0_STEP_TICKS 12
+#define M0_PROFILE_STEPS 3
 #else
-#define M0_STEP_TICKS 9
+#define M0_PROFILE_STEPS 0
 #endif
+#define M0_STEP_TICKS (15 + M0_PROFILE_STEPS)
+
+/* The input moves 2^-shift of the way to the next sample per tick, so a
+ * sample may last at most 2^shift ticks; the state has room for this much. */
+#define M0_MAX_SHIFT  6
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 
 extern uint32_t m0_play_state[PS_SIZE / 4];
 
-/* SysTick running at the tick rate, PRIMASK set, shmem header valid.
+/* SysTick running at the tick rate, PRIMASK set, shmem header valid, PS_FRAC,
+ * PS_PLAIN, PS_SHIFT and PS_DX_MASK set.
  * Returns when shmem->ctrl leaves M0_CTRL_PLAY, pins as the last tick left them. */
 void m0_play(void);
 #endif
