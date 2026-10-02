@@ -94,8 +94,8 @@
  *
  * The M0 core clock is hclk_m0, a plain gate on aclk_bus_root
  * (CRU_CLKSEL_CON21, shared with the rest of the bus domain), so it cannot
- * be raised for the M0 alone. Code runs from SRAM over the bus at about 2.5
- * cycles per instruction, and a GPIO write takes 33; see play.S for what a
+ * be raised for the M0 alone. In bus mode code runs at about 2.5 cycles per
+ * instruction (1 as TCM), and a GPIO write takes 33; see play.S for what a
  * tick costs and build with PROFILE=1 to measure it. */
 #define M0_DEFAULT_CORE_HZ      187500000U
 #define M0_DEFAULT_TICK_CYCLES  312U

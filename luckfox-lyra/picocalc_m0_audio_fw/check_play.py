@@ -23,8 +23,8 @@ from unicorn.arm_const import (UC_CPU_ARM_CORTEX_M0, UC_ARM_REG_SP, UC_ARM_REG_L
                                UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11)
 
 # Hardware constants, written out independently of the firmware headers.
-CODE_BASE, CODE_SIZE = 0x00000000, 0x1000   # M0 view of the SRAM at 0xFFF88000
-SHMEM = 0xFFF89000
+CODE_BASE, CODE_SIZE = 0x00000000, 0x1000   # M0 view of its image
+SHMEM = 0xFFF81000
 HDR = 64
 RING = 8192
 STACK_TOP = CODE_BASE + CODE_SIZE

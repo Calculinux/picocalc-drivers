@@ -59,9 +59,19 @@ extern struct resource_table *rproc_elf_find_loaded_rsc_table(struct rproc *rpro
  * ARMv6-M) and its ELF segments carry device addresses 0..size, which
  * da_to_va() places at RK3506_MCU_CODE_ADDR.
  *
- * 0xFFF88000 rather than 0xFFF84000: with stock OP-TEE, 0xFFF84000 switches
- * the SRAM into TCM mode and locks the A7 out of it until reboot, so the
- * firmware could never be reloaded (nvitya/rk3506-mcu issue #2).
+ * Two modes, chosen by the "rockchip,tcm" property on the node:
+ *
+ *   bus mode (default): image at 0xFFF88000. The M0 fetches its code over the
+ *   SoC bus, about 2.5 clock cycles per instruction, and the firmware can be
+ *   stopped and reloaded at will.
+ *
+ *   TCM mode: image at 0xFFF84000. With stock OP-TEE, giving the SiP call that
+ *   address switches the SRAM from 0xFFF84000 to 0xFFF8C000 into the M0's
+ *   tightly-coupled memory: one cycle per instruction, nothing else on the bus
+ *   can hold up a fetch, and the A7 is locked out of that SRAM until reboot
+ *   (nvitya/rk3506-mcu issue #2). So the image is loaded exactly once per
+ *   boot; stopping and starting again only resets the M0, which then runs the
+ *   image still sitting in the TCM, and this module can no longer be removed.
  */
 #define RK3506_MCU_CODE_ADDR 0xFFF88000
 #define RK3506_MCU_CODE_SIZE 0x4000
@@ -83,6 +93,10 @@ typedef struct {
 	uint8_t *regs_CRU;
 	uint8_t *regs_GRF;
 	struct platform_device *pdev;
+	bool tcm;           /* "rockchip,tcm": run the image as TCM */
+	bool tcm_engaged;   /* the SRAM is the M0's now; no more loading */
+	uint32_t code_addr; /* where M0 address 0 is */
+	uint32_t code_size;
 } rk3506_mcu_t;
 
 static void rk3506_rproc_mcu_run(rk3506_mcu_t *mcu, bool arun)
@@ -102,16 +116,35 @@ static int rk3506_rproc_start(struct rproc *rproc)
 	struct arm_smccc_res res;
 	/* Base of the vector table, not the ELF entry point: the M0 takes its
 	 * initial SP and reset vector from here. */
-	uint32_t mcu_entry = RK3506_MCU_CODE_ADDR;
+	uint32_t mcu_entry = mcu->code_addr;
 
-	dev_info(&rproc->dev, "Starting M0 MCU at 0x%08X...", mcu_entry);
+	if (mcu->tcm_engaged) {
+		/* Address map and image are already in place; just let it run. */
+		dev_info(&rproc->dev, "Restarting M0 MCU from its TCM image");
+		rk3506_rproc_mcu_run(mcu, true);
+		return 0;
+	}
 
+	dev_info(&rproc->dev, "Starting M0 MCU at 0x%08X%s...", mcu_entry,
+		 mcu->tcm ? " (TCM)" : "");
+
+	/* Everything written to the SRAM must have landed before the M0 (or,
+	 * in TCM mode, OP-TEE's switch of the SRAM port) gets to it. */
+	wmb();
 	arm_smccc_smc(SIP_MCU_CFG, ROCKCHIP_SIP_CONFIG_BUSMCU_0_ID,
 		     ROCKCHIP_SIP_CONFIG_MCU_CODE_START_ADDR,
 		     mcu_entry, 0, 0, 0, 0, &res);
 	if (res.a0) {
 		dev_err(&rproc->dev, "SMCCC CODE START call error: %i", (int)res.a0);
 		return -EIO;
+	}
+	if (mcu->tcm) {
+		mcu->tcm_engaged = true;
+		/* The state above must outlive any attempt to unload us. */
+		__module_get(THIS_MODULE);
+		dev_info(&rproc->dev,
+			 "SRAM 0x%08X-0x%08X is now M0 TCM: no firmware reload until reboot",
+			 mcu->code_addr, mcu->code_addr + mcu->code_size);
 	}
 
 	rk3506_rproc_mcu_run(mcu, true);
@@ -133,9 +166,11 @@ static int rk3506_rproc_load(struct rproc *rproc, const struct firmware *fw)
 {
 	rk3506_mcu_t *mcu = rproc->priv;
 
-	void __iomem *dst = mcu->tcm_virt + (RK3506_MCU_CODE_ADDR - RK3506_MCU_TCM_ADDR);
+	void __iomem *dst = mcu->tcm_virt + (mcu->code_addr - RK3506_MCU_TCM_ADDR);
 
-	if (fw->size > RK3506_MCU_CODE_SIZE) {
+	if (mcu->tcm_engaged)
+		return 0;
+	if (fw->size > mcu->code_size) {
 		dev_err(&rproc->dev, "M0 MCU FW is too big: size=%u", (uint32_t)fw->size);
 		return -EINVAL;
 	}
@@ -151,12 +186,12 @@ static void *my_da_to_va(struct rproc *rproc, u64 da, size_t len, bool *is_iomem
 	rk3506_mcu_t *mcu = rproc->priv;
 	void __iomem *va;
 
-	/* M0-local addresses (image linked at 0) land at RK3506_MCU_CODE_ADDR.
+	/* M0-local addresses (image linked at 0) land at the code address.
 	 * Absolute SRAM addresses are accepted too, for segments an image wants
-	 * placed outside the window the M0 sees at 0. The audio ring in the
-	 * same SRAM bank is mapped separately by picocalc_snd_m0 (WC). */
-	if (da + len <= RK3506_MCU_CODE_SIZE) {
-		va = mcu->tcm_virt + (RK3506_MCU_CODE_ADDR - RK3506_MCU_TCM_ADDR) + da;
+	 * placed outside the window the M0 sees at 0. The audio ring, in the
+	 * first SRAM bank, is mapped separately by picocalc_snd_m0 (WC). */
+	if (da + len <= mcu->code_size) {
+		va = mcu->tcm_virt + (mcu->code_addr - RK3506_MCU_TCM_ADDR) + da;
 	} else if (da >= RK3506_MCU_TCM_ADDR && (da + len) <= (RK3506_MCU_TCM_ADDR + RK3506_MCU_TCM_SIZE)) {
 		va = mcu->tcm_virt + (da - RK3506_MCU_TCM_ADDR);
 	} else {
@@ -164,6 +199,28 @@ static void *my_da_to_va(struct rproc *rproc, u64 da, size_t len, bool *is_iomem
 		va = NULL;
 	}
 	return va;
+}
+
+/* Once the SRAM is TCM the A7 must not touch it: the image stays as loaded. */
+static int rk3506_rproc_elf_load(struct rproc *rproc, const struct firmware *fw)
+{
+	rk3506_mcu_t *mcu = rproc->priv;
+
+	if (mcu->tcm_engaged)
+		return 0;
+	return rproc_elf_load_segments(rproc, fw);
+}
+
+/* The core copies its cached table over the loaded one; in TCM mode that
+ * would be a write into SRAM the A7 may no longer own. The table is empty. */
+static struct resource_table *rk3506_rproc_find_loaded_rsc_table(struct rproc *rproc,
+								  const struct firmware *fw)
+{
+	rk3506_mcu_t *mcu = rproc->priv;
+
+	if (mcu->tcm)
+		return NULL;
+	return rproc_elf_find_loaded_rsc_table(rproc, fw);
 }
 
 #endif
@@ -175,8 +232,8 @@ static const struct rproc_ops rk3506_rproc_ops = {
 	.load = rk3506_rproc_load,
 #else
 	.da_to_va = my_da_to_va,
-	.load = rproc_elf_load_segments,
-	.find_loaded_rsc_table = rproc_elf_find_loaded_rsc_table,
+	.load = rk3506_rproc_elf_load,
+	.find_loaded_rsc_table = rk3506_rproc_find_loaded_rsc_table,
 	.sanity_check = rproc_elf_sanity_check,
 	.get_boot_addr = rproc_elf_get_boot_addr,
 #endif
@@ -217,6 +274,9 @@ static int rk3506_rproc_probe(struct platform_device *pdev)
 	 * leave picocalc_snd_m0's rproc_boot() a no-op on a core that is
 	 * already up and idling, so its firmware would never see the stream. */
 	rproc->auto_boot = false;
+	mcu->tcm = of_property_read_bool(pdev->dev.of_node, "rockchip,tcm");
+	mcu->code_addr = mcu->tcm ? RK3506_MCU_TCM_ADDR : RK3506_MCU_CODE_ADDR;
+	mcu->code_size = mcu->tcm ? RK3506_MCU_TCM_SIZE : RK3506_MCU_CODE_SIZE;
 
 	mcu->num_clks = devm_clk_bulk_get_all(&pdev->dev, &mcu->clks);
 	if (mcu->num_clks < 0) {

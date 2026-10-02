@@ -13,6 +13,9 @@
                 compatible = "rockchip,rk3506-mcu";
                 reg = <0xfff84000 0x8000>;
                 firmware-name = "rk3506-m0-diag.elf";
+                /* Add "rockchip,tcm;" here to run the diagnostics as TCM. That
+                 * can be done once per boot: the SRAM cannot be loaded again
+                 * afterwards (stop/start only restarts the same image). */
                 /* 74 HCLK_M0, 104 STCLK_M0, 76 PCLK_TIMER, 82 CLK_TIMER0_CH5,
                  * 81 CLK_TIMER0_CH4 (stopwatch). Both timer channels run from
                  * 22 CLK_GPLL_DIV_100M; Linux has to select and enable that

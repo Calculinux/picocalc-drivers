@@ -14,19 +14,40 @@
 #define M0_AUDIO_MAGIC    0x4D304431U  /* "M0D1" M0 audio */
 #define M0_CTRL_PLAY      1
 #define M0_CTRL_STOP      0
+
+/*
+ * The firmware is loaded once and left running. Between streams it idles:
+ * SysTick slowed to one wake every M0_IDLE_CYCLES core cycles (a few ms),
+ * asleep in WFI in between, looking at ctrl on each wake.
+ *
+ *   host: wait for m0_state == IDLE, fill in the header, ctrl = PLAY
+ *   M0:   sees PLAY at its next idle wake, m0_state = PLAY, plays
+ *   host: ctrl = STOP
+ *   M0:   sees STOP within one sample, drives the pins low, m0_state = IDLE
+ *
+ * The host must not touch the indices or the timing while m0_state is PLAY.
+ */
+#define M0_STATE_IDLE     0x49444C45U  /* "IDLE" */
+#define M0_STATE_PLAY     0x504C4159U  /* "PLAY" */
+#define M0_IDLE_CYCLES    (1U << 19)   /* 2.8 ms at 187.5 MHz */
 #define M0_FMT_U8         0
 #define M0_FMT_S16_LE     1
 
 /*
- * The header and ring live in system SRAM, in the same 16 KB bank as the
- * firmware, so the M0 never touches DDR while playing:
- *   0xFFF88000  firmware image + stack (4 KB, seen by the M0 at address 0,
- *               see rk3506-m0-audio.ld)
- *   0xFFF89000  this header (64 B) + 8192 B ring
+ * The header and ring live in system SRAM, so the M0 never touches DDR while
+ * playing (M0 accesses to DDR are very slow). They sit in the first bank,
+ * 0xFFF80000..0xFFF84000, past the 4 KB OP-TEE keeps for itself, because that
+ * bank stays on the ordinary bus whichever way the firmware is run:
+ *   bus mode   image at 0xFFF88000 (third bank), reloadable
+ *   TCM mode   image at 0xFFF84000; the second and third banks become the
+ *              M0's private memory and Linux can no longer reach them
+ * Either way the M0 sees its image at address 0 (rk3506-m0-audio.ld).
+ *   0xFFF81000  this header (64 B) + 8192 B ring
  * Both sides use the absolute address: the M0 as a plain data access, the
  * host through the node its memory-region property points at (mapped WC).
+ * (At boot this area holds the remains of the DDR-init stage; it is free.)
  */
-#define M0_SHMEM_ADDR     M0_U32(0xFFF89000)
+#define M0_SHMEM_ADDR     M0_U32(0xFFF81000)
 
 /* Fixed stream format: S16_LE stereo. Host and firmware must agree. */
 #define M0_SAMPLE_RATE_HZ M0_U32(48000)
@@ -50,12 +71,12 @@ typedef struct {
 	volatile uint32_t ctrl;
 	volatile uint32_t write_idx;
 	volatile uint32_t read_idx;
-	volatile uint32_t period_bytes;
+	volatile uint32_t m0_state;   /* written by the M0: M0_STATE_* */
 	volatile uint32_t buf_size;
 	volatile uint32_t sample_rate;
 	volatile uint32_t channels;
 	volatile uint32_t format;
-	volatile uint32_t flags;   /* M0_SHMEM_FLAG_* */
+	volatile uint32_t flags;   /* unused */
 	/*
 	 * Tick timing, set by the host, which knows the M0 core clock (hclk_m0):
 	 *   tick_cycles  core clock cycles per tick (one output bit per tick)
@@ -82,8 +103,5 @@ typedef struct {
 #endif
 
 #define M0_HEADER_SIZE    64
-
-/* flags: set by host when it supports wake via GRF rxev / WIC */
-#define M0_SHMEM_FLAG_WIC_WAKE  (1u << 0)  /* Host set wicenreq and will wake via rxev; M0 may use WFI+SLEEPDEEP */
 
 #endif /* M0_SHMEM_H */

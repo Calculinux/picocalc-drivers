@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Results block shared by the M0 diagnostic firmware and the m0diag host tool.
- * Lives in system SRAM right after the firmware image, the same place the
- * audio firmware keeps its ring header; the magic tells them apart. */
+ * Lives in system SRAM where the audio firmware keeps its ring header (the
+ * bank that stays reachable from Linux in TCM mode too); the magic tells
+ * them apart. */
 
 #ifndef M0_DIAG_H
 #define M0_DIAG_H
 
 #include <stdint.h>
 
-#define M0_DIAG_ADDR      0xFFF89000U
+#define M0_DIAG_ADDR      0xFFF81000U
 #define M0_DIAG_MAGIC     0x4D304447U  /* "M0DG" */
 #define M0_DIAG_VERSION   3U
 

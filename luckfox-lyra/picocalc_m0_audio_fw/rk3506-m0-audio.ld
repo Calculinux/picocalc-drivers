@@ -3,17 +3,19 @@
  * The image is linked at address 0, not at its SRAM address. The Cortex-M0
  * has no VTOR and fetches its vectors from 0; the SoC's address converter
  * maps M0 address 0 onto the "code start address" the host passes to the
- * SiP call (0xFFF88000, see picocalc_rk3506_rproc). The core could not run
- * at 0xFFF8xxxx anyway: on ARMv6-M everything from 0xE0000000 up is
+ * SiP call (see picocalc_rk3506_rproc). The core could not run at
+ * 0xFFF8xxxx anyway: on ARMv6-M everything from 0xE0000000 up is
  * execute-never. Data accesses to absolute addresses up there are fine, which
  * is how the firmware reaches the ring and the peripherals.
  *
- * 16 KB system SRAM bank, physical 0xFFF88000..0xFFF8C000:
- *   0xFFF88000  = M0 0x0000  image (vectors, code, data, bss) and stack, 4 KB
- *   0xFFF89000              shared header + ring written by the host (shmem.h),
- *                           addressed absolutely, 64 + 8192 B
- * Loading at 0xFFF88000 rather than 0xFFF84000 keeps OP-TEE from switching
- * the SRAM to TCM mode, which would lock the host out of it until reboot.
+ * The same image runs in either mode:
+ *   bus mode   loaded at 0xFFF88000; code is fetched over the SoC bus
+ *              (about 2.5 cycles per instruction) and can be reloaded
+ *   TCM mode   loaded at 0xFFF84000; OP-TEE turns that SRAM into the M0's
+ *              tightly-coupled memory (1 cycle per instruction) and Linux
+ *              cannot reach it again until reboot
+ * Image, data, bss and stack all fit in the first 4 KB of the window; the
+ * shared header and ring are elsewhere (shmem.h).
  */
 OUTPUT_ARCH(arm)
 ENTRY(Reset_Handler)

@@ -261,7 +261,7 @@ int main(int argc, char **argv)
 	printf("  GPIO4 DR write                   %5.1f  (2)\n", EXTRA(cal_gpio_wr));
 	printf("  TIMER0 status read               %5.1f  (2)\n", EXTRA(cal_timer_rd));
 	printf("  core-internal (NVIC) write       %5.1f  (2)\n", EXTRA(cal_ppb_wr));
-	printf("  SRAM read at 0xFFF89000          %5.1f  (2)\n", EXTRA(cal_sram_abs));
+	printf("  SRAM read, absolute address      %5.1f  (2)\n", EXTRA(cal_sram_abs));
 	printf("  SRAM read through low window     %5.1f  (2)\n", EXTRA(cal_sram_low));
 
 	if (d->period_n) {

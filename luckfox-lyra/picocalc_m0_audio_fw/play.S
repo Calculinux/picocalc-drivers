@@ -55,13 +55,14 @@
  *   PROFILE=1: the loop then records the lowest SysTick count it sees at the
  *   end of a tick's work and how often a tick ran into the next, and the
  *   host driver reports both when playback stops.
- *   Measured that way at 187.5 MHz: the heaviest tick (3 left) takes about
- *   295 cycles, the other three per-sample ticks 265-285, a plain tick under
- *   250. So 600 kHz (312 cycles) fits everything and each step above it
- *   pushes one more of the four over. A tick that overruns only delays its
- *   own edge and the next tick starts late; none are lost unless the work
- *   exceeds two ticks. A few dozen ticks a second are stretched further by
- *   other traffic on the bus the code is fetched over.
+ *   Measured that way at 187.5 MHz, bus mode: the heaviest tick takes about
+ *   295 cycles, the other per-sample ticks 265-285, a plain tick under 250,
+ *   so 600 kHz (312 cycles) fits everything. As TCM (1 cycle per instruction)
+ *   the heaviest is about 155 and a plain tick about 90, so 1.2 MHz fits.
+ *   A tick that overruns only delays its own edge and the next tick starts
+ *   late; none are lost unless the work exceeds two ticks. In bus mode about
+ *   one tick per host ring update is stretched further, by Linux touching the
+ *   SRAM the code is being fetched from.
  *
  * REGISTERS
  *   r0 i1_l   r1 i2_l   r2 G_l      r8  x_l          r11 GPIO word

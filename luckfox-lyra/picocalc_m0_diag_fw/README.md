@@ -12,7 +12,7 @@ so a hang or fault names the stage it happened in.
 
 | Stage | What | Answers |
 |---|---|---|
-| 1 ALIVE | reached `main()` | M0 starts from `0xFFF88000` with the image linked at 0; it can write SRAM at `0xFFF89000` |
+| 1 ALIVE | reached `main()` | M0 starts with the image linked at 0; it can write SRAM at `0xFFF81000` |
 | 2 CAL | times fixed loops against TIMER0_CH4 | real cycles per instruction, per GPIO write, timer read, SRAM read, core-internal write |
 | 3 PERIOD | 10,000 expiries with LOAD = 999 | whether the timer period is LOAD + 1 or LOAD counts |
 | 4 POLL_LAT | 4096 ticks, polling | expiry-to-detect latency when polling, with histogram |
@@ -75,7 +75,7 @@ core clock rates from `/sys/kernel/debug/clk/clk_summary`, or from `-t HZ` and
 
 | You see | Meaning |
 |---|---|
-| "no diagnostic results" and `M0 locked up: YES` | the M0 faulted before or while writing the results block: wrong start address, image not at M0 address 0, or SRAM at `0xFFF89000` not writable by the M0 |
+| "no diagnostic results" and `M0 locked up: YES` | the M0 faulted before or while writing the results block: wrong start address, image not at M0 address 0, or SRAM at `0xFFF81000` not writable by the M0 |
 | "no diagnostic results", not locked up | the M0 is not running at all (reset not released, clock gated) |
 | "stopwatch did not count", stuck at stage 3 | the timer channels have no clock: their parent is gated (see the overlay's `assigned-clock-parents`) |
 | `HardFault during this stage` | the access that stage makes is blocked (GPIO4, CRU, TIMER0) |
@@ -102,7 +102,7 @@ core clock rates from `/sys/kernel/debug/clk/clk_summary`, or from `-t HZ` and
 | GPIO4 DR write | 28 cycles extra in a loop; 33 start to finish, spread 0 |
 | TIMER0 status read | 24 cycles extra in a loop; 30 start to finish, spread 0 |
 | core-internal (NVIC) write | 2 cycles |
-| SRAM read at `0xFFF89000` / through the low window | 6 / 2 cycles |
+| SRAM read at its absolute address / through the low window | 6 / 2 cycles |
 | polling, expiry to detect | spread 277 ns (52 cycles) |
 | WFI woken by masked TIMER0_CH5 | works; NVIC line 19 pending on every wake; no spurious returns |
 | WFI wake interval, SysTick-stamped | exactly 2000 cycles, 4096 of 4096: zero jitter |

@@ -6,12 +6,19 @@
  * node memory-region points at), so the M0 never reads DDR while playing.
  * One output bit per SysTick tick on the M0; this driver tells the firmware
  * how many core clock cycles a tick is and how many ticks a sample lasts.
+ *
+ * The firmware is booted once, at the first stream, and left running: in TCM
+ * mode it cannot be loaded a second time before the next reboot. Between
+ * streams it idles at a slow tick. Streams are handed over through the
+ * header: wait for m0_state == IDLE, fill the header in, ctrl = PLAY; to end
+ * one, ctrl = STOP and the firmware returns to IDLE.
  */
 
 #include <asm/barrier.h>
 #include <asm/div64.h>
 #include <linux/clk.h>
 #include <linux/compiler.h>
+#include <linux/delay.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
 #include <linux/ktime.h>
@@ -28,6 +35,8 @@
 #define M0_AUDIO_MAGIC    0x4D304431U
 #define M0_CTRL_PLAY      (1u << 0)
 #define M0_CTRL_STOP      0u
+#define M0_STATE_IDLE     0x49444C45U  /* "IDLE", written by the firmware */
+#define M0_STATE_PLAY     0x504C4159U  /* "PLAY" */
 #define M0_FMT_U8         0
 #define M0_FMT_S16_LE     1
 #define M0_HEADER_SIZE    64
@@ -41,11 +50,12 @@
 /*
  * Output bit rate. Higher is better audio (about 12 dB per doubling) as long
  * as the M0 finishes a tick's work in time. Measured at a 187.5 MHz core
- * clock, running from SRAM over the bus: the heaviest tick needs about 295
- * cycles, so 600 kHz (312 cycles) is the highest rate at which every tick
- * fits. A firmware built with PROFILE=1 reports the worst tick and the
- * number of overruns, printed here when playback stops. Takes effect at the
- * next playback start.
+ * clock: the heaviest tick needs about 295 cycles with the firmware in bus
+ * mode and about 155 as TCM, so every tick fits up to 600 kHz and 1.2 MHz
+ * respectively. The default is the bus-mode figure; the m0-audio overlay,
+ * which selects TCM, raises it with tick-rate-hz. A firmware built with
+ * PROFILE=1 reports the worst tick and the number of overruns, printed here
+ * when a stream ends. Takes effect at the next playback start.
  */
 static unsigned int tick_hz = 600000;
 module_param(tick_hz, uint, 0644);
@@ -56,7 +66,7 @@ struct m0_audio_shmem {
 	volatile uint32_t ctrl;
 	volatile uint32_t write_idx;
 	volatile uint32_t read_idx;
-	volatile uint32_t period_bytes;
+	volatile uint32_t m0_state;      /* written by the M0: M0_STATE_* */
 	volatile uint32_t buf_size;
 	volatile uint32_t sample_rate;
 	volatile uint32_t channels;
@@ -98,7 +108,7 @@ struct picocalc_m0 {
 	snd_pcm_uframes_t elapsed_mark;  /* played_frames at the last period_elapsed */
 	bool running;
 	bool want_play;
-	bool rproc_up;
+	bool rproc_up;             /* firmware booted; stays up until remove */
 	struct work_struct rproc_work;
 };
 
@@ -160,9 +170,10 @@ static void m0_report_profile(struct picocalc_m0 *m)
 	dev_info(&m->pdev->dev,
 		 "M0 tick: longest %u of %u core cycles, %u ticks overran\n",
 		 m->tick_cycles - 1 - min_cvr, m->tick_cycles, overruns);
+	m->shmem->stat_min_cvr = U32_MAX;
 }
 
-/* Caller holds m->lock. PLAY + zeroed indices only after M0 is down. */
+/* Caller holds m->lock. PLAY + zeroed indices only while the M0 is idle. */
 static void m0_init_header_locked(struct picocalc_m0 *m)
 {
 	struct snd_pcm_runtime *runtime;
@@ -174,7 +185,6 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 	m->shmem->magic = M0_AUDIO_MAGIC;
 	m->shmem->write_idx = 0;
 	m->shmem->read_idx = 0;
-	m->shmem->period_bytes = frames_to_bytes(runtime, runtime->period_size);
 	m->shmem->buf_size = m->buf_size;
 	m->shmem->sample_rate = M0_FIXED_SAMPLE_RATE_HZ;
 	m->shmem->channels = 2;
@@ -285,86 +295,82 @@ static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
 }
 
 /*
- * Power management (M0-side WFE idle and optional WIC deep sleep) is currently
- * unreachable: we always rproc_boot() on start and rproc_shutdown() on stop,
- * so the M0 is reloaded from ELF each time and never sits in WFE between
- * play cycles. To use the M0 power paths (and avoid boot/shutdown latency),
- * a future phase could: (a) boot M0 once at probe or first play and keep it
- * running, (b) ioremap the GRF region, (c) assert rxev to wake M0 from WFE/WFI
- * before setting ctrl=PLAY, (d) clear rxev after wake.
+ * The firmware looks at ctrl every few milliseconds when idle and once per
+ * sample when playing, so this normally returns within a few milliseconds.
+ */
+static bool m0_wait_idle(struct picocalc_m0 *m)
+{
+	int i;
+
+	for (i = 0; i < 250; i++) {
+		if (READ_ONCE(m->shmem->m0_state) == M0_STATE_IDLE)
+			return true;
+		usleep_range(1000, 2000);
+	}
+	return false;
+}
+
+/*
+ * Runs for every START and STOP (trigger cannot sleep). Whatever was going
+ * on, bring the firmware to IDLE first; then, if a stream is wanted, hand it
+ * over. The M0 is booted here the first time and never shut down between
+ * streams.
  */
 static void m0_rproc_work(struct work_struct *work)
 {
 	struct picocalc_m0 *m = container_of(work, struct picocalc_m0, rproc_work);
 	unsigned long flags;
+	bool want;
 	int ret;
 
-	for (;;) {
-		bool want;
+	spin_lock_irqsave(&m->lock, flags);
+	want = m->want_play;
+	m->running = false;
+	m->shmem->ctrl = M0_CTRL_STOP;
+	spin_unlock_irqrestore(&m->lock, flags);
+	hrtimer_cancel(&m->timer);
 
-		spin_lock_irqsave(&m->lock, flags);
-		want = m->want_play;
-		spin_unlock_irqrestore(&m->lock, flags);
-
-		if (want) {
-			/* Reboot M0 so its local read_idx cannot outlive host index reset. */
-			if (m->rproc_up) {
-				spin_lock_irqsave(&m->lock, flags);
-				m->running = false;
-				if (m->shmem)
-					m->shmem->ctrl = M0_CTRL_STOP;
-				spin_unlock_irqrestore(&m->lock, flags);
-				hrtimer_cancel(&m->timer);
-				rproc_shutdown(m->rproc);
-				m->rproc_up = false;
-				m0_report_profile(m);
-				continue;
-			}
-			hrtimer_cancel(&m->timer);
-			spin_lock_irqsave(&m->lock, flags);
-			m0_init_header_locked(m);
-			m0_copy_to_ring_locked(m);
-			spin_unlock_irqrestore(&m->lock, flags);
-			ret = rproc_boot(m->rproc);
-			if (ret) {
-				dev_err(&m->pdev->dev, "rproc_boot failed: %d\n", ret);
-				spin_lock_irqsave(&m->lock, flags);
-				m->want_play = false;
-				m->running = false;
-				spin_unlock_irqrestore(&m->lock, flags);
-				if (m->substream)
-					snd_pcm_stop_xrun(m->substream);
-				return;
-			}
-			m->rproc_up = true;
-			spin_lock_irqsave(&m->lock, flags);
-			if (m->want_play) {
-				m->running = true;
-				hrtimer_start(&m->timer, m->period_ktime, HRTIMER_MODE_REL);
-			}
-			want = m->want_play;
-			spin_unlock_irqrestore(&m->lock, flags);
-			if (want)
-				break;
-			continue;
+	if (!m->rproc_up) {
+		if (!want)
+			return;
+		/* Nothing in the header may look like a stream yet */
+		m->shmem->magic = 0;
+		m->shmem->m0_state = 0;
+		m->shmem->stat_min_cvr = U32_MAX;
+		ret = rproc_boot(m->rproc);
+		if (ret) {
+			dev_err(&m->pdev->dev, "rproc_boot failed: %d\n", ret);
+			goto fail;
 		}
-
-		spin_lock_irqsave(&m->lock, flags);
-		m->running = false;
-		spin_unlock_irqrestore(&m->lock, flags);
-		hrtimer_cancel(&m->timer);
-		if (m->rproc_up) {
-			rproc_shutdown(m->rproc);
-			m->rproc_up = false;
-			m0_report_profile(m);
-		}
-		spin_lock_irqsave(&m->lock, flags);
-		want = m->want_play;
-		spin_unlock_irqrestore(&m->lock, flags);
-		if (want)
-			continue; /* START arrived during shutdown */
-		break;
+		m->rproc_up = true;
 	}
+
+	if (!m0_wait_idle(m)) {
+		dev_err(&m->pdev->dev, "M0 firmware is not responding (state %08x)\n",
+			m->shmem->m0_state);
+		goto fail;
+	}
+	m0_report_profile(m);
+
+	spin_lock_irqsave(&m->lock, flags);
+	want = m->want_play;
+	if (want) {
+		m0_init_header_locked(m);
+		m0_copy_to_ring_locked(m);
+		m->running = true;
+		hrtimer_start(&m->timer, m->period_ktime, HRTIMER_MODE_REL);
+	}
+	spin_unlock_irqrestore(&m->lock, flags);
+	return;
+
+fail:
+	spin_lock_irqsave(&m->lock, flags);
+	want = m->want_play;
+	m->want_play = false;
+	m->running = false;
+	spin_unlock_irqrestore(&m->lock, flags);
+	if (want && m->substream)
+		snd_pcm_stop_xrun(m->substream);
 }
 
 static enum hrtimer_restart m0_timer_cb(struct hrtimer *t)
@@ -485,9 +491,8 @@ static int m0_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		m->copied_frames = 0;
 		m->played_frames = 0;
 		m->elapsed_mark = 0;
-		/* Header/PLAY are written in work after M0 is confirmed down. */
-		if (m->rproc_up && m->shmem)
-			m->shmem->ctrl = M0_CTRL_STOP;
+		/* Header/PLAY are written in work once the M0 is confirmed idle. */
+		m->shmem->ctrl = M0_CTRL_STOP;
 		/* Fire once per ALSA period (do_div avoids __aeabi_uldivmod on 32-bit ARM) */
 		{
 			u64 nsec = (u64)NSEC_PER_SEC * runtime->period_size;

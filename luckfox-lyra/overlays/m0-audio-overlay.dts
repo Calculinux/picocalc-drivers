@@ -33,12 +33,13 @@
     fragment@0 {
         target-path = "/";
         __overlay__ {
-            /* Header + ring shared with the M0: system SRAM, right after
-             * the firmware image in the bank at 0xFFF88000 (the address is
-             * fixed in the firmware, shmem.h). Not DDR, so there is nothing
-             * to reserve; the node only gives the driver its address. */
-            m0_ring: m0-ring@fff89000 {
-                reg = <0xfff89000 0x3000>;
+            /* Header + ring shared with the M0: system SRAM, in the first
+             * bank past the 4 KB OP-TEE keeps (the address is fixed in the
+             * firmware, shmem.h). That bank stays reachable from Linux in
+             * TCM mode. Not DDR, so there is nothing to reserve; the node
+             * only gives the driver its address. */
+            m0_ring: m0-ring@fff81000 {
+                reg = <0xfff81000 0x3000>;
             };
 
             picocalc_snd_m0: picocalc-snd-m0 {
@@ -50,8 +51,10 @@
                 /* 74 = HCLK_M0, the M0 core clock its SysTick counts: the
                  * driver derives the tick timing from its rate. */
                 clocks = <&cru 74>;
-                /* Output bit rate; see tick_hz in the driver. */
-                tick-rate-hz = <600000>;
+                /* Output bit rate; see tick_hz in the driver. 1.2 MHz is
+                 * the most that fits with the firmware running as TCM
+                 * (rockchip,tcm below); without it use 600000. */
+                tick-rate-hz = <1200000>;
                 pinctrl-names = "default";
                 pinctrl-0 = <&snd_pins>;
             };
@@ -60,6 +63,12 @@
                 compatible = "rockchip,rk3506-mcu";
                 reg = <0xfff84000 0x8000>;
                 firmware-name = "rk3506-m0-audio.elf";
+                /* Run the firmware as tightly-coupled memory: twice the
+                 * speed, hence twice the bit rate. The firmware can then
+                 * not be loaded again until the next reboot (the driver
+                 * keeps it running between streams). Remove this and lower
+                 * tick-rate-hz to reload firmware freely while developing. */
+                rockchip,tcm;
                 /* Vendor 6.1 CRU IDs: 74 HCLK_M0 (must stay first: the
                  * driver reports its rate as the M0 core clock), 104
                  * STCLK_M0. The firmware's tick is the core's own SysTick,
