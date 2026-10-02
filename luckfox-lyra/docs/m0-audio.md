@@ -273,18 +273,50 @@ stalled (or, in mid stream, with an empty ring, which the log shows
 separately), good to one frame, 21 us. A few stretched ticks a second of a
 fraction of a tick each are below that; stalls long enough to hear are not.
 
-`ring_wc=0` on the sound module maps the ring as device memory and writes it
-a word at a time instead of in write-combined bursts, to tell whether the
-M0's reads are waiting behind those bursts.
+The log is a ring of 256 entries and the end of a stream fills it (the
+ring runs dry, and at 3 MHz logging that makes ticks late in itself), so
+read it while the stream is still playing.
 
-What is known so far (TCM, 3 MHz): 15-20 stretched ticks a second, the same
-with the heartbeat LED trigger on or off, more with shorter ALSA periods.
-In simulation the modulator produces no burst of in-band noise when its
-input drops to digital silence. By ear: the ticking is there when playing
-digital silence and gone when nothing plays (the pins are then low), it does
-not change with the tick rate or the heartbeat LED, and it comes about half
-as often with `aplay --period-size=256 --buffer-size=1024`; each occurrence
-is about five ticks close together.
+### What the ticking was
+
+Measured in TCM at 3 MHz, 10 s of digital silence, period 1024:
+
+| Host activity | Late ticks | M0 behind |
+|---|---|---|
+| driver as it was (one copy per period) | 10-25 a second | 10-16 us/s |
+| the same, plus reading an SRAM word 13 million times a second | 11 a second | 11 us/s |
+| the same, plus reading a GRF register 6 million times a second | 15 a second | 5 us/s |
+| the same, plus *writing* an SRAM word as fast as possible | 120000 a second | 18000 us/s |
+| driver writing only in the M0's quiet ticks (`ring_sync`, now the default) | 0-1.5 a second | 0-2 us/s |
+
+Host writes to the SRAM hold up the M0's accesses to it; host reads do not.
+The M0 uses the SRAM only in the step ticks at the start of each sample, and
+a period's copy takes about 10 us, less than a sample, so most copies fell
+wholly in the plain ticks and did no harm. But the driver's timer runs on
+Linux's clock and drifts slowly through the M0's sample; every half second or
+so a few consecutive copies landed on the step ticks, each stalling the M0
+for a fraction of a microsecond: a pin held too long, a click, even in
+silence. That was the cluster of about five ticks every half second, there
+with silence, independent of the tick rate, and different with another ALSA
+period. Turning off Wi-Fi or the keyboard's I2C polling made no difference.
+
+The driver now watches `read_idx`, which the firmware writes in its last step
+tick, and writes the ring (as device memory, word by word) only in the plain
+ticks that follow, carrying on after the next sample's steps if it runs out
+of time. That costs up to about 40 us per period with interrupts off.
+`echo 0 > /sys/module/picocalc_snd_m0/parameters/ring_sync` switches it off
+while playing, to hear the difference; the line `ring updates: ...` printed
+when a stream ends says how many updates were synchronised. With too few
+plain ticks in a sample (a slow tick in bus mode) there is no room and the
+driver writes unsynchronised.
+
+What is left with `ring_sync` on: now and then a few plain ticks late, at
+multiples of 1.0133 s (304 jiffies), so tied to something Linux does about
+once a second, and to the pin write rather than the SRAM. Not yet identified.
+
+Earlier observations, for the record: the same number of late ticks with the
+heartbeat LED trigger on or off; in simulation the modulator produces no
+burst of in-band noise when its input drops to digital silence.
 
 ## Open issues
 
@@ -302,12 +334,10 @@ is about five ticks close together.
 5. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.
-6. **Stretched ticks** in TCM mode (15-20 a second): they follow the host's
-   ring updates in number; which step and when is what `m0trace` is for.
-7. **Audible ticking** roughly every half second while a stream plays, even
-   of silence. Since the data is zeros it must be the bit timing; that it
-   follows the ALSA period points at the host's ring updates. Not yet
-   confirmed: the "behind" figure and `ring_wc=0` above are the test.
+6. **Late ticks about once a second** (a few plain ticks, at multiples of
+   304 jiffies), left over once the ring writes were synchronised: see
+   "What the ticking was". Whether they are audible has not been checked.
+7. **`ring_sync` in bus mode** is untested; the measurements are all TCM.
 8. **Pop when a stream ends** (and presumably when it starts): the pins go
    from the 50% pattern of silence to low, a DC step through the output
    capacitor. Needs a ramp between the two.

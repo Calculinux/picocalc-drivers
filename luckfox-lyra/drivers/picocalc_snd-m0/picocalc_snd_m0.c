@@ -62,16 +62,26 @@ module_param(tick_hz, uint, 0644);
 MODULE_PARM_DESC(tick_hz, "M0 output bit rate in Hz (default 1000000)");
 
 /*
- * How the ring is written. The M0 reads the same SRAM several times a sample
- * and waits while the bus is busy. Write-combined, a period of audio goes out
- * as long bursts; as device memory it goes out one word at a time, which
- * costs this CPU more but lets the M0 in between any two words. For telling
- * whether the bursts hold the M0 up (see the "behind" figure printed when a
- * stream ends).
+ * When the ring is written. The M0 touches the shared SRAM in the first few
+ * ticks of every sample and nothing but its pins in the rest. Our writes to
+ * that SRAM hold its accesses up (our reads do not), by enough to make the
+ * tick late: a click, even in silence. So while a stream plays we watch for
+ * read_idx to change, which the firmware does at the end of its per-sample
+ * work, and write only in the quiet ticks that follow, a part of the period
+ * per sample. Turning this off writes the whole period at once, wherever in
+ * the sample that falls. Can be changed while playing.
  */
-static bool ring_wc = true;
-module_param(ring_wc, bool, 0444);
-MODULE_PARM_DESC(ring_wc, "Map the ring write-combined (default) or, if 0, as device memory written word by word");
+static bool ring_sync = true;
+module_param(ring_sync, bool, 0644);
+MODULE_PARM_DESC(ring_sync, "Write the ring only between the M0's own accesses to it (default on)");
+
+/* Ticks at the start of a sample in which the firmware uses the SRAM: nine,
+ * and three more in a PROFILE build, which we cannot tell apart from here. */
+#define M0_STEP_TICKS     9U
+#define M0_PROFILE_TICKS  3U
+#define M0_SAMPLE_NS      (NSEC_PER_SEC / M0_FIXED_SAMPLE_RATE_HZ)
+/* Words written between two looks at the clock */
+#define M0_SYNC_BURST     32U
 
 struct m0_audio_shmem {
 	volatile uint32_t magic;
@@ -107,7 +117,7 @@ struct picocalc_m0 {
 	struct clk *core_clk;      /* hclk_m0: what the M0's SysTick counts */
 	uint32_t tick_cycles;      /* as last given to the firmware */
 	struct m0_audio_shmem *shmem;
-	void *shmem_virt;  /* mapping of the SRAM ring: see ring_wc */
+	void *shmem_virt;  /* device mapping of the SRAM: header and ring */
 	size_t shmem_size;
 	uint32_t buf_size;
 	spinlock_t lock;
@@ -127,6 +137,11 @@ struct picocalc_m0 {
 	u64 pace_t0, pace_t1;      /* CLOCK_MONOTONIC_RAW, ns */
 	u64 pace_frames;
 	snd_pcm_uframes_t pace_mark; /* played_frames when last added to pace_frames */
+	/* ring_sync: from read_idx changing, when writing may start and must end */
+	uint32_t sync_skip_ns, sync_len_ns;
+	uint32_t stat_windows;     /* samples whose quiet ticks were written in */
+	uint32_t stat_unsynced;    /* ring updates written without waiting */
+	uint32_t stat_update_ns;   /* longest ring update */
 	struct work_struct rproc_work;
 };
 
@@ -169,6 +184,20 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		cycles = den = base = 0;
 	}
 	m->tick_cycles = cycles;
+	m->sync_skip_ns = m->sync_len_ns = 0;
+	if (cycles) {
+		/* Core cycles to ns; a tick is at most 2^24 cycles */
+		uint32_t tick_ns = div_u64((u64)cycles * NSEC_PER_SEC, hclk);
+		uint32_t guard_ns = tick_ns + 300;
+
+		/* read_idx is written in the last step tick; the next sample's
+		 * first is at least base - M0_STEP_TICKS ticks later. */
+		m->sync_skip_ns = M0_PROFILE_TICKS * tick_ns + 200;
+		if (base > M0_STEP_TICKS &&
+		    (u64)(base - M0_STEP_TICKS) * tick_ns > m->sync_skip_ns + guard_ns + 2000)
+			m->sync_len_ns = (base - M0_STEP_TICKS) * tick_ns - guard_ns;
+	}
+	m->stat_windows = m->stat_unsynced = m->stat_update_ns = 0;
 	m->shmem->tick_cycles = cycles;
 	m->shmem->ticks_base = base;
 	m->shmem->ticks_frac = den ? div_u64((u64)(hclk % den) << 32, den) : 0;
@@ -217,6 +246,69 @@ static void m0_report_pace(struct picocalc_m0 *m)
 		 "M0 played %llu frames in %llu us: %lld us behind (%lld us per second)\n",
 		 frames, due_us, (s64)(due_us - got_us),
 		 div64_s64((s64)(due_us - got_us) * USEC_PER_SEC, due_us));
+	dev_info(&m->pdev->dev,
+		 "ring updates: longest %u us, written in %u samples' quiet ticks, %u not synchronised\n",
+		 m->stat_update_ns / 1000, m->stat_windows, m->stat_unsynced);
+}
+
+struct m0_sync {
+	bool on;
+	u64 end;   /* writing must stop here: the M0's next sample is near */
+};
+
+/*
+ * Caller holds m->lock. Returns when the ring may be written: at once if the
+ * current sample's quiet ticks have time left, else when the M0 has finished
+ * the SRAM work of its next sample. If read_idx stops changing the M0 has
+ * nothing to play and there is nothing to keep out of the way of.
+ */
+static void m0_sync_wait(struct picocalc_m0 *m, struct m0_sync *sync)
+{
+	u64 t0, before, now;
+	uint32_t idx;
+
+	if (!sync->on)
+		return;
+	now = ktime_get_raw_ns();
+	if (now < sync->end)
+		return;
+	idx = m->shmem->read_idx;
+	t0 = before = now;
+	for (;;) {
+		now = ktime_get_raw_ns();
+		if (m->shmem->read_idx != idx)
+			break;
+		if (now - t0 > 3 * M0_SAMPLE_NS) {
+			sync->on = false;
+			return;
+		}
+		before = now;
+	}
+	/* It changed between 'before' and now */
+	sync->end = before + m->sync_len_ns;
+	now = ktime_get_raw_ns() + m->sync_skip_ns;
+	while (ktime_get_raw_ns() < now)
+		cpu_relax();
+	m->stat_windows++;
+}
+
+/* Caller holds m->lock. Whole frames at multiples of the frame size: words. */
+static void m0_ring_write(struct picocalc_m0 *m, struct m0_sync *sync,
+			  uint32_t rpos, const uint8_t *from, uint32_t bytes)
+{
+	void __iomem *dst = (void __iomem __force *)(m->shmem->buffer + rpos);
+	const u32 *src = (const u32 *)from;
+	uint32_t words = bytes / 4, n, i;
+
+	while (words) {
+		n = min(words, M0_SYNC_BURST);
+		m0_sync_wait(m, sync);
+		for (i = 0; i < n; i++)
+			__raw_writel(src[i], dst + 4 * i);
+		src += n;
+		dst += 4 * n;
+		words -= n;
+	}
 }
 
 /* Caller holds m->lock. PLAY + zeroed indices only while the M0 is idle. */
@@ -268,16 +360,20 @@ static void m0_update_played_locked(struct picocalc_m0 *m, struct snd_pcm_runtim
  * between the PCM buffer and the M0: the hw pointer (played_frames) must never
  * move a whole buffer between two looks at it, or ALSA cannot tell where it is.
  * appl_ptr and copied_frames share runtime->boundary so a full PCM buffer is
- * not mistaken for empty.
+ * not mistaken for empty. playing: the M0 is reading the ring, see ring_sync.
  */
-static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
+static void m0_copy_to_ring_locked(struct picocalc_m0 *m, bool playing)
 {
+	struct m0_sync sync = {
+		.on = playing && m->sync_len_ns && READ_ONCE(ring_sync),
+	};
+	u64 start = ktime_get_raw_ns();
+	uint32_t took;
 	struct snd_pcm_substream *ss = m->substream;
 	struct snd_pcm_runtime *runtime;
 	uint32_t read_idx, write_idx, space, to_copy;
 	uint32_t buffer_bytes, buf_mask, rpos, dma_pos, left, chunk, frame_bytes;
 	snd_pcm_uframes_t appl, copied, avail_fr, to_fr, space_fr, in_flight, max_flight;
-	uint8_t *ring;
 	const uint8_t *dma_area;
 
 	if (!ss)
@@ -291,7 +387,6 @@ static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
 	if (!buffer_bytes || !frame_bytes)
 		return;
 
-	ring = (uint8_t *)m->shmem->buffer;
 	dma_area = (const uint8_t *)runtime->dma_area;
 	buf_mask = m->buf_size - 1;
 
@@ -330,25 +425,22 @@ static void m0_copy_to_ring_locked(struct picocalc_m0 *m)
 			chunk = ring_chunk;
 		if (chunk > dma_chunk)
 			chunk = dma_chunk;
-		/* Whole frames at multiples of the frame size: words throughout */
-		if (ring_wc) {
-			memcpy(ring + rpos, dma_area + dma_pos, chunk);
-		} else {
-			void __iomem *dst = (void __iomem __force *)(ring + rpos);
-			const u32 *src = (const u32 *)(dma_area + dma_pos);
-			uint32_t i;
-
-			for (i = 0; i < chunk / 4; i++)
-				__raw_writel(src[i], dst + 4 * i);
-		}
+		m0_ring_write(m, &sync, rpos, dma_area + dma_pos, chunk);
 		rpos = (rpos + chunk) & buf_mask;
 		dma_pos += chunk;
 		if (dma_pos >= buffer_bytes)
 			dma_pos -= buffer_bytes;
 		left -= chunk;
 	}
-	dma_wmb(); /* ring data visible to M0 before write_idx (WC map) */
+	m0_sync_wait(m, &sync);
 	m->shmem->write_idx = (write_idx + to_copy) & buf_mask;
+	if (playing) {
+		if (!sync.on)
+			m->stat_unsynced++;
+		took = ktime_get_raw_ns() - start;
+		if (took > m->stat_update_ns)
+			m->stat_update_ns = took;
+	}
 	m->copied_frames += bytes_to_frames(runtime, to_copy);
 	if (m->copied_frames >= runtime->boundary)
 		m->copied_frames -= runtime->boundary;
@@ -417,7 +509,7 @@ static void m0_rproc_work(struct work_struct *work)
 	want = m->want_play;
 	if (want) {
 		m0_init_header_locked(m);
-		m0_copy_to_ring_locked(m);
+		m0_copy_to_ring_locked(m, false);
 		m->running = true;
 		hrtimer_start(&m->timer, m->period_ktime, HRTIMER_MODE_REL);
 	}
@@ -455,7 +547,7 @@ static enum hrtimer_restart m0_timer_cb(struct hrtimer *t)
 	 * (the end of a stream, normally) it is waiting for data, not late. */
 	queued = ((m->shmem->write_idx - m->shmem->read_idx) & (m->buf_size - 1)) > 4;
 	now = ktime_get_raw_ns();
-	m0_copy_to_ring_locked(m); /* first of all brings played_frames up to date */
+	m0_copy_to_ring_locked(m, true); /* first of all brings played_frames up to date */
 	if (!m->pace_valid) {
 		m->pace_valid = true;
 		m->pace_t0 = m->pace_t1 = now;
@@ -678,11 +770,9 @@ static int m0_probe(struct platform_device *pdev)
 		goto put_rproc;
 	}
 	m->shmem_size = resource_size(&res);
-	/* SRAM, not system RAM: either way this is an ioremap underneath */
-	if (ring_wc)
-		m->shmem_virt = devm_memremap(dev, res.start, resource_size(&res), MEMREMAP_WC);
-	else
-		m->shmem_virt = (void __force *)devm_ioremap(dev, res.start, resource_size(&res));
+	/* SRAM the M0 is using too: as device memory, every write goes out on
+	 * its own and when we make it (m0_ring_write) */
+	m->shmem_virt = (void __force *)devm_ioremap(dev, res.start, resource_size(&res));
 	if (!m->shmem_virt) {
 		ret = -ENOMEM;
 		goto put_rproc;

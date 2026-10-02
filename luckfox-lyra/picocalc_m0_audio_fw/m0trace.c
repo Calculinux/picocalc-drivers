@@ -2,7 +2,8 @@
 /*
  * m0trace: read the event log a PROFILE=1 build of the M0 audio firmware
  * keeps in system SRAM (shmem.h, M0_TRACE_ADDR), through /dev/mem. Run as
- * root, after or during a stream. The log holds the last 256 events:
+ * root while a stream plays: its end, when the ring runs dry, fills the log
+ * with that. The log holds the last 256 events:
  * ticks that were still working when the next one fell due (with the step
  * of the sample they were in) and samples for which the ring was empty.
  *

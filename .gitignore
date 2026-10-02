@@ -18,6 +18,7 @@ Module.symvers
 luckfox-lyra/picocalc_m0_audio_fw/check_ring
 luckfox-lyra/picocalc_m0_audio_fw/check_dsm
 luckfox-lyra/picocalc_m0_audio_fw/m0trace
+luckfox-lyra/picocalc_m0_audio_fw/m0hammer
 luckfox-lyra/picocalc_m0_diag_fw/m0diag
 __pycache__/
 

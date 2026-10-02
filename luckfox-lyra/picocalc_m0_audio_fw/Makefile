@@ -51,6 +51,10 @@ LINUX_CC ?= cc
 m0trace: m0trace.c
 	$(LINUX_CC) -O2 -Wall -Wextra -o $@ $<
 
+# Host accesses to a bus slave, to see what they cost the M0
+m0hammer: m0hammer.c
+	$(LINUX_CC) -O2 -Wall -Wextra -o $@ $<
+
 check_dsm: check_dsm.c $(HDRS)
 	$(HOSTCC) -O2 -Wall -Wextra -o $@ $< -lm
 
@@ -62,6 +66,6 @@ check-emu: $(ELF)
 	$(PYTHON) check_play.py $(ELF)
 
 clean:
-	rm -f $(OBJS) $(ELF) check_ring check_dsm m0trace
+	rm -f $(OBJS) $(ELF) check_ring check_dsm m0trace m0hammer
 
 .PHONY: all clean check check-emu
