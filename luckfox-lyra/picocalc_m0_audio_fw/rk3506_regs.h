@@ -125,6 +125,7 @@
  * cycles between a write and the following access to pay nothing. */
 #define GRF_SOC_CON0          0x0000U
 #define GRF_CON0_MCU_BUFFERABLE 0x10001000U
+#define GRF_CON0_MCU_UNBUFFERED 0x10000000U
 #define GRF_SOC_CON37         0x0094U
 #define GRF_CON37_RXEV_BIT    3U   /* grf_con_mcu_rxev: sets the event register, completes WFE */
 #define GRF_CON37_WICENREQ_BIT 5U  /* grf_con_mcu_wicenreq: request WIC-based deep sleep */

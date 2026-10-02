@@ -70,6 +70,7 @@
 
 /* flags */
 #define M0_FLAG_NO_INTERP 1   /* hold each sample; default is to ramp to the next */
+#define M0_FLAG_COMP      2   /* measure how late each pin write lands and correct for it */
 
 /*
  * Event log of a PROFILE=1 firmware, in the SRAM after the ring; read it with

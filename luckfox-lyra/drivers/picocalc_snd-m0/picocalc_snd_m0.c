@@ -47,6 +47,7 @@
 /* The firmware gives each step of its per-sample work a tick of its own */
 #define M0_MIN_TICKS_PER_SAMPLE  19U
 #define M0_FLAG_NO_INTERP        1U
+#define M0_FLAG_COMP             2U
 #define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
 
 /*
@@ -82,6 +83,24 @@ MODULE_PARM_DESC(tick_even, "Round the tick to an even number of core clock cycl
  * rate down by 15 to 30 dB; the noise in the audio band is the same. Off:
  * hold, to compare. Next playback start.
  */
+/*
+ * The M0's pin writes wait while this CPU's SPI controllers or GPIO writes
+ * have the peripheral bus: a redraw of the display makes a quarter of them
+ * late by up to 0.4 us, which is heard as a click per redraw. With comp the
+ * firmware times every pin write and puts what a late one cost back into the
+ * modulator, which moves the error out of the audio band. The price is a
+ * longer tick (the pin write has to be waited for), so the corrected mode has
+ * its own rate, tick_hz_comp (comp-tick-rate-hz in the device tree). Both
+ * take effect at the next playback start.
+ */
+static bool comp = true;
+module_param(comp, bool, 0644);
+MODULE_PARM_DESC(comp, "Correct for pin writes delayed by other bus traffic (default on)");
+
+static unsigned int tick_hz_comp = 1000000;
+module_param(tick_hz_comp, uint, 0644);
+MODULE_PARM_DESC(tick_hz_comp, "M0 output bit rate in Hz with comp on (default 1000000)");
+
 static bool interp = true;
 module_param(interp, bool, 0644);
 MODULE_PARM_DESC(interp, "Interpolate between samples (default on)");
@@ -142,6 +161,7 @@ struct picocalc_m0 {
 	struct rproc *rproc;
 	struct clk *core_clk;      /* hclk_m0: what the M0's SysTick counts */
 	uint32_t tick_cycles;      /* as last given to the firmware */
+	bool comp;                 /* and the mode it was worked out for */
 	struct m0_audio_shmem *shmem;
 	void *shmem_virt;  /* device mapping of the SRAM: header and ring */
 	size_t shmem_size;
@@ -190,7 +210,8 @@ static uint32_t m0_ring_space(uint32_t write_idx, uint32_t read_idx, uint32_t bu
 static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 {
 	unsigned long hclk = m->core_clk ? clk_get_rate(m->core_clk) : 0;
-	uint32_t hz = READ_ONCE(tick_hz);
+	bool with_comp = READ_ONCE(comp);
+	uint32_t hz = with_comp ? READ_ONCE(tick_hz_comp) : READ_ONCE(tick_hz);
 	uint32_t cycles = 0, den = 0, base = 0;
 	u64 den64;
 
@@ -213,6 +234,7 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		cycles = den = base = 0;
 	}
 	m->tick_cycles = cycles;
+	m->comp = with_comp;
 	m->sync_skip_ns = m->sync_len_ns = 0;
 	if (cycles) {
 		/* Core cycles to ns; a tick is at most 2^24 cycles */
@@ -359,7 +381,8 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 	m->shmem->sample_rate = M0_FIXED_SAMPLE_RATE_HZ;
 	m->shmem->channels = 2;
 	m->shmem->format = M0_FMT_S16_LE;
-	m->shmem->flags = READ_ONCE(interp) ? 0 : M0_FLAG_NO_INTERP;
+	m->shmem->flags = (READ_ONCE(interp) ? 0 : M0_FLAG_NO_INTERP) |
+			  (m->comp ? M0_FLAG_COMP : 0);
 	m->shmem->ctrl = M0_CTRL_PLAY;
 	dma_wmb();
 	m->last_read_idx = 0;
@@ -816,6 +839,7 @@ static int m0_probe(struct platform_device *pdev)
 		goto put_rproc;
 	}
 	of_property_read_u32(np, "tick-rate-hz", &tick_hz);
+	of_property_read_u32(np, "comp-tick-rate-hz", &tick_hz_comp);
 
 	if (of_property_read_u32(np, "ring-buffer-bytes", &m->buf_size))
 		m->buf_size = M0_FIXED_BUF_SIZE;

@@ -107,6 +107,20 @@
  *   r2 FS     r5 plain ticks    r6, r7 scratch         sp  m0_play_state
  *   Entering a tick, r7 holds the GPIO word to write and r6 the GPIO address.
  *
+ * LATE PIN WRITES (m0_play_comp)
+ *   The M0's bus writes wait while Linux's SPI controllers or its GPIO writes
+ *   have the peripheral bus: measured, a quarter of the pin writes are up to
+ *   72 cycles late while the display is being redrawn, and each late edge is
+ *   an error in the output. m0_play_comp() is the same loop with the pin write
+ *   made blocking (main.c turns "bufferable" off for it): the SysTick count
+ *   read straight after the write says how late the pin changed, and for a
+ *   bit that changed, K * cycles late is put back into both integrators,
+ *   exactly as if the feedback had been the level actually delivered. The
+ *   error is then shaped out of the audio band like the quantisation error
+ *   is. The count that means "on time" is measured on the first ticks of
+ *   each stream. This costs about 35 cycles per tick; r12 holds the on-time
+ *   count instead of the both-high GPIO word.
+ *
  * LAYOUT
  *   The loop is longer than a Thumb branch reaches in a PROFILE build, so the
  *   plain-tick loop sits in the middle of it: steps 1 onwards, a hop over the
@@ -136,11 +150,66 @@
 m0_play_state:
 	.space	PS_SIZE
 
+/* The pin write was late: r6 = SysTick count after it, r7 = the word written.
+ * A bit that changed was at its old level for that much longer: put
+ * K * cycles back into that channel's integrators, + if the bit is now 1.
+ * Leaves the word in r7. Uses r6, r7; called with bl, so the caller has to
+ * put dx_r back in lr. */
+	.section .ramfunc, "ax", %progbits
+	.align	2
+	.thumb_func
+	.type	m0_play_late, %function
+m0_play_late:
+	str	r7, [sp, #PS_WN]
+	mov	r7, r12
+	subs	r6, r7, r6		@ cycles late
+	bpl	5f
+	ldr	r7, [sp, #PS_CYCLES]
+	adds	r6, r6, r7		@ ... the count had started again
+5:	ldr	r7, [sp, #PS_K_COMP]
+	muls	r6, r7, r6
+	str	r6, [sp, #PS_M]
+	ldr	r6, [sp, #PS_WN]
+	ldr	r7, [sp, #PS_W]
+	eors	r7, r6
+	lsls	r7, r7, #31 - GPIO4_B2_BIT	@ N: left changed
+	bpl	6f
+	ldr	r7, [sp, #PS_M]
+	lsls	r6, r6, #31 - GPIO4_B2_BIT	@ N: left is now 1
+	bmi	7f
+	negs	r7, r7
+7:	adds	r0, r0, r7
+	adds	r1, r1, r7
+6:	ldr	r6, [sp, #PS_WN]
+	ldr	r7, [sp, #PS_W]
+	eors	r7, r6
+	lsls	r7, r7, #31 - GPIO4_B3_BIT	@ N: right changed
+	bpl	8f
+	ldr	r7, [sp, #PS_M]
+	lsls	r6, r6, #31 - GPIO4_B3_BIT
+	bmi	4f
+	negs	r7, r7
+4:	adds	r3, r3, r7
+	adds	r4, r4, r7
+8:	ldr	r7, [sp, #PS_WN]
+	bx	lr
+	.size	m0_play_late, . - m0_play_late
+
 /* Wait for the tick, put out the bits, run both modulators. Leaves the next
  * GPIO word in r7; r6 is free. */
-	.macro	TICK
+	.macro	TICK comp
 	wfi
 	str	r7, [r6]		@ OUTPUT: bits from the previous tick
+	.if	\comp
+	ldr	r6, [sp, #PS_K_CVR]
+	ldr	r6, [r6]		@ the pin has changed: was it on time?
+	cmp	r6, r12
+	beq	9f
+	bl	m0_play_late		@ (out of line: the loop must stay in branch range)
+	ldr	r6, [sp, #PS_DXRM]
+	mov	lr, r6			@ dx_r back
+9:	str	r7, [sp, #PS_W]
+	.endif
 	ldr	r7, [sp, #PS_K_ICSR]
 	movs	r6, #1
 	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
@@ -167,7 +236,12 @@ m0_play_state:
 	subs	r3, r3, r6
 	lsls	r7, r7, #GPIO4_B3_BIT
 	add	r7, r11
+	.if	\comp
+	ldr	r6, [sp, #PS_K_HIGH]
+	adds	r7, r7, r6
+	.else
 	add	r7, r12			@ both-high word minus the bits that are 0
+	.endif
 	.endm
 
 /* PROFILE builds: append (sample number << 5) | code to the event log.
@@ -212,8 +286,8 @@ m0_play_state:
 	.endm
 
 /* A step tick: TICK, then a step that may use r6 and r7. */
-	.macro	STEP
-	TICK
+	.macro	STEP comp
+	TICK	\comp
 	mov	r11, r7			@ park the GPIO word
 	.endm
 
@@ -260,13 +334,14 @@ m0_play_state:
 	str	r6, [sp, #\v]
 	.endm
 
+	.macro	M0_PLAY name, comp
 	.section .ramfunc, "ax", %progbits
 	.align	2
-	.global	m0_play
+	.global	\name
 	.thumb_func
-	.type	m0_play, %function
+	.type	\name, %function
 
-m0_play:
+\name:
 	push	{r4-r7, lr}
 	mov	r4, r8
 	mov	r5, r9
@@ -302,6 +377,34 @@ m0_play:
 	str	r3, [sp, #PS_SAMPLE_NO]
 #endif
 
+	.if	\comp
+	/* The SysTick count straight after an undisturbed pin write: the
+	 * highest of a few, since a disturbed one can only come later. */
+	ldr	r6, [sp, #PS_K_GPIO]
+	ldr	r7, =GPIO4_DR_B23_LOW
+	str	r7, [sp, #PS_W]
+	movs	r5, #M0_COMP_CAL_TICKS
+	movs	r4, #0
+10:	wfi
+	str	r7, [r6]
+	ldr	r0, [sp, #PS_K_CVR]
+	ldr	r0, [r0]
+	ldr	r1, [sp, #PS_K_ICSR]
+	movs	r2, #1
+	lsls	r2, r2, #ICSR_PENDSTCLR_BIT
+	str	r2, [r1]
+	cmp	r0, r4
+	bls	11f
+	mov	r4, r0
+11:	subs	r5, #1
+	bne	10b
+	mov	r12, r4
+	ldr	r0, =GPIO4_DR_B23_HIGH
+	str	r0, [sp, #PS_K_HIGH]
+	ldr	r1, [sp, #PS_K_SHMEM]
+	ldr	r2, [sp, #PS_K_MASK]
+	.endif
+
 	ldr	r0, [r1, #M0_SHMEM_READ_IDX]
 	ands	r0, r2			@ in range and frame aligned, whatever the host wrote
 	str	r0, [sp, #PS_PUB]
@@ -321,6 +424,7 @@ m0_play:
 	str	r0, [sp, #PS_VR]
 	str	r0, [sp, #PS_DXR]
 	str	r0, [sp, #PS_XR]
+	str	r0, [sp, #PS_DXRM]
 	mvns	r1, r0
 	str	r1, [sp, #PS_MIN_CVR]
 
@@ -342,13 +446,15 @@ m0_play:
 	movs	r4, #0
 	negs	r0, r2			@ i1_l = -G, G = +FS
 	mov	r3, r2			@ i1_r = -G, G = -FS: the idle patterns interleave
+	.if	\comp == 0
 	ldr	r6, =GPIO4_DR_B23_HIGH
 	mov	r12, r6
+	.endif
 	ldr	r6, [sp, #PS_K_GPIO]
 	ldr	r7, =GPIO4_DR_B23_LOW	@ first tick writes both low
-	b	.L_sample
+	b	.L_sample_\comp
 
-.L_stop:
+.L_stop_\comp:
 	ldr	r6, [sp, #PS_SAVED_SP]
 	mov	sp, r6
 	pop	{r4-r7}
@@ -360,21 +466,21 @@ m0_play:
 
 	.ltorg
 
-.L_sample:
-	STEP				@ 1: stop?
+.L_sample_\comp:
+	STEP	\comp			@ 1: stop?
 	ldr	r7, [sp, #PS_K_SHMEM]
 	ldr	r6, [r7, #M0_SHMEM_CTRL]
 	cmp	r6, #M0_CTRL_PLAY
-	bne	.L_stop
+	bne	.L_stop_\comp
 	STEP_END 1
 
-	STEP				@ 2: where is the host writing
+	STEP	\comp			@ 2: where is the host writing
 	ldr	r7, [sp, #PS_K_SHMEM]
 	ldr	r6, [r7, #M0_SHMEM_WRITE_IDX]
 	str	r6, [sp, #PS_WIDX]
 	STEP_END 2
 
-	STEP				@ 3: next frame, unless the ring is empty
+	STEP	\comp			@ 3: next frame, unless the ring is empty
 	ldr	r7, [sp, #PS_CUR]
 	adds	r7, #M0_FRAME_BYTES
 	ldr	r6, [sp, #PS_K_MASK]
@@ -393,14 +499,14 @@ m0_play:
 1:
 	STEP_END 3
 
-	STEP				@ 4: fetch it: L in [15:0], R in [31:16]
+	STEP	\comp			@ 4: fetch it: L in [15:0], R in [31:16]
 	ldr	r7, [sp, #PS_CUR]
 	ldr	r6, [sp, #PS_K_RING]
 	ldr	r6, [r6, r7]
 	str	r6, [sp, #PS_FRAME]
 	STEP_END 4
 
-	STEP				@ 5: read_idx = the frame after the current one
+	STEP	\comp			@ 5: read_idx = the frame after the current one
 	ldr	r6, [sp, #PS_CUR]
 	adds	r6, #M0_FRAME_BYTES
 	ldr	r7, [sp, #PS_K_MASK]
@@ -408,26 +514,26 @@ m0_play:
 	str	r6, [sp, #PS_PUB]
 	STEP_END 5
 
-	STEP				@ 6: tell the host
+	STEP	\comp			@ 6: tell the host
 	ldr	r6, [sp, #PS_PUB]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_READ_IDX]
 	STEP_END 6
 
 #ifdef M0_PROFILE
-	STEP				@ 7
+	STEP	\comp			@ 7
 	ldr	r6, [sp, #PS_MIN_CVR]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_STAT_MIN_CVR]
 	STEP_END 7
 
-	STEP				@ 8
+	STEP	\comp			@ 8
 	ldr	r6, [sp, #PS_OVERRUNS]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_STAT_OVERRUNS]
 	STEP_END 8
 
-	STEP				@ 9
+	STEP	\comp			@ 9
 	ldr	r6, [sp, #PS_SAMPLE_NO]
 	adds	r6, #1
 	str	r6, [sp, #PS_SAMPLE_NO]
@@ -435,7 +541,7 @@ m0_play:
 #endif
 	/* No more SRAM accesses in this sample. */
 
-	STEP				@ S+1: plain ticks in this sample
+	STEP	\comp			@ S+1: plain ticks in this sample
 	ldr	r6, [sp, #PS_ACC]
 	ldr	r7, [sp, #PS_FRAC]
 	adds	r6, r6, r7		@ carry out = one extra tick
@@ -444,10 +550,10 @@ m0_play:
 	movs	r7, #0			@ (leaves the carry alone)
 	adcs	r5, r7
 	STEP_END S + 1
-	b	.L_steps2
+	b	.L_steps2_\comp
 
-.L_plain:				@ r5 plain ticks, at least one
-	TICK
+.L_plain_\comp:				@ r5 plain ticks, at least one
+	TICK	\comp
 #ifdef M0_PROFILE
 	mov	r11, r7
 	STEP_END M0_TRACE_PLAIN
@@ -455,31 +561,31 @@ m0_play:
 	ldr	r6, [sp, #PS_K_GPIO]
 #endif
 	subs	r5, #1
-	bne	.L_plain
-	b	.L_sample
+	bne	.L_plain_\comp
+	b	.L_sample_\comp
 
-.L_steps2:
-	STEP				@ S+2: left sample
+.L_steps2_\comp:
+	STEP	\comp			@ S+2: left sample
 	ldr	r6, [sp, #PS_FRAME]
 	sxth	r6, r6
 	SAMPLE_IN PS_NL, PS_VL, PS_DXL
 	STEP_END S + 2
 
-	STEP				@ S+3
+	STEP	\comp			@ S+3
 	SAMPLE_START PS_NL, PS_VL, PS_XL
 	STEP_END S + 3
 
-	STEP				@ S+4: right sample
+	STEP	\comp			@ S+4: right sample
 	ldr	r6, [sp, #PS_FRAME]
 	asrs	r6, r6, #16
 	SAMPLE_IN PS_NR, PS_VR, PS_DXR
 	STEP_END S + 4
 
-	STEP				@ S+5
+	STEP	\comp			@ S+5
 	SAMPLE_START PS_NR, PS_VR, PS_XR
 	STEP_END S + 5
 
-	STEP				@ S+6: left starts on its way to the new sample
+	STEP	\comp			@ S+6: left starts on its way to the new sample
 	ldr	r6, [sp, #PS_XL]
 	mov	r8, r6
 	ldr	r6, [sp, #PS_DXL]
@@ -488,23 +594,28 @@ m0_play:
 	mov	r10, r6
 	STEP_END S + 6
 
-	STEP				@ S+7: right
+	STEP	\comp			@ S+7: right
 	ldr	r6, [sp, #PS_XR]
 	mov	r9, r6
 	ldr	r6, [sp, #PS_DXR]
 	ldr	r7, [sp, #PS_DX_MASK]
 	ands	r6, r7
 	mov	lr, r6
+	str	r6, [sp, #PS_DXRM]	@ m0_play_late borrows lr
 	STEP_END S + 7
 
-	STEP				@ S+8
+	STEP	\comp			@ S+8
 	CLAMP	r1
 	STEP_END S + 8
 
-	STEP				@ S+9
+	STEP	\comp			@ S+9
 	CLAMP	r4
 	STEP_END S + 9
-	b	.L_plain
+	b	.L_plain_\comp
 
 	.ltorg
-	.size	m0_play, . - m0_play
+	.size	\name, . - \name
+	.endm
+
+	M0_PLAY	m0_play, 0
+	M0_PLAY	m0_play_comp, 1

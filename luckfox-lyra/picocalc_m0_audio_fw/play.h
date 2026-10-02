@@ -40,7 +40,15 @@
 #define PS_VR         112
 #define PS_DXR        116
 #define PS_XR         120
-#define PS_SIZE       128
+/* m0_play_comp only */
+#define PS_W          124 /* the GPIO word written on the previous tick */
+#define PS_WN         128 /* scratch: the one just written */
+#define PS_M          132 /* scratch: what a late edge is put back as */
+#define PS_CYCLES     136 /* set by caller: core cycles per tick */
+#define PS_K_COMP     140 /* set by caller: 2 * FS / PS_CYCLES, FS as scaled by PS_SHIFT */
+#define PS_K_HIGH     144 /* GPIO word, both high */
+#define PS_DXRM       148 /* dx_r as it is in lr */
+#define PS_SIZE       152
 
 /*
  * Ticks at the start of every sample that each carry one step of the
@@ -60,15 +68,21 @@
  * sample may last at most 2^shift ticks; the state has room for this much. */
 #define M0_MAX_SHIFT  6
 
+/* m0_play_comp() takes the SysTick count of an on-time pin write from this
+ * many ticks before it plays anything */
+#define M0_COMP_CAL_TICKS 16
+
 #ifndef __ASSEMBLER__
 #include <stdint.h>
 
 extern uint32_t m0_play_state[PS_SIZE / 4];
 
 /* SysTick running at the tick rate, PRIMASK set, shmem header valid, PS_FRAC,
- * PS_PLAIN, PS_SHIFT and PS_DX_MASK set.
+ * PS_PLAIN, PS_SHIFT and PS_DX_MASK set; for m0_play_comp() also PS_CYCLES
+ * and PS_K_COMP, and the M0's bus writes not bufferable (play.S).
  * Returns when shmem->ctrl leaves M0_CTRL_PLAY, pins as the last tick left them. */
 void m0_play(void);
+void m0_play_comp(void);
 #endif
 
 #endif /* M0_PLAY_H */

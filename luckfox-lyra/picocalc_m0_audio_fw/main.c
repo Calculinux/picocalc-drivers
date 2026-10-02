@@ -55,6 +55,21 @@ static void tick_set(uint32_t cycles)
 	REG(SYST_CSR) = SYST_CSR_RUN;
 }
 
+/* No divide instruction, no library */
+static uint32_t udiv(uint32_t n, uint32_t d)
+{
+	uint32_t q = 0;
+	int i;
+
+	for (i = 31; i >= 0; i--) {
+		if ((n >> i) >= d) {
+			n -= d << i;
+			q |= 1U << i;
+		}
+	}
+	return q;
+}
+
 /* Take the tick timing from the header if it is usable, else the defaults,
  * hand the per-sample part to m0_play() and switch SysTick to the tick rate. */
 static void tick_start(const m0_audio_shmem_t *shmem)
@@ -87,15 +102,15 @@ static void tick_start(const m0_audio_shmem_t *shmem)
 	m0_play_state[PS_PLAIN / 4] = base - M0_STEP_TICKS;
 	m0_play_state[PS_SHIFT / 4] = shift;
 	m0_play_state[PS_DX_MASK / 4] = interp;
+	/* m0_play_comp: a bit that changes n cycles late was short by
+	 * 2 * FS * n / cycles */
+	m0_play_state[PS_CYCLES / 4] = cycles;
+	m0_play_state[PS_K_COMP / 4] = udiv(2U << (DSM_FS_SHIFT + shift), cycles);
 	tick_set(cycles);
 }
 
 static void hardware_init(void)
 {
-	/* Let bus writes complete behind our back: the GPIO write in every tick
-	 * then costs a few cycles instead of 32 (see rk3506_regs.h). */
-	REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_BUFFERABLE;
-
 	/* CRU: ungate GPIO4 (pclk + dbclk). Nothing else is needed: the tick is
 	 * inside the core. */
 	REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
@@ -125,7 +140,17 @@ int main(void)
 		shmem->m0_state = M0_STATE_PLAY;
 		REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
 		tick_start(shmem);
-		m0_play(); /* until ctrl != PLAY */
+		if (shmem->flags & M0_FLAG_COMP) {
+			/* Blocking writes: the loop times each pin write */
+			REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
+			m0_play_comp();
+		} else {
+			/* Let bus writes complete behind our back: the GPIO write
+			 * in every tick then costs a few cycles instead of 32
+			 * (see rk3506_regs.h). */
+			REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_BUFFERABLE;
+			m0_play(); /* until ctrl != PLAY */
+		}
 		gpio_write_both(0, 0);
 	}
 }
