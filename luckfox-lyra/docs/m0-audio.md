@@ -495,29 +495,52 @@ What it needs, each established on the board:
    correcting. So this loop holds each sample (no interpolation), has 13
    steps and keeps its constants in registers: about 17 cycles spare on a
    plain tick, 10 on the longest step.
-3. **One-word DMA bursts in the display's SPI driver** (above). With the
-   driver's own 16-word bursts the loop fell 89 ms a second behind during a
-   console flood.
-4. **The display's SPI clock at 31.25 MHz or less** (it asks for 80 MHz and
-   gets 46.9; the driver's divider gives 46.9, 31.25, 23.4, ...). At
-   46.9 MHz the display's DMA and the M0's now blocking writes saturate the
-   bus between them.
+3. **Shorter DMA bursts in the display's SPI driver** (above), and the right
+   length for the display's SPI clock. With the driver's own 16-word bursts
+   the loop falls further and further behind while the display is redrawn.
 
-Console flood, one-word bursts, how late the plain ticks' pin writes were
-(`COMP_STATS=2` build, which has 7 cycles spare instead of 17) and the pace:
+The display's SPI clock on this board is 93.75 MHz (the overlay asks for
+100 MHz; the driver's divider gives 93.75, 46.9, 31.25, 23.4, ...), and a
+full 320x320 frame takes 20.6 ms: 48 frames a second. Continuous full-screen
+redraws through KMS (`picocalc_m0_diag_fw/drmfps.c`) with corrected audio
+playing, M0 at 375 MHz:
+
+| Display SPI clock | DMA burst | Frames a second | Audio behind, per second |
+|---|---|---|---|
+| 93.75 MHz | 16 (the driver's own) | 48 | (not coping) |
+| 93.75 MHz | 8 | 48.5 | 9.8 ms |
+| 93.75 MHz | **4** | **48.4** | **0.1 ms** |
+| 93.75 MHz | 2 | 39.8 | 18.8 ms |
+| 93.75 MHz | 1 | 23.6 | 7.8 ms |
+| 46.9 MHz | 16 | 26.2 | 5.7 ms |
+| 46.9 MHz | 8 | 26.2 | 4.8 ms |
+| 46.9 MHz | 2, 3 or 4 | 26.3 | 0.02-0.03 ms |
+| 46.9 MHz | 1 | 23.7 | 7.1 ms |
+| 31.25 MHz | 16 | 18.0 | 3.8 ms |
+| 31.25 MHz | 1 or 4 | 18.0 | 0.02 ms |
+
+Too long a burst holds the bus too long each time; too short a one cannot
+keep the FIFO full, so the DMA never rests and the frame rate drops as well.
+Four words keeps the stock frame rate with the loop all but on pace (it
+loses about 300 ticks a second under this, the heaviest display load there
+is); at 46.9 MHz it loses a quarter of that, for 26 frames a second.
+
+How late the plain ticks' pin writes were during a console flood, one-word
+bursts (`COMP_STATS=2` build, which has 7 cycles spare instead of 17):
 
 | Display SPI clock | On time | Late by 64 cycles or more | Mean | Behind, over 10 s |
 |---|---|---|---|---|
 | (no flood) | 100.0 % | 0 | 0.0 cycles | 2 us |
-| 46.9 MHz | 26 % | 21.75 % | 34 cycles | 102 ms |
+| 93.75 MHz | 26 % | 21.75 % | 34 cycles | 102 ms |
 | 31.25 MHz | 73 % | 0.03 % | 4.1 cycles | 0.15 ms |
 | 23.4 MHz | 81 % | 0.01 % | 2.7 cycles | 0.10 ms |
 
-With the normal build: 31.25 MHz, 84 us behind over 10 s of flood (as good
-as none); 46.9 MHz, 5 ms. In simulation the correction takes a redraw's noise
-under a -40 dBFS tone from -36 dBFS to -72 (16 % of writes up to 32 cycles
-late). By ear, with an earlier and worse version of the loop: a tone played
-through a console flood was "not affected at all".
+In simulation the correction takes a redraw's noise under a -40 dBFS tone
+from -36 dBFS to -72 (16 % of writes up to 32 cycles late). By ear, with an
+earlier and worse version of the loop: a tone played through a console flood
+was "not affected at all". A tick lost (the lateness passing a whole tick)
+is not corrected: it is an error of one bit's charge, a click about 36 dB
+below full scale.
 
 `check_play.py` runs this loop too, puts late writes in by setting the
 SysTick count it reads, and checks both that the firmware matches the model
@@ -530,9 +553,9 @@ and leaves the 32 counts at `M0_TRACE_ADDR`.
 
 Where this lives outside this repository: the SPI burst length is a kernel
 change (`docs/spi-rockchip-tx-burst.patch` is the change that was tested, as
-a module parameter); the display's SPI clock is `spi-max-frequency` in the
-board device tree (32000000); the 375 MHz clock is so far only the
-experiment module.
+a module parameter; 4 is the value to use); the display's SPI clock, if it
+is to be lowered, is `spi-max-frequency` in the board device tree; the
+375 MHz clock is so far only the experiment module.
 
 **The SPI SD card is the worst offender.** While `mmc1` is being read the M0
 does not just get late edges, it falls about 2 % behind (20 ms a second,
@@ -554,7 +577,8 @@ the driver built as a module that takes the burst length as a parameter:
 
 From those figures a burst of 1 takes the timing-error power during display
 activity down by about 15 dB, or about 11 dB per redraw, since redraws then
-take 2.6 times as long. The change is one line in the kernel
+take twice as long or more (the DMA cannot keep the FIFO full; see the frame
+rates under "Correcting for late pin writes"). The change is one line in the kernel
 (`dst_maxburst` in `rockchip_spi_prepare_dma()`), not in this repository;
 by ear it is not yet judged. Each beat can still hold the M0 for up to 16
 cycles, so this reduces the pops and does not remove them.
@@ -609,8 +633,8 @@ burst of in-band noise when its input drops to digital silence.
 7. **Pops from late pin writes**: the display's SPI traffic, the SPI SD
    card and Linux's GPIO writes delay the M0's pin write. There is a
    correction (`comp=1`, "Correcting for late pin writes") that works for
-   the display given a 375 MHz core clock, one-word DMA bursts and a
-   31.25 MHz display clock, none of which is in place by default. The SPI SD
+   the display given a 375 MHz core clock and four-word DMA bursts in the
+   display's SPI driver, neither of which is in place by default. The SPI SD
    card is not dealt with.
 8. **Bus mode** has not been run with `ring_sync` or with interpolation;
    the measurements are all TCM.

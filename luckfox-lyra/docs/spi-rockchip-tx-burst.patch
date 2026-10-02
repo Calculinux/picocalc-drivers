@@ -5,8 +5,10 @@ burst. On the RK3506 a burst holds the low-speed peripheral bus for its whole
 length, and the Cortex-M0's GPIO writes (PicoCalc M0 audio: one per output
 bit) wait behind it: measured, up to 72 core cycles (0.38 us) with 16-word
 bursts and 16 with one-word bursts. See luckfox-lyra/docs/m0-audio.md in
-picocalc-drivers. With tx_burst=1 a full-screen redraw takes about 2.6 times
-as long.
+picocalc-drivers. tx_burst=4 is the value to use with the display at
+93.75 MHz: the frame rate stays at 48 a second and the M0's corrected audio
+loop keeps pace. Shorter bursts cannot keep the FIFO full (24 frames a second
+at tx_burst=1) and are worse for the M0 as well.
 
 Tested as an out-of-tree copy of the driver bound to the display's
 controller; this is the only functional change in it.
