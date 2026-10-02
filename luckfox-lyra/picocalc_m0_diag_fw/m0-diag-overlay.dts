@@ -1,0 +1,30 @@
+/dts-v1/;
+/plugin/;
+
+/* Bring-up only: just the RK3506 M0 loader node, booting the diagnostic
+ * firmware. Clock/reset IDs are the vendor 6.1 numbers (see m0-audio-overlay.dts). */
+/ {
+    compatible = "rockchip,rk3506";
+
+    fragment@0 {
+        target-path = "/";
+        __overlay__ {
+            mcu_rproc: mcu@fff84000 {
+                compatible = "rockchip,rk3506-mcu";
+                reg = <0xfff84000 0x8000>;
+                firmware-name = "rk3506-m0-diag.elf";
+                /* 74 HCLK_M0, 104 STCLK_M0, 76 PCLK_TIMER, 82 CLK_TIMER0_CH5,
+                 * 81 CLK_TIMER0_CH4 (stopwatch). Both timer channels run from
+                 * 22 CLK_GPLL_DIV_100M; Linux has to select and enable that
+                 * parent, otherwise it stays gated and the timers stand still. */
+                clocks = <&cru 74>, <&cru 104>,
+                         <&cru 76>, <&cru 82>, <&cru 81>;
+                assigned-clocks = <&cru 82>, <&cru 81>;
+                assigned-clock-parents = <&cru 22>, <&cru 22>;
+                resets = <&cru 90>, <&cru 91>,
+                         <&cru 10>;
+                reset-names = "h_m0", "m0_jtag", "hresetn_m0_ac";
+            };
+        };
+    };
+};

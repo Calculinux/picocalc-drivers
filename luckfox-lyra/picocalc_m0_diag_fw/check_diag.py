@@ -8,7 +8,8 @@ Needs: pip install unicorn pyelftools   (run via `make check-emu`)
 This checks the firmware's logic and the layout of the results block. It
 cannot say anything about the real SoC: in particular WFI is replaced by a
 no-op here, so the WFI stages run as polling with one "spurious" return
-per poll.
+per poll, and SysTick is not modelled, so the firmware finds none and skips
+the stages that need it.
 """
 import struct
 import sys
@@ -27,13 +28,18 @@ GPIO4_DR = 0xFF1E0000
 STOP_AT_HEARTBEAT = 5
 
 # struct m0_diag field offsets (diag.h), written out independently
-F = {name: 4 * i for i, name in enumerate([
-    'magic', 'version', 'stage', 'fault', 'heartbeat',
-    'cal_empty', 'cal_gpio_wr', 'cal_timer_rd', 'cal_sram_abs', 'cal_sram_low',
-    'period_n', 'period_counts',
-    'poll_n', 'poll_min', 'poll_max', 'poll_sum', 'poll_spurious', 'poll_pend',
-    'poll_slow_ticks', 'wfi_slow_ticks', 'wfi_slow_spurious',
-    'wfi_n', 'wfi_min', 'wfi_max', 'wfi_sum', 'wfi_spurious', 'wfi_pend'])}
+HEAD = ['magic', 'version', 'stage', 'fault', 'heartbeat',
+        'cal_empty', 'cal_nop8', 'cal_gpio_wr', 'cal_timer_rd', 'cal_sram_abs',
+        'cal_sram_low', 'cal_ppb_wr', 'period_n', 'period_counts',
+        'poll_slow_ticks', 'wfi_slow_ticks', 'wfi_slow_spurious',
+        'syst_present', 'syst_calib', 'syst_per_1000', 'stamp_first', 'syst_nowake']
+LAT = ['n', 'min', 'max', 'sum', 'spurious', 'pend']
+HIST = 64
+F = {name: 4 * i for i, name in enumerate(HEAD)}
+for j, block in enumerate(['poll', 'wfi', 'stamp', 'syst', 'acc_gpio', 'acc_timer']):
+    for i, name in enumerate(LAT):
+        F[f'{block}_{name}'] = 4 * (len(HEAD) + j * (len(LAT) + HIST) + i)
+RUN_STAGE = 12
 
 
 class Timer:
@@ -133,22 +139,25 @@ def main():
             bad.append(msg)
 
     expect(r['magic'] == 0x4D304447, 'magic')
-    expect(r['stage'] == 8, f"stage {r['stage']}, want 8 (RUN)")
+    expect(r['version'] == 3, f"version {r['version']}")
+    expect(r['stage'] == RUN_STAGE, f"stage {r['stage']}, want {RUN_STAGE} (RUN)")
+    expect(r['syst_present'] == 0, 'SysTick found, but the emulator has none')
     expect(r['fault'] == 0, 'fault flag set')
     expect(r['heartbeat'] >= STOP_AT_HEARTBEAT, 'heartbeat')
     # Calibration: the model charges half a count per instruction, so the
     # 2-instruction loop costs 1 count per iteration and the 3-instruction
     # loops 1.5.
     expect(abs(r['cal_empty'] - 65536) < 64, f"cal_empty {r['cal_empty']}")
-    for k in ('cal_gpio_wr', 'cal_timer_rd', 'cal_sram_abs', 'cal_sram_low'):
+    for k in ('cal_gpio_wr', 'cal_timer_rd', 'cal_sram_abs', 'cal_sram_low', 'cal_ppb_wr'):
         expect(abs(r[k] - 98304) < 64, f"{k} {r[k]}")
+    expect(abs(r['cal_nop8'] - 327680) < 64, f"cal_nop8 {r['cal_nop8']}")
     expect(r['period_n'] == 10000, 'period_n')
     per = r['period_counts'] / max(r['period_n'], 1)
     expect(abs(per - 1000.0) < 0.5, f'period {per} counts, model is LOAD + 1 = 1000')
     for name in ('poll', 'wfi'):
         n, lo, hi, total = r[name + '_n'], r[name + '_min'], r[name + '_max'], r[name + '_sum']
         expect(n == 4096, f'{name} n {n}')
-        expect(lo <= hi < 16, f'{name} latency range {lo}..{hi}')
+        expect(lo <= hi < 32, f'{name} latency range {lo}..{hi}')
         expect(hi > lo, f'{name} latency shows no spread, model varies it')
         expect(lo * n <= total <= hi * n, f'{name} sum {total}')
     expect(r['poll_spurious'] == 0, 'poll spurious')
@@ -156,9 +165,14 @@ def main():
     expect(r['wfi_slow_ticks'] == 1000, f"wfi_slow_ticks {r['wfi_slow_ticks']}")
     # wfi is a nop here: every poll that finds nothing counts as spurious
     expect(r['wfi_slow_spurious'] > 0 and r['wfi_spurious'] > 0, 'no spurious WFI counted')
-    # B2: one write low at init, then it alternates on every slow tick
+    # B2 alternates on every tick of the two slow stages and is quiet otherwise
     toggles = sum(1 for a, b in zip(b2, b2[1:]) if a != b)
-    expect(toggles >= 2000 - 2, f'B2 toggled {toggles} times, want about 2000')
+    expect(1996 <= toggles <= 2000, f'B2 toggled {toggles} times, want about 2000')
+    # the latency histograms must account for every sample
+    for name in ('poll', 'wfi'):
+        base = RES + F[name + '_n'] + 4 * len(LAT)
+        hist = struct.unpack(f'<{HIST}I', uc.mem_read(base, 4 * HIST))
+        expect(sum(hist) == 4096, f'{name} histogram holds {sum(hist)} samples')
 
     print(f"stage {r['stage']}, period {per:.3f} counts, poll latency {r['poll_min']}..{r['poll_max']}, "
           f"wfi-as-poll latency {r['wfi_min']}..{r['wfi_max']}, B2 toggles {toggles}")

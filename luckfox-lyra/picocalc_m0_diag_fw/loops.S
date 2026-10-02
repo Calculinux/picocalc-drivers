@@ -22,6 +22,24 @@ diag_loop_empty:
 	bx	lr
 	.size	diag_loop_empty, . - diag_loop_empty
 
+/* void diag_loop_nop8(uint32_t n): the empty loop plus eight nops (8 cycles) */
+	.global	diag_loop_nop8
+	.thumb_func
+	.type	diag_loop_nop8, %function
+diag_loop_nop8:
+1:	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	nop
+	subs	r0, #1
+	bne	1b
+	bx	lr
+	.size	diag_loop_nop8, . - diag_loop_nop8
+
 /* void diag_loop_str(uint32_t n, volatile uint32_t *addr, uint32_t val):
  * the empty loop plus one store (2 cycles at zero wait states) */
 	.global	diag_loop_str
@@ -79,3 +97,42 @@ diag_wait_wfi:
 	mvns	r0, r0
 	bx	lr
 	.size	diag_wait_wfi, . - diag_wait_wfi
+
+/* uint32_t diag_wfi_read(volatile uint32_t *reg): one WFI, then read *reg as
+ * the very first thing after waking. With reg = SysTick's current value (a
+ * core-internal register, no bus bridge in the way) this time-stamps the
+ * wake to one core clock cycle. */
+	.global	diag_wfi_read
+	.thumb_func
+	.type	diag_wfi_read, %function
+diag_wfi_read:
+	wfi
+	ldr	r0, [r0]
+	bx	lr
+	.size	diag_wfi_read, . - diag_wfi_read
+
+/* uint32_t diag_time_str(volatile uint32_t *cvr, volatile uint32_t *addr, uint32_t val):
+ * SysTick before, one store, SysTick after. Returns the difference (the
+ * counter counts down); the caller masks it to 24 bits. */
+	.global	diag_time_str
+	.thumb_func
+	.type	diag_time_str, %function
+diag_time_str:
+	ldr	r3, [r0]
+	str	r2, [r1]
+	ldr	r0, [r0]
+	subs	r0, r3, r0
+	bx	lr
+	.size	diag_time_str, . - diag_time_str
+
+/* uint32_t diag_time_ldr(volatile uint32_t *cvr, volatile uint32_t *addr): same for one load */
+	.global	diag_time_ldr
+	.thumb_func
+	.type	diag_time_ldr, %function
+diag_time_ldr:
+	ldr	r3, [r0]
+	ldr	r2, [r1]
+	ldr	r0, [r0]
+	subs	r0, r3, r0
+	bx	lr
+	.size	diag_time_ldr, . - diag_time_ldr
