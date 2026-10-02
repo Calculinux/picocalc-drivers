@@ -287,6 +287,10 @@ Special logic for Shift:
 	if ((ev->state == KEY_STATE_PRESSED) && (ev->scancode == 0xA2 || ev->scancode == 0xA3)) {
 		if (ctx->left_shift_pressed && ctx->right_shift_pressed) {
 			ctx->mouse_mode = !ctx->mouse_mode;
+			// Clear any residual mouse movement flags when disabling mouse mode,
+			// e.g. when an arrow key was still held at the moment of the toggle.
+			if (!ctx->mouse_mode)
+				ctx->mouse_move_dir = 0;
 			// Press both Shifts simultaneously to toggle mouse mode
 		}
 	}else if ((ev->state == KEY_STATE_RELEASED) && (ev->scancode == 0xA2 || ev->scancode == 0xA3)){
@@ -303,62 +307,66 @@ Special logic for Shift:
     	}
 	}
 
+	// Track arrow key direction flags for mouse mode.
+	// Flags are cleared on RELEASE regardless of mouse_mode so that toggling
+	// the mode off while an arrow key is still held cannot leave stale state
+	// that resurrects phantom movement when the mode is switched back on.
+	switch (ev->scancode) {
+		/* KEY_RIGHT */
+		case 0xb7:
+			if (ev->state == KEY_STATE_RELEASED) {
+				ctx->mouse_move_dir &= ~MOUSE_MOVE_RIGHT;
+			} else if (ctx->mouse_mode && ev->state == KEY_STATE_PRESSED) {
+				if (!(ctx->mouse_move_dir & MOUSE_MOVE_RIGHT))
+					ctx->last_keypress_at = ktime_get_boottime_ns();
+				ctx->mouse_move_dir |= MOUSE_MOVE_RIGHT;
+			}
+			if (ctx->mouse_mode)
+				return;
+			break;
+		/* KEY_LEFT */
+		case 0xb4:
+			if (ev->state == KEY_STATE_RELEASED) {
+				ctx->mouse_move_dir &= ~MOUSE_MOVE_LEFT;
+			} else if (ctx->mouse_mode && ev->state == KEY_STATE_PRESSED) {
+				if (!(ctx->mouse_move_dir & MOUSE_MOVE_LEFT))
+					ctx->last_keypress_at = ktime_get_boottime_ns();
+				ctx->mouse_move_dir |= MOUSE_MOVE_LEFT;
+			}
+			if (ctx->mouse_mode)
+				return;
+			break;
+		/* KEY_DOWN */
+		case 0xb6:
+			if (ev->state == KEY_STATE_RELEASED) {
+				ctx->mouse_move_dir &= ~MOUSE_MOVE_DOWN;
+			} else if (ctx->mouse_mode && ev->state == KEY_STATE_PRESSED) {
+				if (!(ctx->mouse_move_dir & MOUSE_MOVE_DOWN))
+					ctx->last_keypress_at = ktime_get_boottime_ns();
+				ctx->mouse_move_dir |= MOUSE_MOVE_DOWN;
+			}
+			if (ctx->mouse_mode)
+				return;
+			break;
+		/* KEY_UP */
+		case 0xb5:
+			if (ev->state == KEY_STATE_RELEASED) {
+				ctx->mouse_move_dir &= ~MOUSE_MOVE_UP;
+			} else if (ctx->mouse_mode && ev->state == KEY_STATE_PRESSED) {
+				if (!(ctx->mouse_move_dir & MOUSE_MOVE_UP))
+					ctx->last_keypress_at = ktime_get_boottime_ns();
+				ctx->mouse_move_dir |= MOUSE_MOVE_UP;
+			}
+			if (ctx->mouse_mode)
+				return;
+			break;
+	default:
+		break;
+	}
+
 	// Mouse mode
 	if (ctx->mouse_mode){
 		switch(ev->scancode){
-		/* KEY_RIGHT */
-		case 0xb7:
-				if (ev->state == KEY_STATE_PRESSED)
-				{
-					if (!(ctx->mouse_move_dir & MOUSE_MOVE_RIGHT))
-					ctx->last_keypress_at = ktime_get_boottime_ns();
-					ctx->mouse_move_dir |= MOUSE_MOVE_RIGHT;
-				}
-				else if (ev->state == KEY_STATE_RELEASED)
-				{
-					ctx->mouse_move_dir &= ~MOUSE_MOVE_RIGHT;
-				}
-				return;
-		/* KEY_LEFT */
-		case 0xb4:
-				if (ev->state == KEY_STATE_PRESSED)
-				{
-					if (!(ctx->mouse_move_dir & MOUSE_MOVE_LEFT))
-					ctx->last_keypress_at = ktime_get_boottime_ns();
-					ctx->mouse_move_dir |= MOUSE_MOVE_LEFT;
-				}
-				else if (ev->state == KEY_STATE_RELEASED)
-				{
-				ctx->last_keypress_at = ktime_get_boottime_ns();
-					ctx->mouse_move_dir &= ~MOUSE_MOVE_LEFT;
-				}
-				return;
-		/* KEY_DOWN */
-		case 0xb6:
-				if (ev->state == KEY_STATE_PRESSED)
-				{
-					if (!(ctx->mouse_move_dir & MOUSE_MOVE_DOWN))
-					ctx->last_keypress_at = ktime_get_boottime_ns();
-					ctx->mouse_move_dir |= MOUSE_MOVE_DOWN;
-				}
-				else if (ev->state == KEY_STATE_RELEASED)
-				{
-					ctx->mouse_move_dir &= ~MOUSE_MOVE_DOWN;
-				}
-				return;
-		/* KEY_UP */
-		case 0xb5:
-				if (ev->state == KEY_STATE_PRESSED)
-				{
-					if (!(ctx->mouse_move_dir & MOUSE_MOVE_UP))
-					ctx->last_keypress_at = ktime_get_boottime_ns();
-					ctx->mouse_move_dir |= MOUSE_MOVE_UP;
-				}
-				else if (ev->state == KEY_STATE_RELEASED)
-				{
-					ctx->mouse_move_dir &= ~MOUSE_MOVE_UP;
-				}
-				return;
 		/* KEY_RIGHTBRACE */
 		case ']':
 			input_report_key(ctx->input_dev, BTN_RIGHT, ev->state == KEY_STATE_PRESSED);
