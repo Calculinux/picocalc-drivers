@@ -160,12 +160,14 @@ controllers), and that is `clk_gpll_div`, GPLL / 8, undivided. `clk_gpll_div`
 also feeds the low-speed peripheral bus and several peripheral clocks, each
 through a divider of its own. Halving every one of those and then setting
 `clk_gpll_div` to GPLL / 4 leaves them all where they were and puts the M0 at
-375 MHz, with the GPIO clock exactly a quarter of it. `picocalc_m0_diag_fw/
-m0clk` is a module that does that through the clock framework when loaded
-and undoes it when removed; while it is loaded none of those other clocks
-can be set above its old rate (their parent being twice as fast, a driver
-could otherwise be handed twice the clock it expects). **An experiment**: the
-TRM gives no limit for this clock.
+375 MHz, with the GPIO clock exactly a quarter of it. The remoteproc driver
+does that, through the clock framework, when its node has
+`picocalc,double-core-clock` (the m0-audio overlay as shipped has it), and
+undoes it when unbound; while it is bound none of those other clocks can be
+set above its old rate (their parent being twice as fast, a driver could
+otherwise be handed twice the clock it expects). **An experiment**: the TRM
+gives no limit for this clock. (It was first tried as a separate module,
+`m0clk`, which this replaced.)
 
 Measured on the board at 375 MHz, firmware as TCM:
 
@@ -484,7 +486,8 @@ always costs the same; the tick is exactly 128 core cycles, which makes the
 arithmetic shifts by constants. Because it measures from one write to the
 next and not against the tick grid, it stays right when the loop has fallen
 a tick or more behind the grid: it then just plays that much slower until it
-has caught up. `comp=1` on the sound module selects it
+has caught up. `picocalc,comp` on the sound node (the m0-audio overlay as
+shipped has it) or `comp=1` on the sound module selects it
 (default off; it needs all of the following).
 
 What it needs, each established on the board:
@@ -559,11 +562,13 @@ system: 0.02 cycles per tick; full-screen redraws at 48 a second: 3.5).
 The lateness table above is from an earlier debug build that counted how
 often each lateness against the tick grid occurred.
 
-Where this lives outside this repository: the SPI burst length is a kernel
-change (`docs/spi-rockchip-tx-burst.patch` is the change that was tested, as
-a module parameter; 4 is the value to use); the display's SPI clock, if it
-is to be lowered, is `spi-max-frequency` in the board device tree; the
-375 MHz clock is so far only the experiment module.
+Where this lives: the SPI burst length is a kernel change,
+`docs/spi-rockchip-tx-burst.patch` (the device tree property
+`rockchip,tx-dma-burst`, which `picocalc-luckfox-lyra.dtsi` sets to 4 on
+`&spi0`; it was measured with the same change as a module parameter of an
+out-of-tree copy of the driver). The display's SPI clock, if it
+is to be lowered, is `spi-max-frequency` in the board device tree. The
+375 MHz clock and `comp` come with the m0-audio overlay.
 
 **The SPI SD card is the worst offender.** While `mmc1` is being read the M0
 does not just get late edges, it falls about 2 % behind (20 ms a second,
@@ -640,9 +645,10 @@ burst of in-band noise when its input drops to digital silence.
    that exact; same caveat.
 7. **Pops from late pin writes**: the display's SPI traffic, the SPI SD
    card and Linux's GPIO writes delay the M0's pin write. There is a
-   correction (`comp=1`, "Correcting for late pin writes") that works for
-   the display given a 375 MHz core clock and four-word DMA bursts in the
-   display's SPI driver, neither of which is in place by default. The SPI SD
+   correction ("Correcting for late pin writes") that works for the
+   display given a 375 MHz core clock and four-word DMA bursts in the
+   display's SPI driver. The m0-audio overlay as shipped turns on the first
+   two; the bursts need the kernel patch. The SPI SD
    card is not dealt with.
 8. **Bus mode** has not been run with `ring_sync` or with interpolation;
    the measurements are all TCM.

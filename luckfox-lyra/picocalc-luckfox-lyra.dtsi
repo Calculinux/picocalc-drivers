@@ -95,6 +95,12 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&rm_io4_spi0_csn0 &rm_io5_spi0_miso &rm_io6_spi0_mosi &rm_io7_spi0_clk>;
 	num-cs = <1>;
+	/* DMA bursts of 4 words instead of a quarter of the FIFO (16): a burst
+	 * holds the low-speed peripheral bus, and the M0's audio pin writes
+	 * wait behind it. 4 keeps the display at 48 frames a second and lets
+	 * the M0's corrected audio loop keep pace (docs/m0-audio.md). Needs a
+	 * kernel patch (docs/spi-rockchip-tx-burst.patch); ignored without. */
+	rockchip,tx-dma-burst = <4>;
 
 	ili9488: ili9488@0 {
 		status = "okay";

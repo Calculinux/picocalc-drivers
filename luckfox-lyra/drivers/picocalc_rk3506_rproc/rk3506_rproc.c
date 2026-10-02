@@ -18,11 +18,14 @@
  *             peripheral clocks the firmware needs kept running)
  *    resets = <&cru SRST_H_M0>, <&cru SRST_M0_JTAG>, <&cru SRST_HRESETN_M0_AC>;
  *    reset-names = "h_m0", "m0_jtag", "hresetn_m0_ac";
+ *    rockchip,tcm;                  (optional: run the image as TCM, below)
+ *    picocalc,double-core-clock;    (optional: M0 at 375 MHz, below)
  *  };
  */
 
 #include <linux/arm-smccc.h>
 #include <linux/clk.h>
+#include <linux/clk-provider.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/module.h>
@@ -30,6 +33,7 @@
 #include <linux/platform_device.h>
 #include <linux/remoteproc.h>
 #include <linux/reset.h>
+#include <dt-bindings/clock/rockchip,rk3506-cru.h>
 
 extern int rproc_elf_sanity_check(struct rproc *rproc, const struct firmware *fw);
 extern u64 rproc_elf_get_boot_addr(struct rproc *rproc, const struct firmware *fw);
@@ -80,6 +84,131 @@ extern struct resource_table *rproc_elf_find_loaded_rsc_table(struct rproc *rpro
 #define RK3506_CRU_BASE 0xFF9A0000
 #define RK3506_GRF_BASE 0xFF288000
 
+/*
+ * "picocalc,double-core-clock": run the M0 at twice the usual rate.
+ *
+ * hclk_m0 is a gate on aclk_bus_root, which is clk_gpll_div (GPLL / 8,
+ * 187.5 MHz) undivided, and clk_gpll_div also feeds the low-speed peripheral
+ * bus and the clocks listed below, each through a divider of its own. Halving
+ * each of those first (so that none is ever above its usual rate), then
+ * setting clk_gpll_div to GPLL / 4, leaves them all where they were and puts
+ * the M0 (with the system SRAM and the DMA controllers) at 375 MHz, its GPIO
+ * clock exactly a quarter of that. While the driver is bound none of them can
+ * be set above its old rate: a driver asking for a new rate could otherwise
+ * be given twice what it expects. Through the clock framework, so the rates
+ * Linux reports stay true. The RK3506 TRM gives no limit for aclk_bus_root;
+ * this has been run on one board (picocalc-drivers docs/m0-audio.md).
+ */
+#define RK3506_BUS_SLOW_HZ 187500000UL
+#define RK3506_BUS_FAST_HZ 375000000UL
+
+static const u32 rk3506_bus_siblings[] = {
+	HCLK_VIO_ROOT, CLK_SPI1, CLK_SPI0, CLK_PWM1, CLK_I2C2, CLK_I2C1, CLK_I2C0,
+	HCLK_LSPERI_ROOT, PCLK_BUS_ROOT, CLK_GPLL_DIV_100M,
+};
+
+struct rk3506_fast_bus {
+	struct clk *gpll_div;
+	struct clk *sib[ARRAY_SIZE(rk3506_bus_siblings)];
+	unsigned long rate[ARRAY_SIZE(rk3506_bus_siblings)];
+	bool on;
+};
+
+static struct clk *rk3506_cru_clk(struct device_node *cru, u32 id)
+{
+	struct of_phandle_args spec = { .np = cru, .args_count = 1, .args = { id } };
+
+	return of_clk_get_from_provider(&spec);
+}
+
+static void rk3506_fast_bus_put(struct rk3506_fast_bus *fb)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(fb->sib); i++)
+		if (!IS_ERR_OR_NULL(fb->sib[i]))
+			clk_put(fb->sib[i]);
+	if (!IS_ERR_OR_NULL(fb->gpll_div))
+		clk_put(fb->gpll_div);
+	fb->gpll_div = NULL;
+}
+
+static int rk3506_fast_bus_on(struct device *dev, struct rk3506_fast_bus *fb)
+{
+	struct device_node *cru = of_find_compatible_node(NULL, NULL, "rockchip,rk3506-cru");
+	int i, ret = 0;
+
+	if (!cru)
+		return -ENODEV;
+	fb->gpll_div = rk3506_cru_clk(cru, CLK_GPLL_DIV);
+	for (i = 0; i < ARRAY_SIZE(fb->sib); i++)
+		fb->sib[i] = rk3506_cru_clk(cru, rk3506_bus_siblings[i]);
+	of_node_put(cru);
+	if (IS_ERR(fb->gpll_div))
+		ret = PTR_ERR(fb->gpll_div);
+	for (i = 0; !ret && i < ARRAY_SIZE(fb->sib); i++)
+		if (IS_ERR(fb->sib[i]))
+			ret = PTR_ERR(fb->sib[i]);
+	if (ret)
+		goto put;
+	if (clk_get_rate(fb->gpll_div) != RK3506_BUS_SLOW_HZ) {
+		dev_warn(dev, "clk_gpll_div is %lu Hz, not %lu: core clock left alone\n",
+			 clk_get_rate(fb->gpll_div), RK3506_BUS_SLOW_HZ);
+		ret = -EINVAL;
+		goto put;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(fb->sib); i++) {
+		fb->rate[i] = clk_get_rate(fb->sib[i]);
+		ret = clk_set_rate(fb->sib[i], fb->rate[i] / 2);
+		if (ret || clk_get_rate(fb->sib[i]) != fb->rate[i] / 2 ||
+		    !clk_is_match(clk_get_parent(fb->sib[i]), fb->gpll_div)) {
+			dev_warn(dev, "could not halve %s: core clock left alone\n",
+				 __clk_get_name(fb->sib[i]));
+			ret = ret ? ret : -EINVAL;
+			goto undo;
+		}
+	}
+	ret = clk_set_rate(fb->gpll_div, RK3506_BUS_FAST_HZ);
+	if (ret)
+		goto undo;
+	for (i = 0; i < ARRAY_SIZE(fb->sib); i++) {
+		/* Setting a limit makes the framework go back to the last rate
+		 * asked for, which is half: so the limit first, then the rate. */
+		clk_set_max_rate(fb->sib[i], fb->rate[i]);
+		clk_set_rate(fb->sib[i], fb->rate[i]);
+		if (clk_get_rate(fb->sib[i]) != fb->rate[i])
+			dev_warn(dev, "%s is now %lu Hz, was %lu\n", __clk_get_name(fb->sib[i]),
+				 clk_get_rate(fb->sib[i]), fb->rate[i]);
+	}
+	fb->on = true;
+	return 0;
+
+undo:
+	i = ARRAY_SIZE(fb->sib);
+	while (--i >= 0)
+		if (fb->rate[i])
+			clk_set_rate(fb->sib[i], fb->rate[i]);
+put:
+	rk3506_fast_bus_put(fb);
+	return ret;
+}
+
+static void rk3506_fast_bus_off(struct rk3506_fast_bus *fb)
+{
+	int i;
+
+	if (!fb->on)
+		return;
+	for (i = 0; i < ARRAY_SIZE(fb->sib); i++)
+		clk_set_max_rate(fb->sib[i], ULONG_MAX);
+	clk_set_rate(fb->gpll_div, RK3506_BUS_SLOW_HZ);	/* the others at half for a moment */
+	for (i = 0; i < ARRAY_SIZE(fb->sib); i++)
+		clk_set_rate(fb->sib[i], fb->rate[i]);
+	rk3506_fast_bus_put(fb);
+	fb->on = false;
+}
+
 typedef struct {
 	struct rproc *rproc;
 	struct clk_bulk_data *clks;
@@ -97,6 +226,7 @@ typedef struct {
 	bool tcm_engaged;   /* the SRAM is the M0's now; no more loading */
 	uint32_t code_addr; /* where M0 address 0 is */
 	uint32_t code_size;
+	struct rk3506_fast_bus fast_bus; /* "picocalc,double-core-clock" */
 } rk3506_mcu_t;
 
 static void rk3506_rproc_mcu_run(rk3506_mcu_t *mcu, bool arun)
@@ -310,6 +440,12 @@ static int rk3506_rproc_probe(struct platform_device *pdev)
 		goto unmap_periph;
 	}
 
+	if (of_property_read_bool(pdev->dev.of_node, "picocalc,double-core-clock")) {
+		ret = rk3506_fast_bus_on(&pdev->dev, &mcu->fast_bus);
+		if (ret)
+			dev_warn(&pdev->dev, "core clock not doubled: %d\n", ret);
+	}
+
 	/* hclk_m0 is a gate on aclk_bus_root (CRU_CLKSEL_CON21), so the M0 runs
 	 * at whatever the bus runs at. Firmware with a per-tick cycle budget
 	 * (the audio firmware) is tuned against this number. */
@@ -350,6 +486,7 @@ static int rk3506_rproc_probe(struct platform_device *pdev)
 	return 0;
 
 disable_clks:
+	rk3506_fast_bus_off(&mcu->fast_bus);
 	clk_bulk_disable_unprepare(mcu->num_clks, mcu->clks);
 unmap_periph:
 	if (mcu->regs_PMU) iounmap(mcu->regs_PMU);
@@ -375,6 +512,7 @@ static int rk3506_rproc_remove(struct platform_device *pdev)
 	rk3506_mcu_t *mcu = rproc->priv;
 
 	rk3506_rproc_shutdown(pdev);
+	rk3506_fast_bus_off(&mcu->fast_bus);
 	clk_bulk_disable_unprepare(mcu->num_clks, mcu->clks);
 	if (mcu->tcm_virt) iounmap(mcu->tcm_virt);
 	if (mcu->regs_PMU) iounmap(mcu->regs_PMU);

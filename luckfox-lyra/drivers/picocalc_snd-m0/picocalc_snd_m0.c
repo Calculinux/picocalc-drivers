@@ -101,12 +101,14 @@ MODULE_PARM_DESC(tick_even, "Make the tick a whole number of GPIO clock periods 
  * pin write and puts what a late one cost back into its modulator, which
  * moves the error out of the audio band. That loop needs a tick of exactly
  * 128 core cycles, which is only fast enough with the M0's clock raised to
- * 375 MHz (2.93 MHz; picocalc_m0_diag_fw/m0clk): comp_min_hz is the slowest
+ * 375 MHz (2.93 MHz; "picocalc,double-core-clock" for the remoteproc driver):
+ * comp_min_hz is the slowest
  * bit rate at which it is used, and at the stock 187.5 MHz the driver plays
  * uncorrected at tick_hz instead. It holds each sample (no interpolation: it
  * has no cycles for it). Not with a PROFILE=1 firmware. Next playback start.
  *
- * Off by default: timing a pin write means waiting for it, so a late write
+ * Off by default ("picocalc,comp" in the device tree turns it on): timing a
+ * pin write means waiting for it, so a late write
  * holds the firmware's loop up too, and the loop has only a few cycles per
  * tick to spare. With the kernel's own SPI driver, whose DMA bursts make a
  * quarter of the writes 70 cycles late on average, it falls further and
@@ -908,6 +910,8 @@ static int m0_probe(struct platform_device *pdev)
 		goto put_rproc;
 	}
 	of_property_read_u32(np, "tick-rate-hz", &tick_hz);
+	if (of_property_read_bool(np, "picocalc,comp"))
+		comp = true;
 
 	if (of_property_read_u32(np, "ring-buffer-bytes", &m->buf_size))
 		m->buf_size = M0_FIXED_BUF_SIZE;

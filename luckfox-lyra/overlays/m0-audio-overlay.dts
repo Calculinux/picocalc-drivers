@@ -61,6 +61,13 @@
                  * running as TCM (rockchip,tcm below); without, use
                  * 1000000. A PROFILE=1 firmware needs 2929688 or less. */
                 tick-rate-hz = <3000000>;
+                /* Time every pin write and correct for those that other bus
+                 * traffic (the SPI display) has delayed; see comp in the
+                 * driver. Only takes effect with the core clock doubled
+                 * (picocalc,double-core-clock below), and needs the
+                 * display's SPI DMA bursts shortened (rockchip,tx-dma-burst
+                 * on &spi0 in the base device tree, a kernel patch). */
+                picocalc,comp;
                 pinctrl-names = "default";
                 pinctrl-0 = <&snd_pins>;
             };
@@ -75,6 +82,12 @@
                  * keeps it running between streams). Remove this and lower
                  * tick-rate-hz to reload firmware freely while developing. */
                 rockchip,tcm;
+                /* Run the M0 (and with it the system SRAM and the DMA
+                 * controllers) at 375 MHz instead of 187.5, every other
+                 * clock staying where it was: the cycles the corrected
+                 * loop needs (picocalc,comp below). An experiment: the TRM
+                 * gives no limit for this clock. Remove both to run stock. */
+                picocalc,double-core-clock;
                 /* Vendor 6.1 CRU IDs: 74 HCLK_M0 (must stay first: the
                  * driver reports its rate as the M0 core clock), 104
                  * STCLK_M0. The firmware's tick is the core's own SysTick,
