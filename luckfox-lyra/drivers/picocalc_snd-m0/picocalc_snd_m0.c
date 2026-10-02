@@ -45,7 +45,7 @@
 #define M0_FIXED_SAMPLE_RATE_HZ  48000U
 #define M0_FIXED_BUF_SIZE        8192U
 /* The firmware gives each step of its per-sample work a tick of its own */
-#define M0_MIN_TICKS_PER_SAMPLE  12U
+#define M0_MIN_TICKS_PER_SAMPLE  13U
 #define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
 
 /*

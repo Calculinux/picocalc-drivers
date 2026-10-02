@@ -245,6 +245,26 @@ input (clamp), underrun hold, an unaligned start index, clean return on STOP
 and preserved registers. It checks arithmetic and schedule, not timing; the
 idle loop and the handshake are only tested on hardware.
 
+## Diagnosing ticks and dropouts
+
+A `PROFILE=1` firmware also keeps an event log in the SRAM after the ring:
+every tick that was still working when the next fell due, with the step of
+the sample it was in, and every sample for which the ring was empty, each
+with its sample number. `m0trace` (in the firmware directory; build it for
+the board) reads it from Linux and shows the events by kind, a 50 ms
+timeline, the gaps between them and, with `-p FRAMES`, where in the ALSA
+period they fall:
+
+```
+make PROFILE=1                         # then load it (bus mode, or TCM after a reboot)
+aplay something.wav; m0trace -p 1024
+```
+
+What is known so far (TCM, 3 MHz): 15-20 stretched ticks a second, the same
+with the heartbeat LED trigger on or off, more with shorter ALSA periods.
+In simulation the modulator produces no burst of in-band noise when its
+input drops to digital silence.
+
 ## Open issues
 
 1. **Quality.** Not measured. Nobody has yet listened critically or looked at
@@ -261,5 +281,8 @@ idle loop and the handshake are only tested on hardware.
 5. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.
-6. **Stretched ticks** in TCM mode (a few tens a second): unidentified.
-7. **ALDO4 margin**, above.
+6. **Stretched ticks** in TCM mode (15-20 a second): they follow the host's
+   ring updates in number; which step and when is what `m0trace` is for.
+7. **Audible artefacts reported**: a rhythmic ticking roughly every half
+   second, and brief static when a sound stops. Causes not yet found.
+8. **ALDO4 margin**, above.

@@ -22,12 +22,15 @@
 #define PS_K_MASK     48  /* ring index mask, frame aligned */
 #define PS_K_CLAMP    52  /* largest i2 the clamp allows */
 #define PS_K_CVR      56  /* &SYST_CVR */
-#define PS_SIZE       60
+#define PS_SAMPLE_NO  60  /* PROFILE: samples since the stream started */
+#define PS_EVENTS     64  /* PROFILE: events logged so far */
+#define PS_K_TRACE    68  /* PROFILE: M0_TRACE_ADDR */
+#define PS_SIZE       72
 
 /* Ticks at the start of every sample that each carry one step of the
  * per-sample work (play.S); the rest of the sample is plain ticks. */
 #ifdef M0_PROFILE
-#define M0_STEP_TICKS 11
+#define M0_STEP_TICKS 12
 #else
 #define M0_STEP_TICKS 9
 #endif

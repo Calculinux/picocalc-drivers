@@ -32,6 +32,8 @@ GPIO4_DR = 0xFF1E0000
 RET_ADDR = 0x10000000
 CTRL, WRITE_IDX, READ_IDX = 4, 8, 12
 PS_FRAC, PS_PLAIN = 4, 8                    # m0_play_state: what main.c sets
+TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
+TRACE_UNDERRUN = 30
 
 SAMPLE_RATE = 48000
 FS_SHIFT, CLAMP_SHIFT = 15, 20
@@ -76,6 +78,8 @@ class Model:
         self.i2 = [0, 0]
         self.g = [1 << FS_SHIFT, -(1 << FS_SHIFT)]
         self.word = 0x0C000000
+        self.empties = []               # sample numbers at which the ring was empty
+        self.sample_no = 0
         self.pos = 0                    # tick number within the sample
         self.length = None              # ticks in this sample, known from step 2
         self.tick_no = 0
@@ -101,6 +105,8 @@ class Model:
             nxt = (self.cur + 4) & IDX_MASK
             if nxt != self.widx:
                 self.cur = nxt
+            else:
+                self.empties.append(self.sample_no)
         elif n == 5:
             self.frame = self.frames[self.cur // 4]
         elif n == 6:
@@ -113,6 +119,8 @@ class Model:
             self.pub = (self.cur + 4) & IDX_MASK
         elif n == 9:
             self.published = self.pub
+        elif n == 12:
+            self.sample_no += 1
         # steps 10, 11 (PROFILE builds) publish statistics only
 
     def tick(self, ctrl):
@@ -232,6 +240,17 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None):
     if pub != model.published:
         print(f'  {name}: published read_idx {pub}, model {model.published}')
         bad += 1
+    if steps >= 12:
+        # PROFILE build: nothing overruns here, so the log is the empty-ring events
+        total = struct.unpack('<I', uc.mem_read(TRACE, 4))[0]
+        if total != len(model.empties):
+            print(f'  {name}: {total} events logged, model has {len(model.empties)} empty-ring samples')
+            bad += 1
+        elif total:
+            entry = struct.unpack('<I', uc.mem_read(TRACE + 4 + 4 * (total & 255), 4))[0]
+            if entry != (model.empties[-1] << 5 | TRACE_UNDERRUN):
+                print(f'  {name}: last log entry {entry:#x}, model sample {model.empties[-1]}')
+                bad += 1
     ones_l = sum((w >> 10) & 1 for w in words) / max(len(words), 1)
     print(f'{name:36s} {len(words):7d} ticks  left duty {ones_l:.4f}  {"FAIL" if bad else "ok"}')
     return bad
@@ -245,13 +264,13 @@ def main():
     noise = [(rnd.randint(-32768, 32767), rnd.randint(-32768, 32767)) for _ in range(n)]
     rails = [(rnd.choice((-32768, 32767)), rnd.choice((-32768, 32767))) for _ in range(n)]
     dc = [(16384, -8000)] * n
-    t600k = timing(187500000, 312)      # 12.52 ticks per sample: the shortest allowed
+    t600k = timing(187500000, 300)      # 13.02 ticks per sample: the shortest allowed
     t1m2 = timing(187500000, 156)       # 25.04
     t2m4 = timing(187500000, 78)        # 50.08
     bad = 0
     bad += run(path, 'silence', [(0, 0)] * n, 20000, t1m2)
     bad += run(path, 'dc', dc, 60000, t1m2)
-    bad += run(path, 'sine, 600 kHz', sine, 150000, t600k)
+    bad += run(path, 'sine, 625 kHz', sine, 150000, t600k)
     bad += run(path, 'sine, 1.2 MHz', sine, 150000, t1m2)
     bad += run(path, 'sine, 2.4 MHz', sine, 150000, t2m4)
     bad += run(path, 'noise, wraps the ring', noise, 250000, t1m2, read_idx=RING - 40)

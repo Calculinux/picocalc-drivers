@@ -56,7 +56,7 @@
  *      7  right sample in; clamp right
  *      8  work out read_idx
  *      9  publish read_idx
- *     (10, 11 in PROFILE builds: publish the profile figures)
+ *     (10-12 in PROFILE builds: publish the profile figures, count the sample)
  *   Left and right change one tick apart. On an underrun step 4 stays on the
  *   same frame, step 5 fetches it again and the output holds; at the start of
  *   a stream that frame is the one before read_idx, which the host zeroes.
@@ -72,6 +72,8 @@
  *   SysTick count seen at the end of its work and whether it ran into the
  *   next tick, and the host driver reports both when a stream ends. That
  *   costs about 17 cycles per tick, 9 of which are included in the figure.
+ *   It also logs every overrun and every empty-ring event with the sample
+ *   number it happened in (shmem.h, M0_TRACE_ADDR); m0trace reads the log.
  *   Measured that way at a 187.5 MHz core clock: as TCM every tick fits in
  *   59 cycles (3.2 MHz) and not in 57; in bus mode in 156 (1.2 MHz) and not
  *   in 134. A tick that overruns only delays its own edge and the next tick
@@ -140,10 +142,27 @@ m0_play_state:
 	add	r7, r12			@ both-high word minus the bits that are 0
 	.endm
 
+/* PROFILE builds: append (sample number << 5) | code to the event log.
+ * Uses r6, r7. Two bus writes, so only for things that are already slow. */
+	.macro	TRACE_EVENT code
+	ldr	r7, [sp, #PS_EVENTS]
+	adds	r7, #1
+	str	r7, [sp, #PS_EVENTS]
+	ldr	r6, [sp, #PS_K_TRACE]
+	str	r7, [r6]		@ word 0: events so far
+	lsls	r7, r7, #24
+	lsrs	r7, r7, #22		@ (n & 255) * 4
+	adds	r6, r6, r7
+	ldr	r7, [sp, #PS_SAMPLE_NO]
+	lsls	r7, r7, #5
+	adds	r7, #\code
+	str	r7, [r6, #4]
+	.endm
+
 /* End of a tick's work, PROFILE builds: already pending means the tick
  * overran; otherwise remember the lowest SysTick count, i.e. the longest
  * tick so far. Uses r6, r7. */
-	.macro	PROFILE_TICK
+	.macro	PROFILE_TICK code
 #ifdef M0_PROFILE
 	mov	r7, r10
 	ldr	r6, [r7]
@@ -152,6 +171,7 @@ m0_play_state:
 	ldr	r6, [sp, #PS_OVERRUNS]
 	adds	r6, #1
 	str	r6, [sp, #PS_OVERRUNS]
+	TRACE_EVENT \code
 	b	2f
 1:	ldr	r7, [sp, #PS_K_CVR]
 	ldr	r6, [r7]
@@ -169,8 +189,8 @@ m0_play_state:
 	mov	r11, r7			@ park the GPIO word
 	.endm
 
-	.macro	STEP_END
-	PROFILE_TICK
+	.macro	STEP_END code
+	PROFILE_TICK \code
 	mov	r7, r11
 	mov	r6, lr
 	.endm
@@ -218,6 +238,14 @@ m0_play:
 	str	r0, [sp, #PS_K_CLAMP]
 	ldr	r0, =SYST_CVR
 	str	r0, [sp, #PS_K_CVR]
+#ifdef M0_PROFILE
+	ldr	r0, =M0_TRACE_ADDR
+	str	r0, [sp, #PS_K_TRACE]
+	movs	r3, #0
+	str	r3, [r0]		@ empty log
+	str	r3, [sp, #PS_EVENTS]
+	str	r3, [sp, #PS_SAMPLE_NO]
+#endif
 
 	ldr	r0, [r1, #M0_SHMEM_READ_IDX]
 	ands	r0, r2			@ in range and frame aligned, whatever the host wrote
@@ -260,7 +288,7 @@ m0_play:
 	beq	1f
 	b	.L_stop
 1:
-	STEP_END
+	STEP_END 1
 
 	STEP				@ 2: plain ticks in this sample
 	ldr	r6, [sp, #PS_ACC]
@@ -270,13 +298,13 @@ m0_play:
 	ldr	r5, [sp, #PS_PLAIN]
 	movs	r7, #0			@ (leaves the carry alone)
 	adcs	r5, r7
-	STEP_END
+	STEP_END 2
 
 	STEP				@ 3: where is the host writing
 	ldr	r7, [sp, #PS_K_SHMEM]
 	ldr	r6, [r7, #M0_SHMEM_WRITE_IDX]
 	str	r6, [sp, #PS_WIDX]
-	STEP_END
+	STEP_END 3
 
 	STEP				@ 4: next frame, unless the ring is empty
 	ldr	r7, [sp, #PS_CUR]
@@ -285,17 +313,24 @@ m0_play:
 	ands	r7, r6
 	ldr	r6, [sp, #PS_WIDX]
 	cmp	r6, r7
+#ifdef M0_PROFILE
+	bne	3f
+	TRACE_EVENT M0_TRACE_UNDERRUN	@ empty: stay on the current frame
+	b	1f
+3:	str	r7, [sp, #PS_CUR]
+#else
 	beq	1f			@ empty: stay on the current frame
 	str	r7, [sp, #PS_CUR]
+#endif
 1:
-	STEP_END
+	STEP_END 4
 
 	STEP				@ 5: fetch it: L in [15:0], R in [31:16]
 	ldr	r7, [sp, #PS_CUR]
 	ldr	r6, [sp, #PS_K_RING]
 	ldr	r6, [r6, r7]
 	str	r6, [sp, #PS_FRAME]
-	STEP_END
+	STEP_END 5
 
 	STEP				@ 6: left
 	ldr	r6, [sp, #PS_FRAME]
@@ -304,7 +339,7 @@ m0_play:
 	subs	r6, r6, r7		@ x -= x >> 3 (7/8 headroom)
 	mov	r8, r6
 	CLAMP	r1
-	STEP_END
+	STEP_END 6
 
 	STEP				@ 7: right
 	ldr	r6, [sp, #PS_FRAME]
@@ -313,7 +348,7 @@ m0_play:
 	subs	r6, r6, r7
 	mov	r9, r6
 	CLAMP	r4
-	STEP_END
+	STEP_END 7
 
 	STEP				@ 8: read_idx = the frame after the current one
 	ldr	r6, [sp, #PS_CUR]
@@ -321,33 +356,39 @@ m0_play:
 	ldr	r7, [sp, #PS_K_MASK]
 	ands	r6, r7
 	str	r6, [sp, #PS_PUB]
-	STEP_END
+	STEP_END 8
 
 	STEP				@ 9: tell the host
 	ldr	r6, [sp, #PS_PUB]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_READ_IDX]
-	STEP_END
+	STEP_END 9
 
 #ifdef M0_PROFILE
 	STEP				@ 10
 	ldr	r6, [sp, #PS_MIN_CVR]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_STAT_MIN_CVR]
-	STEP_END
+	STEP_END 10
 
 	STEP				@ 11
 	ldr	r6, [sp, #PS_OVERRUNS]
 	ldr	r7, [sp, #PS_K_SHMEM]
 	str	r6, [r7, #M0_SHMEM_STAT_OVERRUNS]
-	STEP_END
+	STEP_END 11
+
+	STEP				@ 12
+	ldr	r6, [sp, #PS_SAMPLE_NO]
+	adds	r6, #1
+	str	r6, [sp, #PS_SAMPLE_NO]
+	STEP_END 12
 #endif
 
 .L_plain:				@ r5 plain ticks, at least one
 	TICK
 #ifdef M0_PROFILE
 	mov	r11, r7
-	STEP_END
+	STEP_END M0_TRACE_PLAIN
 #else
 	mov	r6, lr
 #endif

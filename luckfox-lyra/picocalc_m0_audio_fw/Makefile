@@ -44,6 +44,13 @@ check: check_ring check_dsm
 check_ring: check_ring.c
 	$(HOSTCC) -O2 -Wall -Wextra -o $@ $<
 
+# Reader for the PROFILE build's event log. Cross-compile for the board, e.g.
+#   make m0trace LINUX_CC=arm-linux-gnueabihf-gcc
+LINUX_CC ?= cc
+
+m0trace: m0trace.c
+	$(LINUX_CC) -O2 -Wall -Wextra -o $@ $<
+
 check_dsm: check_dsm.c $(HDRS)
 	$(HOSTCC) -O2 -Wall -Wextra -o $@ $< -lm
 
@@ -55,6 +62,6 @@ check-emu: $(ELF)
 	$(PYTHON) check_play.py $(ELF)
 
 clean:
-	rm -f $(OBJS) $(ELF) check_ring check_dsm
+	rm -f $(OBJS) $(ELF) check_ring check_dsm m0trace
 
 .PHONY: all clean check check-emu

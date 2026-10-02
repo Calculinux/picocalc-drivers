@@ -64,9 +64,22 @@
 #define M0_SHMEM_STAT_OVERRUNS 60
 
 /* One sample must last at least this many ticks: play.S gives each step of
- * the per-sample work a tick of its own (11 in a PROFILE build) and needs one
+ * the per-sample work a tick of its own (12 in a PROFILE build) and needs one
  * more. */
-#define M0_MIN_TICKS_PER_SAMPLE 12
+#define M0_MIN_TICKS_PER_SAMPLE 13
+
+/*
+ * Event log of a PROFILE=1 firmware, in the SRAM after the ring; read it with
+ * m0trace. Word 0 counts the events since the stream started; event n is in
+ * word 1 + (n & (M0_TRACE_ENTRIES - 1)), as (sample number << 5) | code:
+ *   1..12  that step tick was still working when the next tick fell due
+ *   31     a plain tick was
+ *   30     the ring was empty when the firmware wanted the next frame
+ */
+#define M0_TRACE_ADDR     (M0_SHMEM_ADDR + M0_U32(0x2100))
+#define M0_TRACE_ENTRIES  256
+#define M0_TRACE_UNDERRUN 30
+#define M0_TRACE_PLAIN    31
 
 #ifndef __ASSEMBLER__
 typedef struct {
