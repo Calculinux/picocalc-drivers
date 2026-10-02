@@ -49,12 +49,15 @@
                 remote-proc = <&mcu_rproc>;
                 ring-buffer-bytes = <8192>;
                 /* 74 = HCLK_M0, the M0 core clock its SysTick counts: the
-                 * driver derives the tick timing from its rate. */
-                clocks = <&cru 74>;
+                 * driver derives the tick timing from its rate.
+                 * 143 = PCLK_GPIO4, which clocks the pins: a tick has to be
+                 * a whole number of its periods. */
+                clocks = <&cru 74>, <&cru 143>;
+                clock-names = "core", "pin";
                 /* Output bit rate; see tick_hz in the driver, which makes
-                 * the tick an even number of core cycles: 62 at a 187.5 MHz
-                 * core clock, the shortest at which the firmware still
-                 * interpolates between samples. That needs the firmware
+                 * the tick a whole number of GPIO clock periods: 62 core
+                 * cycles at a 187.5 MHz core clock, the shortest at which
+                 * the firmware still interpolates between samples. That needs the firmware
                  * running as TCM (rockchip,tcm below); without, use
                  * 1000000. A PROFILE=1 firmware needs 2929688 or less. */
                 tick-rate-hz = <3000000>;

@@ -141,16 +141,51 @@ tick), from `clk_get_rate()` of `hclk_m0` and its `tick_hz` parameter (also
 applies from the next stream, so rates can be tried without touching the
 firmware.
 
-**A tick must be an even number of core cycles.** The GPIO block is clocked
-by `pclk_gpio4`, 93.75 MHz, half the M0's 187.5 MHz, so a pin can only
+**A tick must be a whole number of GPIO clock periods.** The GPIO block is
+clocked by `pclk_gpio4`, 93.75 MHz, half the M0's 187.5 MHz, so a pin can only
 change on every second core cycle. With an odd count (the 63 cycles that
 3 MHz first came out as) every other bit is a core cycle, 5.3 ns, late. A
 regular error like that brings the modulator's ultrasonic noise down into
 the audio band: in simulation the noise under a -40 dBFS tone goes from
--79 dBFS to -40 dBFS. The driver therefore rounds to an even count
-(`tick_even`, on by default; turn it off to hear the difference). Not yet
-confirmed by ear or measurement on the board; the clock rates are from
-`clk_summary`.
+-79 dBFS to -40 dBFS. The driver therefore makes the tick a multiple of the
+ratio of the two clocks, which it reads (`clocks = core, pin` in the device
+tree): 2 as the SoC boots, 4 with the core clock doubled (below).
+`tick_even`, on by default, can be turned off to hear the difference. By ear
+this is what removed the hiss.
+
+### A faster core clock
+
+`hclk_m0` is `aclk_bus_root` (which also clocks the system SRAM and the DMA
+controllers), and that is `clk_gpll_div`, GPLL / 8, undivided. `clk_gpll_div`
+also feeds the low-speed peripheral bus and several peripheral clocks, each
+through a divider of its own. Halving every one of those and then setting
+`clk_gpll_div` to GPLL / 4 leaves them all where they were and puts the M0 at
+375 MHz, with the GPIO clock exactly a quarter of it. `picocalc_m0_diag_fw/
+m0clk` is a module that does that through the clock framework when loaded
+and undoes it when removed. **An experiment**: the TRM gives no limit for this
+clock.
+
+Measured on the board at 375 MHz, firmware as TCM:
+
+| | 187.5 MHz | 375 MHz |
+|---|---|---|
+| straight-line instruction | 1 cycle | 1 cycle |
+| SRAM read, absolute address | 7 cycles (37 ns) | 7 cycles (19 ns) |
+| GPIO write, blocking | 31 cycles (165 ns), no jitter | 49 cycles (131 ns), no jitter |
+| WFI wake jitter | 0 | 0 |
+| core cycles in a 3.02 MHz tick | 62 | 124 |
+
+The audio firmware plays at 375 MHz with a 124-cycle tick and keeps exact
+pace; the display and its DMA work; the delays a display flood causes are
+the same in nanoseconds. That is all the testing it has had. The board
+**hung once** at 375 MHz, while the display's SPI controller was being
+unbound and bound to another driver (the same operation had worked at
+375 MHz minutes earlier); whether the clock was the cause is not known.
+Nothing is known about margins, temperature or power.
+
+What it would buy: the uncorrected loop needs 44 to 56 of the 124 cycles. A
+correction for late pin writes (below) needs the blocking write, 49 cycles
+here, and about 70 more, which is close to fitting at 3 MHz.
 
 ## Playback loop (`play.S`)
 
@@ -460,7 +495,8 @@ the next pin word 21: 37 for the core of a tick. A plain tick is 44 with
 the loop; a step tick 49 to 56. The tick is 62, set by the step ticks and,
 for interpolation, by a sample having to fit in 64 ticks; there is little
 to gain for plain playback. A correction for late pin writes would add the
-blocking write (26) and about 35 of arithmetic on every tick.
+blocking write (26) and about 35 of arithmetic on every tick; see "A
+faster core clock" for what doubling the M0's clock does to that.
 
 `poptest.sh` in the test directory on the board plays silence in phases
 marked by beeps while it freezes the display, stops the keyboard polling,

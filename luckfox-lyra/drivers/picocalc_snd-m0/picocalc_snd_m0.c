@@ -63,17 +63,21 @@ module_param(tick_hz, uint, 0644);
 MODULE_PARM_DESC(tick_hz, "M0 output bit rate in Hz (default 1000000)");
 
 /*
- * The GPIO block the M0 writes its pins through is clocked at half the M0's
- * core clock, so a pin can only change on every second core cycle. With an
- * odd number of core cycles per tick every other bit comes out a core cycle
- * late, and a regular error like that brings the modulator's ultrasonic noise
- * down into the audio band (in simulation: from -79 to -40 dBFS at 63
- * cycles). So the tick is made an even number of cycles. Off: the nearest
- * number, even or odd, to hear the difference. Next playback start.
+ * The GPIO block the M0 writes its pins through has a slower clock than the
+ * M0's core (a half of it as the SoC boots, a quarter with the core clock
+ * doubled), so a pin can only change on every second or fourth core cycle.
+ * If a tick is not a whole number of GPIO clock periods, some bits come out
+ * a core cycle or more late in a regular pattern, and that brings the
+ * modulator's ultrasonic noise down into the audio band (in simulation: from
+ * -79 to -40 dBFS at 63 cycles and a GPIO clock of half the core clock; by
+ * ear, plain hiss). So the tick is made a multiple of the ratio of the two
+ * clocks ("pin" clock in the device tree; 2 if there is none). Off: the
+ * nearest number of cycles whatever it is, to hear the difference. Next
+ * playback start.
  */
 static bool tick_even = true;
 module_param(tick_even, bool, 0644);
-MODULE_PARM_DESC(tick_even, "Round the tick to an even number of core clock cycles (default on)");
+MODULE_PARM_DESC(tick_even, "Make the tick a whole number of GPIO clock periods (default on)");
 
 /*
  * Between two samples the firmware moves its modulator input towards the
@@ -141,6 +145,7 @@ struct picocalc_m0 {
 	struct snd_pcm_substream *substream;
 	struct rproc *rproc;
 	struct clk *core_clk;      /* hclk_m0: what the M0's SysTick counts */
+	struct clk *pin_clk;       /* pclk of the GPIO bank: when a pin can change */
 	uint32_t tick_cycles;      /* as last given to the firmware */
 	struct m0_audio_shmem *shmem;
 	void *shmem_virt;  /* device mapping of the SRAM: header and ring */
@@ -195,10 +200,18 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 	u64 den64;
 
 	if (hclk && hz) {
-		if (READ_ONCE(tick_even))
-			cycles = 2 * DIV_ROUND_CLOSEST(hclk, 2 * (unsigned long)hz);
-		else
-			cycles = DIV_ROUND_CLOSEST(hclk, hz);
+		unsigned long pclk = m->pin_clk ? clk_get_rate(m->pin_clk) : 0;
+		unsigned long step = 2;
+
+		if (pclk && pclk <= hclk && hclk % pclk == 0)
+			step = hclk / pclk;
+		else if (pclk)
+			dev_warn_once(&m->pdev->dev,
+				      "core clock %lu Hz is not a multiple of the pin clock %lu Hz: expect noise\n",
+				      hclk, pclk);
+		if (!READ_ONCE(tick_even))
+			step = 1;
+		cycles = step * DIV_ROUND_CLOSEST(hclk, step * (unsigned long)hz);
 		den64 = (u64)cycles * M0_FIXED_SAMPLE_RATE_HZ;
 		if (cycles >= 2 && cycles <= M0_MAX_TICK_CYCLES && den64 <= U32_MAX) {
 			den = den64;
@@ -813,6 +826,11 @@ static int m0_probe(struct platform_device *pdev)
 	m->core_clk = devm_clk_get_optional(dev, NULL);
 	if (IS_ERR(m->core_clk)) {
 		ret = PTR_ERR(m->core_clk);
+		goto put_rproc;
+	}
+	m->pin_clk = devm_clk_get_optional(dev, "pin");
+	if (IS_ERR(m->pin_clk)) {
+		ret = PTR_ERR(m->pin_clk);
 		goto put_rproc;
 	}
 	of_property_read_u32(np, "tick-rate-hz", &tick_hz);
