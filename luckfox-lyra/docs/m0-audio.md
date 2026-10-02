@@ -260,10 +260,31 @@ make PROFILE=1                         # then load it (bus mode, or TCM after a 
 aplay something.wav; m0trace -p 1024
 ```
 
+The log says when a tick was late, not by how much. For that the driver
+compares the frames the M0 played with the time they should have taken, with
+any firmware, and prints it when a stream ends:
+
+```
+M0 played 479232 frames in 9984000 us: 0 us behind (0 us per second)
+```
+
+The two clocks come from the same crystal, so "behind" is time the M0 spent
+stalled (or, in mid stream, with an empty ring, which the log shows
+separately), good to one frame, 21 us. A few stretched ticks a second of a
+fraction of a tick each are below that; stalls long enough to hear are not.
+
+`ring_wc=0` on the sound module maps the ring as device memory and writes it
+a word at a time instead of in write-combined bursts, to tell whether the
+M0's reads are waiting behind those bursts.
+
 What is known so far (TCM, 3 MHz): 15-20 stretched ticks a second, the same
 with the heartbeat LED trigger on or off, more with shorter ALSA periods.
 In simulation the modulator produces no burst of in-band noise when its
-input drops to digital silence.
+input drops to digital silence. By ear: the ticking is there when playing
+digital silence and gone when nothing plays (the pins are then low), it does
+not change with the tick rate or the heartbeat LED, and it comes about half
+as often with `aplay --period-size=256 --buffer-size=1024`; each occurrence
+is about five ticks close together.
 
 ## Open issues
 
@@ -283,6 +304,11 @@ input drops to digital silence.
    that exact; same caveat.
 6. **Stretched ticks** in TCM mode (15-20 a second): they follow the host's
    ring updates in number; which step and when is what `m0trace` is for.
-7. **Audible artefacts reported**: a rhythmic ticking roughly every half
-   second, and brief static when a sound stops. Causes not yet found.
-8. **ALDO4 margin**, above.
+7. **Audible ticking** roughly every half second while a stream plays, even
+   of silence. Since the data is zeros it must be the bit timing; that it
+   follows the ALSA period points at the host's ring updates. Not yet
+   confirmed: the "behind" figure and `ring_wc=0` above are the test.
+8. **Pop when a stream ends** (and presumably when it starts): the pins go
+   from the 50% pattern of silence to low, a DC step through the output
+   capacitor. Needs a ramp between the two.
+9. **ALDO4 margin**, above.
