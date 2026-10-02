@@ -44,9 +44,9 @@
 #define PS_FADDR      128 /* address of the frame being played */
 /* m0_play_comp only */
 #define PS_C0         132 /* SysTick count straight after an on-time pin write */
-#define PS_K_HIGH     136 /* GPIO word, both high */
-#define PS_DSUM       140 /* the lateness of every plain tick's pin write, added up */
-#define PS_SIZE       144
+#define PS_DSUM       140 /* COMP_STATS=1: the lateness of every plain tick's pin write, added up */
+#define PS_HIST       144 /* COMP_STATS=2: how many plain ticks' writes were 0, 4, 8, ... cycles late */
+#define PS_SIZE       (144 + 128)
 
 /*
  * Ticks at the start of every sample that each carry one step of the
@@ -66,12 +66,19 @@
  * sample may last at most 2^shift ticks; the state has room for this much. */
 #define M0_MAX_SHIFT  6
 
-/* m0_play_comp(): a tick is exactly this many core cycles (2^7), the shift is
- * M0_MAX_SHIFT, and the count of an on-time pin write is taken from this many
- * ticks before anything is played. */
+/* m0_play_comp(): a tick is exactly this many core cycles (2^7), samples are
+ * held (shift 0) and take this many steps. Before anything is played it looks
+ * for the SysTick count of an on-time pin write: the first count to come
+ * M0_COMP_CAL_RUN times running, within M0_COMP_CAL_TICKS ticks. */
 #define M0_COMP_LOG2_CYCLES 7
 #define M0_COMP_CYCLES      (1 << M0_COMP_LOG2_CYCLES)
-#define M0_COMP_CAL_TICKS   16
+#define M0_COMP_STEPS       13
+#define M0_COMP_CAL_RUN     4
+#define M0_COMP_CAL_TICKS   200
+
+#ifndef M0_COMP_STATS
+#define M0_COMP_STATS 0
+#endif
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>
@@ -83,8 +90,9 @@ extern uint32_t m0_play_state[PS_SIZE / 4];
  * Returns when shmem->ctrl leaves M0_CTRL_PLAY, pins as the last tick left them. */
 void m0_play(void);
 /* The same, timing each pin write and correcting for late ones (play.S). Also
- * needs: a tick of M0_COMP_CYCLES, PS_SHIFT = M0_MAX_SHIFT, the M0's bus
- * writes not bufferable. Not in PROFILE builds. */
+ * needs: a tick of M0_COMP_CYCLES, PS_SHIFT = 0, PS_PLAIN counted from
+ * M0_COMP_STEPS, the M0's bus writes not bufferable. Holds each sample
+ * whatever PS_DX_MASK says. Not in PROFILE builds. */
 void m0_play_comp(void);
 #endif
 

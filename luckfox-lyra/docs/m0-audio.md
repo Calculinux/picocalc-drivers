@@ -188,9 +188,13 @@ an earlier version of the module that did not yet cap the other clocks (the
 same operation had worked at 375 MHz minutes earlier); whether the clock was
 the cause is not known. Nothing is known about margins or power.
 
-What it would buy: the uncorrected loop needs 44 to 56 of the 124 cycles. A
-correction for late pin writes (below) needs the blocking write, 49 cycles
-here, and about 70 more, which is close to fitting at 3 MHz.
+What it buys: the uncorrected loop needs 44 to 52 of the 124 cycles, and
+there is room for the loop that corrects late pin writes ("Correcting for
+late pin writes"), which is what it is for.
+
+Binding the display's SPI controller to another driver with the clock
+already raised hung the board both times it was tried; doing that first and
+raising the clock afterwards has worked every time.
 
 ## Playback loop (`play.S`)
 
@@ -465,17 +469,70 @@ edges, a click. Simulated at 3 MHz under a -40 dBFS tone, a quarter of the
 pin writes late by up to 72 cycles puts the in-band noise at -22 dBFS for as
 long as it lasts; 2 % late, -32 dBFS.
 
-The M0 can see the delay (the write returns late when it is not
-bufferable), so the firmware could measure each one and put what a late
-edge cost back into the modulator, which shapes the error out of the audio
-band: simulated, -22 dBFS becomes -70. A first version is on the branch
-`m0-audio-comp-wip` and **does not work**: it corrects only on late ticks, in
-more cycles than a tick has to spare, so one late tick makes the next late
-or loses it. A working one has to do the correction on every tick, with the
-pin write blocking (25 cycles more than now), and needs a tick of about 128
-core cycles: 1.46 MHz, with the quiet-system noise floor near -64 dBFS
-instead of -79.5. Not worth it as it stands; it depends on getting the loop
-shorter first.
+### Correcting for late pin writes
+
+The M0 can see the delay: with its bus writes not bufferable, a pin write
+returns when the pin has changed, and the SysTick count read after it says
+when that was. `m0_play_comp()` in `play.S` is a second copy of the playback
+loop built on that. Every tick it works out by how much the lateness changed
+since the previous write (which is by how much the level that just ended
+lasted longer or shorter than a tick) and takes that fraction of the level's
+feedback out of both integrators, so the modulator treats the bit as what it
+really delivered and shapes the error out of the audio band. It does this on
+every tick, late or not, with no branch on the lateness, so a tick always
+costs the same; the tick is exactly 128 core cycles, which makes the
+arithmetic shifts by constants. `comp=1` on the sound module selects it
+(default off; it needs all of the following).
+
+What it needs, each established on the board:
+
+1. **The M0 at 375 MHz** ("A faster core clock"): the blocking write takes
+   49 cycles of the tick, and at 187.5 MHz a 128-cycle tick is 1.46 MHz.
+   At 375 MHz it is 2.93 MHz.
+2. **Cycles to spare on every tick.** A late write holds the loop up as well
+   as the pin. If writes are late by more on average than the loop has
+   spare, it falls further and further behind, which is far worse than not
+   correcting. So this loop holds each sample (no interpolation), has 13
+   steps and keeps its constants in registers: about 17 cycles spare on a
+   plain tick, 10 on the longest step.
+3. **One-word DMA bursts in the display's SPI driver** (above). With the
+   driver's own 16-word bursts the loop fell 89 ms a second behind during a
+   console flood.
+4. **The display's SPI clock at 31.25 MHz or less** (it asks for 80 MHz and
+   gets 46.9; the driver's divider gives 46.9, 31.25, 23.4, ...). At
+   46.9 MHz the display's DMA and the M0's now blocking writes saturate the
+   bus between them.
+
+Console flood, one-word bursts, how late the plain ticks' pin writes were
+(`COMP_STATS=2` build, which has 7 cycles spare instead of 17) and the pace:
+
+| Display SPI clock | On time | Late by 64 cycles or more | Mean | Behind, over 10 s |
+|---|---|---|---|---|
+| (no flood) | 100.0 % | 0 | 0.0 cycles | 2 us |
+| 46.9 MHz | 26 % | 21.75 % | 34 cycles | 102 ms |
+| 31.25 MHz | 73 % | 0.03 % | 4.1 cycles | 0.15 ms |
+| 23.4 MHz | 81 % | 0.01 % | 2.7 cycles | 0.10 ms |
+
+With the normal build: 31.25 MHz, 84 us behind over 10 s of flood (as good
+as none); 46.9 MHz, 5 ms. In simulation the correction takes a redraw's noise
+under a -40 dBFS tone from -36 dBFS to -72 (16 % of writes up to 32 cycles
+late). By ear, with an earlier and worse version of the loop: a tone played
+through a console flood was "not affected at all".
+
+`check_play.py` runs this loop too, puts late writes in by setting the
+SysTick count it reads, and checks both that the firmware matches the model
+and, from the pin writes alone, that the late edges are cancelled (a model
+sharing a sign error with the firmware would pass the first).
+
+Debug builds: `make COMP_STATS=1` adds up the lateness (the driver prints it
+when a stream ends); `COMP_STATS=2` counts how often each lateness occurred
+and leaves the 32 counts at `M0_TRACE_ADDR`.
+
+Where this lives outside this repository: the SPI burst length is a kernel
+change (`docs/spi-rockchip-tx-burst.patch` is the change that was tested, as
+a module parameter); the display's SPI clock is `spi-max-frequency` in the
+board device tree (32000000); the 375 MHz clock is so far only the
+experiment module.
 
 **The SPI SD card is the worst offender.** While `mmc1` is being read the M0
 does not just get late edges, it falls about 2 % behind (20 ms a second,
@@ -549,11 +606,12 @@ burst of in-band noise when its input drops to digital silence.
 6. **Sample timing.** Sample changes are snapped to the tick grid. A bus
    clock that is a multiple of 48 kHz (the 1179.648 MHz audio PLL) would make
    that exact; same caveat.
-7. **Pops from late pin writes**: display redraws, the SPI SD card and
-   Linux's GPIO writes delay the M0's pin write; see "Pops: what delays the
-   pin write". Audible as faint random pops in normal use. A correction in
-   the firmware is possible in principle and too expensive in cycles as the
-   loop stands.
+7. **Pops from late pin writes**: the display's SPI traffic, the SPI SD
+   card and Linux's GPIO writes delay the M0's pin write. There is a
+   correction (`comp=1`, "Correcting for late pin writes") that works for
+   the display given a 375 MHz core clock, one-word DMA bursts and a
+   31.25 MHz display clock, none of which is in place by default. The SPI SD
+   card is not dealt with.
 8. **Bus mode** has not been run with `ring_sync` or with interpolation;
    the measurements are all TCM.
 9. **Pop when a stream ends** (and presumably when it starts): the pins go

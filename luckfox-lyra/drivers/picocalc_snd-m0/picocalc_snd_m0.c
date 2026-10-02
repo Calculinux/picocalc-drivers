@@ -49,11 +49,11 @@
 #define M0_FLAG_NO_INTERP        1U
 #define M0_FLAG_COMP             2U
 #define M0_STAT_LATE_NONE        0xFFFFFFFFU
-/* The firmware's corrected loop is written for this tick and at most this
- * many ticks per sample (play.S, m0_play_comp) */
+#define M0_STAT_LATE_UNKNOWN     0xFFFFFFFEU
+/* The firmware's corrected loop is written for this tick; it has this many
+ * step ticks per sample, the rest being plain ones (play.S, m0_play_comp) */
 #define M0_COMP_CYCLES           128U
-#define M0_COMP_MAX_TICKS        63U
-#define M0_ALL_STEP_TICKS        19U         /* of a sample's ticks, not plain ones */
+#define M0_COMP_STEPS            13U
 #define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
 
 /*
@@ -103,8 +103,8 @@ MODULE_PARM_DESC(tick_even, "Make the tick a whole number of GPIO clock periods 
  * 128 core cycles, which is only fast enough with the M0's clock raised to
  * 375 MHz (2.93 MHz; picocalc_m0_diag_fw/m0clk): comp_min_hz is the slowest
  * bit rate at which it is used, and at the stock 187.5 MHz the driver plays
- * uncorrected at tick_hz instead. Not with a PROFILE=1 firmware. Next
- * playback start.
+ * uncorrected at tick_hz instead. It holds each sample (no interpolation: it
+ * has no cycles for it). Not with a PROFILE=1 firmware. Next playback start.
  *
  * Off by default: timing a pin write means waiting for it, so a late write
  * holds the firmware's loop up too, and the loop has only a few cycles per
@@ -257,11 +257,10 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		if (!READ_ONCE(tick_even))
 			step = 1;
 		cycles = step * DIV_ROUND_CLOSEST(hclk, step * (unsigned long)hz);
-		/* The corrected loop: one tick length only, a whole number of
-		 * GPIO clock periods, a sample of no more than 63 ticks */
+		/* The corrected loop: one tick length only, which has to be a
+		 * whole number of GPIO clock periods */
 		if (READ_ONCE(comp) && M0_COMP_CYCLES % step == 0 &&
-		    hclk / M0_COMP_CYCLES >= READ_ONCE(comp_min_hz) &&
-		    hclk / (M0_COMP_CYCLES * M0_FIXED_SAMPLE_RATE_HZ) <= M0_COMP_MAX_TICKS) {
+		    hclk / M0_COMP_CYCLES >= READ_ONCE(comp_min_hz)) {
 			cycles = M0_COMP_CYCLES;
 			with_comp = true;
 		}
@@ -354,8 +353,11 @@ static void m0_report_pace(struct picocalc_m0 *m)
 	if (late == M0_STAT_LATE_NONE || !m->tick_ticks) {
 		dev_info(&m->pdev->dev, "pin writes: %u core cycles per tick, not timed%s\n",
 			 m->tick_cycles, m->comp ? " (firmware cannot: PROFILE build?)" : "");
+	} else if (late == M0_STAT_LATE_UNKNOWN) {
+		dev_info(&m->pdev->dev, "pin writes: %u core cycles per tick, timed and corrected\n",
+			 m->tick_cycles);
 	} else {
-		u64 ticks = frames * (m->tick_ticks - M0_ALL_STEP_TICKS);
+		u64 ticks = frames * (m->tick_ticks - M0_COMP_STEPS);
 
 		dev_info(&m->pdev->dev,
 			 "pin writes: %u core cycles per tick, timed and corrected; late by %u cycles in all, %llu per 1000 ticks\n",

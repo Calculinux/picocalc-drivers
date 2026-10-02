@@ -71,10 +71,12 @@
 /* flags */
 #define M0_FLAG_NO_INTERP 1   /* hold each sample; default is to ramp to the next */
 /* Time every pin write and correct for late ones (play.S, m0_play_comp). Only
- * with tick_cycles = 128 and at most 63 ticks per sample, and not in a PROFILE
- * build: otherwise the firmware plays uncorrected and says so in stat_late. */
+ * with tick_cycles = 128, and not in a PROFILE build: otherwise the firmware
+ * plays uncorrected and says so in stat_late. Samples are then held, whatever
+ * M0_FLAG_NO_INTERP says. */
 #define M0_FLAG_COMP      2
-#define M0_STAT_LATE_NONE M0_U32(0xFFFFFFFF)  /* stat_late: played uncorrected */
+#define M0_STAT_LATE_NONE    M0_U32(0xFFFFFFFF)  /* stat_late: played uncorrected */
+#define M0_STAT_LATE_UNKNOWN M0_U32(0xFFFFFFFE)  /* corrected; not built with COMP_STATS=1 */
 
 /*
  * Event log of a PROFILE=1 firmware, in the SRAM after the ring; read it with
@@ -114,7 +116,8 @@ typedef struct {
 	volatile uint32_t ticks_frac;
 	/*
 	 * Written by the firmware when a stream ends. M0_STAT_LATE_NONE if it
-	 * played uncorrected; else the lateness, in core cycles, of all its pin
+	 * played uncorrected, M0_STAT_LATE_UNKNOWN if corrected; a COMP_STATS=1
+	 * build instead gives the lateness, in core cycles, of all its pin
 	 * writes on plain ticks added up (modulo 2^32).
 	 */
 	volatile uint32_t stat_late;

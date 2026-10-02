@@ -25,7 +25,8 @@ _Static_assert(__builtin_offsetof(m0_audio_shmem_t, read_idx) == M0_SHMEM_READ_I
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_min_cvr) == M0_SHMEM_STAT_MIN_CVR, "stat_min_cvr");
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_overruns) == M0_SHMEM_STAT_OVERRUNS, "stat_overruns");
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, buffer) == M0_HEADER_SIZE, "header");
-_Static_assert(DSM_FS_SHIFT + M0_MAX_SHIFT >= M0_COMP_LOG2_CYCLES, "comp scaling");
+_Static_assert(DSM_FS_SHIFT >= M0_COMP_LOG2_CYCLES, "comp scaling");
+_Static_assert(M0_MIN_TICKS_PER_SAMPLE > M0_COMP_STEPS, "a sample needs a plain tick too");
 _Static_assert((M0_RING_BYTES & (M0_RING_BYTES - 1U)) == 0, "ring size must be a power of two");
 _Static_assert(M0_IDLE_CYCLES <= SYST_MAX + 1U, "idle period does not fit SysTick");
 
@@ -64,7 +65,7 @@ static int tick_start(const m0_audio_shmem_t *shmem)
 	uint32_t cycles = shmem->tick_cycles;
 	uint32_t base = shmem->ticks_base;
 	uint32_t frac = shmem->ticks_frac;
-	uint32_t shift = 0, interp = ~0U;
+	uint32_t shift = 0, interp = ~0U, steps = M0_STEP_TICKS;
 	int comp = 0;
 
 	if (cycles < 2U || cycles > SYST_MAX + 1U || base < M0_MIN_TICKS_PER_SAMPLE) {
@@ -87,16 +88,16 @@ static int tick_start(const m0_audio_shmem_t *shmem)
 	if (!interp)
 		shift = 0;
 #ifndef M0_PROFILE
-	/* The corrected loop is written for one tick length and one shift
-	 * (play.S); with those, holding has to live with the smaller headroom. */
-	if ((shmem->flags & M0_FLAG_COMP) && cycles == M0_COMP_CYCLES &&
-	    base + 1U <= (1U << M0_MAX_SHIFT)) {
+	/* The corrected loop is written for one tick length; it holds each
+	 * sample and has fewer steps (play.S). */
+	if ((shmem->flags & M0_FLAG_COMP) && cycles == M0_COMP_CYCLES) {
 		comp = 1;
-		shift = M0_MAX_SHIFT;
+		shift = 0;
+		steps = M0_COMP_STEPS;
 	}
 #endif
 	m0_play_state[PS_FRAC / 4] = frac;
-	m0_play_state[PS_PLAIN / 4] = base - M0_STEP_TICKS;
+	m0_play_state[PS_PLAIN / 4] = base - steps;
 	m0_play_state[PS_SHIFT / 4] = shift;
 	m0_play_state[PS_DX_MASK / 4] = interp;
 	tick_set(cycles);
@@ -138,7 +139,16 @@ int main(void)
 			/* Blocking writes: the loop times each pin write */
 			REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
 			m0_play_comp(); /* until ctrl != PLAY */
+#if M0_COMP_STATS == 1
 			shmem->stat_late = m0_play_state[PS_DSUM / 4];
+#else
+			shmem->stat_late = M0_STAT_LATE_UNKNOWN;
+#endif
+#if M0_COMP_STATS == 2
+			/* The histogram, where the PROFILE build keeps its log */
+			for (uint32_t i = 0; i < M0_COMP_CYCLES / 4; i++)
+				REG(M0_TRACE_ADDR + 4 * i) = m0_play_state[PS_HIST / 4 + i];
+#endif
 #endif
 		} else {
 			/* Let bus writes complete behind our back: the GPIO write

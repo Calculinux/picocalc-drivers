@@ -129,14 +129,24 @@
  *   noise to -60, or to -72 with the display's DMA bursts shortened). It is
  *   done on every tick, late or not, without a branch that depends on d: a
  *   tick always costs the same and a late one cannot make the next late.
- *   Requires a tick of exactly 128 core cycles and a shift of 6 (the two
- *   make "modulo the tick" and "FS * delta / tick" shifts by a constant):
- *   2.93 MHz at a 375 MHz core clock, where the blocking write takes 49 of
- *   the 128 cycles. SysTick's pending bit is cleared before the write, so
- *   that a write that lands after the next tick cannot wipe that tick out.
- *   The count that means "on time" is the highest of the first ticks of each
- *   stream. r12 holds the previous d plus the word written then; the tick
- *   starts with its word in r11, not r7. Not in PROFILE builds.
+ *   Requires a tick of exactly 128 core cycles (which makes "modulo the
+ *   tick" and "FS * delta / tick" shifts by a constant): 2.93 MHz at a
+ *   375 MHz core clock, where the blocking write takes 49 of the 128 cycles.
+ *   SysTick's pending bit is cleared before the write, so that a write that
+ *   lands after the next tick cannot wipe that tick out. The count that means
+ *   "on time" is found at the start of each stream: the first to come four
+ *   times running.
+ *   A late write holds this loop up as well, so it needs cycles to spare on
+ *   every tick, more than the writes are late by on average (3.5 cycles while
+ *   the display is redrawn with one-word DMA bursts, measured), or it falls
+ *   further and further behind. Hence no interpolation here: each sample is
+ *   held (shift 0), which saves the two adds and leaves r10 and lr for the
+ *   both-high GPIO word and the on-time count; and fewer steps, M0_COMP_STEPS.
+ *   That leaves about 17 cycles on a plain tick and 10 on the longest step.
+ *   r12 holds the previous d plus the word written then; the tick starts with
+ *   its word in r11, not r7. Not in PROFILE builds. Built with COMP_STATS=1
+ *   the plain ticks also add up the lateness they see (5 cycles); with
+ *   COMP_STATS=2 they count how often each lateness occurred (10 cycles).
  *
  * LAYOUT
  *   The loop is longer than a Thumb branch reaches in a PROFILE build, so the
@@ -156,12 +166,16 @@
 	.equ	RING_IDX_MASK, M0_RING_BYTES - M0_FRAME_BYTES
 	.equ	PENDST_TO_SIGN, 31 - ICSR_PENDSTSET_BIT
 	.equ	S, M0_BUS_STEPS + M0_PROFILE_STEPS	@ number of the last SRAM step
-	.equ	COMP_LSL, DSM_FS_SHIFT + M0_MAX_SHIFT - M0_COMP_LOG2_CYCLES
+	.equ	COMP_LSL, DSM_FS_SHIFT - M0_COMP_LOG2_CYCLES
 	.equ	COMP_MOD, 32 - M0_COMP_LOG2_CYCLES
 
 /* For check_play.py, which has to know how this build schedules a sample */
 	.global	m0_step_ticks
 	.equ	m0_step_ticks, M0_STEP_TICKS
+#if M0_COMP_STATS == 1
+	.global	m0_comp_stats
+	.equ	m0_comp_stats, 1
+#endif
 
 	.section .bss.m0_play_state, "aw", %nobits
 	.align	3
@@ -172,9 +186,11 @@ m0_play_state:
 /* Both modulators: the bit each channel puts out next, as r7 = 0 or
  * -(1 << bit) per channel summed (the caller adds the both-high word). r11 is
  * used on the way. */
-	.macro	MODULATE
+	.macro	MODULATE interp
 	add	r0, r8			@ LEFT  i1 += x
+	.if	\interp
 	add	r8, r10			@       x += dx
+	.endif
 	adds	r1, r1, r0		@       y = i2 + i1
 	asrs	r7, r1, #31		@       s = 0 (bit 1) or -1 (bit 0)
 	mov	r6, r7
@@ -185,7 +201,9 @@ m0_play_state:
 	mov	r11, r7
 
 	add	r3, r9			@ RIGHT, same with r3/r4, r9/lr and B3
+	.if	\interp
 	add	r9, lr
+	.endif
 	adds	r4, r4, r3
 	asrs	r7, r4, #31
 	mov	r6, r7
@@ -207,7 +225,7 @@ m0_play_state:
 	str	r7, [r6]		@ OUTPUT, and wait until the pin has changed
 	ldr	r6, [sp, #PS_K_CVR]
 	ldr	r6, [r6]		@ when was that
-	ldr	r7, [sp, #PS_C0]
+	mov	r7, lr			@ the count when on time
 	subs	r6, r7, r6
 	lsls	r6, r6, #COMP_MOD
 	lsrs	r6, r6, #COMP_MOD	@ d = cycles late, modulo the tick
@@ -222,11 +240,13 @@ m0_play_state:
 	wfi
 	.if	\comp
 	WRITE_TIMED
+#if M0_COMP_STATS == 1
 	.if	\stats
 	ldr	r7, [sp, #PS_DSUM]
 	adds	r7, r7, r6
 	str	r7, [sp, #PS_DSUM]
 	.endif
+#endif
 	mov	r7, r12			@ the previous d + the word written then
 	mov	r12, r6
 	add	r12, r11		@ this d + this word, for the next tick
@@ -257,17 +277,28 @@ m0_play_state:
 	subs	r3, r3, r6
 	subs	r4, r4, r6
 9:
-	MODULATE
-	ldr	r6, [sp, #PS_K_HIGH]
-	adds	r7, r7, r6		@ both-high word minus the bits that are 0
+	MODULATE 0
+	add	r7, r10			@ both-high word minus the bits that are 0
 	mov	r11, r7
+#if M0_COMP_STATS == 2
+	.if	\stats
+	mov	r6, r12			@ this tick's d again (the word is bits 10 up)
+	lsls	r6, r6, #COMP_MOD
+	lsrs	r6, r6, #COMP_MOD
+	add	r7, sp, #PS_HIST
+	adds	r7, r7, r6		@ d is a multiple of 4 (the GPIO clock): a word offset
+	ldr	r6, [r7]
+	adds	r6, #1
+	str	r6, [r7]
+	.endif
+#endif
 	.else
 	str	r7, [r6]		@ OUTPUT: bits from the previous tick
 	ldr	r7, [sp, #PS_K_ICSR]
 	movs	r6, #1
 	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
 	str	r6, [r7]		@ tick taken: clear SysTick's pending bit
-	MODULATE
+	MODULATE 1
 	add	r7, r12			@ both-high word minus the bits that are 0
 	.endif
 	.endm
@@ -411,28 +442,41 @@ m0_play_state:
 #endif
 
 	.if	\comp
-	/* The SysTick count straight after an undisturbed pin write: the
-	 * highest of a few, since a disturbed one can only come later. */
-	ldr	r0, =GPIO4_DR_B23_HIGH
-	str	r0, [sp, #PS_K_HIGH]
+	/* The SysTick count straight after an undisturbed pin write: one that
+	 * comes M0_COMP_CAL_RUN times running. Disturbed writes give other
+	 * counts, and different ones each time; so does the first tick here,
+	 * which SysTick may have started without us. */
 	ldr	r0, =GPIO4_DR_B23_LOW
 	mov	r11, r0
 	movs	r0, #0
-	str	r0, [sp, #PS_C0]
+	mov	lr, r0
 	str	r0, [sp, #PS_DSUM]
-	movs	r5, #M0_COMP_CAL_TICKS
-	movs	r4, #0
+#if M0_COMP_STATS == 2
+	add	r1, sp, #PS_HIST
+	movs	r2, #M0_COMP_CYCLES / 4
+12:	stmia	r1!, {r0}
+	subs	r2, #1
+	bne	12b
+#endif
+	movs	r3, #M0_COMP_CAL_TICKS	@ give up after this many, with the latest
+	movs	r4, #255		@ the count seen last: none yet
+	movs	r5, #0			@ and how many times running
 10:	wfi
-	WRITE_TIMED			@ d = -count, modulo the tick, PS_C0 being 0
+	WRITE_TIMED			@ d = -count, modulo the tick, lr being 0
 	negs	r6, r6
 	lsls	r6, r6, #COMP_MOD
 	lsrs	r6, r6, #COMP_MOD	@ the count
 	cmp	r6, r4
-	bls	11f
+	beq	11f
 	mov	r4, r6
-11:	subs	r5, #1
+	movs	r5, #0
+11:	adds	r5, #1
+	cmp	r5, #M0_COMP_CAL_RUN
+	beq	13f
+	subs	r3, #1
 	bne	10b
-	str	r4, [sp, #PS_C0]
+13:
+	str	r4, [sp, #PS_C0]	@ (kept in lr; here for whoever looks)
 	mov	r12, r11		@ no lateness yet, and the word on the pins
 	ldr	r1, [sp, #PS_K_SHMEM]
 	ldr	r2, [sp, #PS_K_MASK]
@@ -462,8 +506,15 @@ m0_play_state:
 
 	mov	r8, r0			@ x = dx = 0
 	mov	r9, r0
+	.if	\comp
+	ldr	r6, =GPIO4_DR_B23_HIGH
+	mov	r10, r6
+	ldr	r6, [sp, #PS_C0]
+	mov	lr, r6
+	.else
 	mov	r10, r0
 	mov	lr, r0
+	.endif
 	ldr	r6, [sp, #PS_SHIFT]
 	movs	r2, #1
 	adds	r6, #DSM_CLAMP_SHIFT
@@ -594,6 +645,41 @@ m0_play_state:
 	adcs	r5, r7
 	STEP_END \comp, S + 1
 
+	.if	\comp
+	/* Hold: the new sample is x, at once. One step per channel. */
+	STEP	\comp			@ S+2: left sample
+	ldr	r6, [sp, #PS_FRAME]
+	sxth	r6, r6
+	asrs	r7, r6, #3
+	subs	r6, r6, r7		@ x -= x >> 3 (7/8 headroom)
+	mov	r8, r6
+	STEP_END \comp, S + 2
+	b	.L_steps2_\comp
+
+.L_plain_\comp:				@ r5 plain ticks, at least one
+	TICK	\comp, 1
+	subs	r5, #1
+	bne	.L_plain_\comp
+	b	.L_sample_\comp
+
+.L_steps2_\comp:
+	STEP	\comp			@ S+3: right sample
+	ldr	r6, [sp, #PS_FRAME]
+	asrs	r6, r6, #16
+	asrs	r7, r6, #3
+	subs	r6, r6, r7
+	mov	r9, r6
+	STEP_END \comp, S + 3
+
+	STEP	\comp			@ S+4
+	CLAMP	r1
+	STEP_END \comp, S + 4
+
+	STEP	\comp			@ S+5
+	CLAMP	r4
+	STEP_END \comp, S + 5
+	b	.L_plain_\comp
+	.else
 	STEP	\comp			@ S+2: left sample
 	ldr	r6, [sp, #PS_FRAME]
 	sxth	r6, r6
@@ -602,14 +688,12 @@ m0_play_state:
 	b	.L_steps2_\comp
 
 .L_plain_\comp:				@ r5 plain ticks, at least one
-	TICK	\comp, 1
+	TICK	\comp
 #ifdef M0_PROFILE
 	mov	r11, r7
 	STEP_END \comp, M0_TRACE_PLAIN
 #else
-	.if	\comp == 0
 	ldr	r6, [sp, #PS_K_GPIO]
-	.endif
 #endif
 	subs	r5, #1
 	bne	.L_plain_\comp
@@ -664,6 +748,7 @@ m0_play_state:
 	CLAMP	r4
 	STEP_END \comp, S + 11
 	b	.L_plain_\comp
+	.endif
 
 	.ltorg
 	.size	\name, . - \name

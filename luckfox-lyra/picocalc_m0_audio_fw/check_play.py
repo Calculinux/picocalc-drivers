@@ -43,11 +43,13 @@ PS_FRAC, PS_PLAIN = 4, 8                    # m0_play_state: what main.c sets
 PS_SHIFT, PS_DX_MASK = 72, 76
 PS_DSUM = 140                               # m0_play_comp: lateness of plain ticks, added up
 BUS_STEPS, STEPS = 8, 19                    # a PROFILE build has three more after the bus steps
+COMP_STEPS = 13                             # m0_play_comp: holds each sample, fewer steps
 MAX_SHIFT = 6
 SYST_CVR = PPB + 0x18
 COMP_CYCLES = 128                           # m0_play_comp: core cycles per tick, fixed
 ON_TIME = 58                                # SysTick count after an undisturbed pin write
-CAL_TICKS = 16                              # m0_play_comp finds that out on its first ticks
+CAL_RUN, CAL_TICKS = 4, 200                 # m0_play_comp finds that out on its first ticks:
+                                            # the first count to come 4 times running
 TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
 TRACE_UNDERRUN = 30
 
@@ -83,7 +85,9 @@ class Model:
         self.write_idx_fn = write_idx_fn
         self.base, self.frac, self.cycles = tm
         self.comp = comp
-        self.cal_left = CAL_TICKS if comp else 0
+        self.cal = comp                 # still looking for the on-time count
+        self.cal_left, self.cal_count, self.cal_run = CAL_TICKS, None, 0
+        self.on_time = ON_TIME
         self.late = 0                   # how late the previous pin write was, core cycles
         self.written = 0x0C000000       # the word on the pins
         self.late_sum = 0               # lateness of the plain ticks' writes, added up
@@ -136,7 +140,7 @@ class Model:
         self.dx[ch] = self.next_dx[ch] if self.interp else 0
 
     def step(self, n, ctrl):
-        profile = self.steps - STEPS    # 3 in a PROFILE build
+        profile = self.steps - (COMP_STEPS if self.comp else STEPS)     # 3 in a PROFILE build
         if n == 1:
             if ctrl != 1:
                 self.stopped = True
@@ -168,6 +172,11 @@ class Model:
                 carry = self.acc >> 32
                 self.acc &= MASK32
                 self.length = self.base + carry
+            elif self.comp:             # hold: the new sample is x, at once
+                if n in (2, 3):
+                    self.x[n - 2] = scale(self.frame[n - 2])
+                elif n in (4, 5):
+                    self.clamp(n - 4)
             elif n == 2:
                 self.sample_new(0)
             elif n == 3:
@@ -192,9 +201,16 @@ class Model:
     def tick(self, ctrl, late=0):
         """Returns the GPIO word written at this tick. late: by how many core
         cycles that write was late (m0_play_comp)."""
-        if self.cal_left:
+        if self.cal:
+            count = (ON_TIME - late) % self.cycles
+            if count != self.cal_count:
+                self.cal_count, self.cal_run = count, 0
+            self.cal_run += 1
             self.cal_left -= 1
+            if self.cal_run == CAL_RUN or not self.cal_left:
+                self.cal, self.on_time = False, count
             return 0x0C000000
+        late = (late + self.on_time - ON_TIME) % self.cycles   # as the firmware sees it
         out = self.word
         if self.comp:
             # The level that has just ended lasted a tick plus the change in
@@ -247,11 +263,12 @@ def load(path, comp=False):
         symtab = elf.get_section_by_name('.symtab')
         syms = symtab.get_symbol_by_name('m0_play_comp' if comp else 'm0_play')
         if not syms:
-            return None, None, None, None       # a PROFILE build has no m0_play_comp
+            return None, None, None, None, None  # a PROFILE build has no m0_play_comp
         entry = syms[0]['st_value']
+        stats = bool(symtab.get_symbol_by_name('m0_comp_stats'))
         state = symtab.get_symbol_by_name('m0_play_state')[0]['st_value']
         steps = symtab.get_symbol_by_name('m0_step_ticks')[0]['st_value']
-    return uc, entry, state, steps
+    return uc, entry, state, COMP_STEPS if comp else steps, stats
 
 
 def cancels(name, trace, cycles, fs):
@@ -282,7 +299,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
     fraction of its pin writes that are late, by 2 to late_max core cycles;
     cancel: also check that the late edges are cancelled (needs a slow input
     and enough of them to stand out from the modulator's own noise)."""
-    uc, entry, state_addr, steps = load(path, comp)
+    uc, entry, state_addr, steps, stats = load(path, comp)
     if uc is None:
         print(f'{name:36s} (not in this build)')
         return 0
@@ -296,8 +313,8 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         shift = 0
     cycles = tm[2]
     if comp:
-        assert cycles == COMP_CYCLES and tm[0] + 1 <= 1 << MAX_SHIFT
-        shift = MAX_SHIFT
+        assert cycles == COMP_CYCLES
+        shift, interp = 0, False        # as main.c sets it up: m0_play_comp holds
     rnd = random.Random(7)
     trace = []
     uc.mem_write(SYST_CVR, struct.pack('<I', ON_TIME))
@@ -331,14 +348,15 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         ctrl_at.append(0 if n >= state['stop_at'] else 1)
         # how late this write was, as the firmware will read it from SysTick
         d = 0
-        if comp and n == 3:
-            d = 5                       # one of the calibration ticks: must not count
-        elif comp and n > CAL_TICKS and rnd.random() < late:
+        playing = comp and not model.cal
+        if comp and n in (1, 4):
+            d = 70 if n == 1 else 5     # calibration ticks that must not count
+        elif playing and rnd.random() < late:
             d = rnd.randint(2, late_max)
         uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - d) % cycles))
         # keep the model in step so the hooks above can look at its state
         expect.append(model.tick(ctrl_at[-1], d))
-        if comp and n > CAL_TICKS:
+        if playing:
             trace.append((value >> 10 & 1, d, model.x_used))
 
     uc.hook_add(UC_HOOK_MEM_WRITE, on_gpio, begin=GPIO4_DR, end=GPIO4_DR + 3)
@@ -392,7 +410,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
             if entry != (model.empties[-1] << 5 | TRACE_UNDERRUN):
                 print(f'  {name}: last log entry {entry:#x}, model sample {model.empties[-1]}')
                 bad += 1
-    if comp:
+    if comp and stats:
         dsum = struct.unpack('<I', uc.mem_read(state_addr + PS_DSUM, 4))[0]
         if dsum != model.late_sum:
             print(f'  {name}: lateness total {dsum}, model {model.late_sum}')
@@ -433,13 +451,14 @@ def main():
     bad += run(path, 'rail to rail (clamps)', rails, 250000, t2m4)
     bad += run(path, 'rail to rail, 3.0 MHz', rails, 400000, t3m0)
     bad += run(path, 'underrun holds', sine, 60000, t1m2, underrun_after=30000)
-    # m0_play_comp: 128 cycles per tick at a 375 MHz core clock, 61.04 ticks per sample
+    # m0_play_comp: 128 cycles per tick at a 375 MHz core clock, 61.04 ticks per
+    # sample. Build with COMP_STATS=1 to have its lateness total checked too.
     slow = [(int(12000 * math.sin(2 * math.pi * k / 512)), int(9000 * math.sin(2 * math.pi * k / 256))) for k in range(n)]
     tcomp = timing(375000000, COMP_CYCLES)
     bad += run(path, 'corrected, none late', sine, 250000, tcomp, comp=True)
     bad += run(path, 'corrected, 16 % late, to 32', slow, 600000, tcomp, comp=True, late=0.16, cancel=True)
     bad += run(path, 'corrected, 25 % late, to 127', slow, 600000, tcomp, comp=True, late=0.25, late_max=127, cancel=True)
-    bad += run(path, 'corrected, 2 % late, held', slow, 600000, tcomp, comp=True, late=0.02, interp=False)
+    bad += run(path, 'corrected, 2 % late', slow, 600000, tcomp, comp=True, late=0.02)
     bad += run(path, 'corrected, noise, 25 % late', noise, 400000, tcomp, comp=True, late=0.25, late_max=100)
     bad += run(path, 'corrected, rails, 25 % late', rails, 400000, tcomp, comp=True, late=0.25, late_max=100)
     bad += run(path, 'corrected, underrun', sine, 60000, tcomp, comp=True, late=0.1, underrun_after=30000)

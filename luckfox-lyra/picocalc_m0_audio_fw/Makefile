@@ -19,6 +19,16 @@ ifeq ($(PROFILE),1)
 CFLAGS += -DM0_PROFILE
 endif
 
+# make COMP_STATS=1: the corrected loop (m0_play_comp) also adds up how late
+# its pin writes were, which the host driver reports when playback stops.
+# Costs 5 of that loop's spare cycles per tick.
+# make COMP_STATS=2: it counts instead how often each lateness occurred (10
+# cycles); the 32 counts, for 0, 4, 8, ... cycles late, are left at
+# M0_TRACE_ADDR when a stream ends.
+ifneq ($(COMP_STATS),)
+CFLAGS += -DM0_COMP_STATS=$(COMP_STATS)
+endif
+
 OBJS = startup.o main.o play.o resource_table.o
 ELF  = rk3506-m0-audio.elf
 

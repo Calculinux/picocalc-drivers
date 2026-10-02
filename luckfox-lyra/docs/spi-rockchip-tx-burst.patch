@@ -1,0 +1,29 @@
+spi: rockchip: TX DMA burst length as a parameter
+
+The driver hands the DMA controller a quarter of the FIFO (16 words) per
+burst. On the RK3506 a burst holds the low-speed peripheral bus for its whole
+length, and the Cortex-M0's GPIO writes (PicoCalc M0 audio: one per output
+bit) wait behind it: measured, up to 72 core cycles (0.38 us) with 16-word
+bursts and 16 with one-word bursts. See luckfox-lyra/docs/m0-audio.md in
+picocalc-drivers. With tx_burst=1 a full-screen redraw takes about 2.6 times
+as long.
+
+Tested as an out-of-tree copy of the driver bound to the display's
+controller; this is the only functional change in it.
+
+--- a/drivers/spi/spi-rockchip.c
++++ b/drivers/spi/spi-rockchip.c
+@@
+ #define DRIVER_NAME "rockchip-spi"
+
++/* Beats per TX DMA burst (0: a quarter of the FIFO) */
++static unsigned int tx_burst;
++module_param(tx_burst, uint, 0644);
++
+@@ static int rockchip_spi_prepare_dma(struct rockchip_spi *rs,
+ 			.direction = DMA_MEM_TO_DEV,
+ 			.dst_addr = rs->dma_addr_tx,
+ 			.dst_addr_width = rs->n_bytes,
+-			.dst_maxburst = rs->fifo_len / 4,
++			.dst_maxburst = tx_burst ? tx_burst : rs->fifo_len / 4,
+ 		};
