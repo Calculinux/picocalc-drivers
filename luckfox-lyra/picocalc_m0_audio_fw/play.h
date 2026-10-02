@@ -42,11 +42,10 @@
 #define PS_XR         120
 #define PS_NEXT       124 /* ring offset of the frame after PS_CUR */
 #define PS_FADDR      128 /* address of the frame being played */
-/* m0_play_comp only */
-#define PS_C0         132 /* SysTick count straight after an on-time pin write */
-#define PS_DSUM       140 /* COMP_STATS=1: the lateness of every plain tick's pin write, added up */
-#define PS_HIST       144 /* COMP_STATS=2: how many plain ticks' writes were 0, 4, 8, ... cycles late */
-#define PS_SIZE       (144 + 128)
+/* m0_play_comp, COMP_STATS=1: by how many core cycles the plain ticks' pin
+ * writes came later than a tick after the write before, added up */
+#define PS_DSUM       132
+#define PS_SIZE       136
 
 /*
  * Ticks at the start of every sample that each carry one step of the
@@ -67,14 +66,12 @@
 #define M0_MAX_SHIFT  6
 
 /* m0_play_comp(): a tick is exactly this many core cycles (2^7), samples are
- * held (shift 0) and take this many steps. Before anything is played it looks
- * for the SysTick count of an on-time pin write: the first count to come
- * M0_COMP_CAL_RUN times running, within M0_COMP_CAL_TICKS ticks. */
+ * held (shift 0) and take this many steps. The time from one pin write to
+ * the next is taken to be a tick less at most M0_COMP_BACK cycles. */
 #define M0_COMP_LOG2_CYCLES 7
 #define M0_COMP_CYCLES      (1 << M0_COMP_LOG2_CYCLES)
 #define M0_COMP_STEPS       13
-#define M0_COMP_CAL_RUN     4
-#define M0_COMP_CAL_TICKS   200
+#define M0_COMP_BACK        28
 
 #ifndef M0_COMP_STATS
 #define M0_COMP_STATS 0

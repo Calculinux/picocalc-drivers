@@ -144,11 +144,6 @@ int main(void)
 #else
 			shmem->stat_late = M0_STAT_LATE_UNKNOWN;
 #endif
-#if M0_COMP_STATS == 2
-			/* The histogram, where the PROFILE build keeps its log */
-			for (uint32_t i = 0; i < M0_COMP_CYCLES / 4; i++)
-				REG(M0_TRACE_ADDR + 4 * i) = m0_play_state[PS_HIST / 4 + i];
-#endif
 #endif
 		} else {
 			/* Let bus writes complete behind our back: the GPIO write

@@ -474,14 +474,17 @@ long as it lasts; 2 % late, -32 dBFS.
 The M0 can see the delay: with its bus writes not bufferable, a pin write
 returns when the pin has changed, and the SysTick count read after it says
 when that was. `m0_play_comp()` in `play.S` is a second copy of the playback
-loop built on that. Every tick it works out by how much the lateness changed
-since the previous write (which is by how much the level that just ended
-lasted longer or shorter than a tick) and takes that fraction of the level's
-feedback out of both integrators, so the modulator treats the bit as what it
-really delivered and shapes the error out of the audio band. It does this on
-every tick, late or not, with no branch on the lateness, so a tick always
-costs the same; the tick is exactly 128 core cycles, which makes the
-arithmetic shifts by constants. `comp=1` on the sound module selects it
+loop built on that. Every tick it works out how long the level that just
+ended really lasted, from the counts of the two pin writes that bounded it,
+and takes the difference from a tick, as a fraction of the level's
+feedback, out of both integrators: the modulator then treats the bit as what
+it really delivered and shapes the error out of the audio band. It does
+this on every tick, late or not, with no branch on the lateness, so a tick
+always costs the same; the tick is exactly 128 core cycles, which makes the
+arithmetic shifts by constants. Because it measures from one write to the
+next and not against the tick grid, it stays right when the loop has fallen
+a tick or more behind the grid: it then just plays that much slower until it
+has caught up. `comp=1` on the sound module selects it
 (default off; it needs all of the following).
 
 What it needs, each established on the board:
@@ -493,8 +496,8 @@ What it needs, each established on the board:
    as the pin. If writes are late by more on average than the loop has
    spare, it falls further and further behind, which is far worse than not
    correcting. So this loop holds each sample (no interpolation), has 13
-   steps and keeps its constants in registers: about 17 cycles spare on a
-   plain tick, 10 on the longest step.
+   steps and keeps its constants in registers: about 19 cycles spare on a
+   plain tick, 12 on the longest step.
 3. **Shorter DMA bursts in the display's SPI driver** (above), and the right
    length for the display's SPI clock. With the driver's own 16-word bursts
    the loop falls further and further behind while the display is redrawn.
@@ -507,9 +510,9 @@ playing, M0 at 375 MHz:
 
 | Display SPI clock | DMA burst | Frames a second | Audio behind, per second |
 |---|---|---|---|
-| 93.75 MHz | 16 (the driver's own) | 48 | (not coping) |
+| 93.75 MHz | 16 (the driver's own) | 48 | 20 ms |
 | 93.75 MHz | 8 | 48.5 | 9.8 ms |
-| 93.75 MHz | **4** | **48.4** | **0.1 ms** |
+| 93.75 MHz | **4** | **48.4** | **0.05 ms** |
 | 93.75 MHz | 2 | 39.8 | 18.8 ms |
 | 93.75 MHz | 1 | 23.6 | 7.8 ms |
 | 46.9 MHz | 16 | 26.2 | 5.7 ms |
@@ -521,9 +524,12 @@ playing, M0 at 375 MHz:
 
 Too long a burst holds the bus too long each time; too short a one cannot
 keep the FIFO full, so the DMA never rests and the frame rate drops as well.
-Four words keeps the stock frame rate with the loop all but on pace (it
-loses about 300 ticks a second under this, the heaviest display load there
-is); at 46.9 MHz it loses a quarter of that, for 26 frames a second.
+Four words keeps the stock frame rate with the loop all but on pace: under
+this, the heaviest display load there is, it plays 0.005 % slow (a twelfth
+of a cent), and since it measures from write to write nothing is left
+uncorrected by that. (The 0.05 ms and 0.02 ms figures are the loop as it is
+now; the rest of the table was measured with the version before, which
+measured against the tick grid and has the same pace.)
 
 How late the plain ticks' pin writes were during a console flood, one-word
 bursts (`COMP_STATS=2` build, which has 7 cycles spare instead of 17):
@@ -538,18 +544,20 @@ bursts (`COMP_STATS=2` build, which has 7 cycles spare instead of 17):
 In simulation the correction takes a redraw's noise under a -40 dBFS tone
 from -36 dBFS to -72 (16 % of writes up to 32 cycles late). By ear, with an
 earlier and worse version of the loop: a tone played through a console flood
-was "not affected at all". A tick lost (the lateness passing a whole tick)
-is not corrected: it is an error of one bit's charge, a click about 36 dB
-below full scale.
+was "not affected at all". The limit of the present loop is a write that
+comes 100 core cycles or more later than a tick after the one before (0.27
+us): that is misread. Four-word bursts hold a write up by 80 at most.
 
 `check_play.py` runs this loop too, puts late writes in by setting the
 SysTick count it reads, and checks both that the firmware matches the model
 and, from the pin writes alone, that the late edges are cancelled (a model
 sharing a sign error with the firmware would pass the first).
 
-Debug builds: `make COMP_STATS=1` adds up the lateness (the driver prints it
-when a stream ends); `COMP_STATS=2` counts how often each lateness occurred
-and leaves the 32 counts at `M0_TRACE_ADDR`.
+Debug build: `make COMP_STATS=1` adds up by how many cycles the pin writes
+were pushed later, and the driver prints it when a stream ends (quiet
+system: 0.02 cycles per tick; full-screen redraws at 48 a second: 3.5).
+The lateness table above is from an earlier debug build that counted how
+often each lateness against the tick grid occurred.
 
 Where this lives outside this repository: the SPI burst length is a kernel
 change (`docs/spi-rockchip-tx-burst.patch` is the change that was tested, as

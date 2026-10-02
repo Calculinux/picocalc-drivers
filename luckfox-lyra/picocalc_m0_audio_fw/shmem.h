@@ -117,8 +117,8 @@ typedef struct {
 	/*
 	 * Written by the firmware when a stream ends. M0_STAT_LATE_NONE if it
 	 * played uncorrected, M0_STAT_LATE_UNKNOWN if corrected; a COMP_STATS=1
-	 * build instead gives the lateness, in core cycles, of all its pin
-	 * writes on plain ticks added up (modulo 2^32).
+	 * build instead gives the core cycles by which its pin writes on plain
+	 * ticks came later than a tick after the write before, added up.
 	 */
 	volatile uint32_t stat_late;
 	/*

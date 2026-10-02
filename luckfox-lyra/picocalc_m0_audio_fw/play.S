@@ -118,35 +118,39 @@
  *   m0_play_comp() is the same loop with the pin write made blocking (main.c
  *   turns "bufferable" off for it), so that the SysTick count read straight
  *   after it says when the pin changed:
- *      d      = (count when on time - count) mod tick   @ cycles late
- *      delta  = d - previous d      @ the level that just ended lasted a
- *                                   @ tick + delta
+ *      delta  = previous count - count, modulo the tick, as a number from
+ *               -28 to 99        @ the level that just ended lasted a tick
+ *                                @ + delta core cycles
  *      m      = FS * delta / tick
  *      i1, i2 -= m if that level was 1, += m if it was 0, per channel
  *   i.e. the feedback already taken for that bit is brought to what the bit
  *   really delivered, and the error is shaped out of the audio band like the
  *   quantisation error is (in simulation, a display redraw: from -24 dBFS of
  *   noise to -60, or to -72 with the display's DMA bursts shortened). It is
- *   done on every tick, late or not, without a branch that depends on d: a
- *   tick always costs the same and a late one cannot make the next late.
+ *   done on every tick, late or not, without a branch that depends on the
+ *   lateness: a tick always costs the same.
+ *   What is measured is the time from one pin write to the next, not the
+ *   lateness against the tick grid, so it stays right when the loop has
+ *   fallen a tick or more behind the grid (it then plays that much slower
+ *   until it has caught up, and that is all). The window, -28 to 99: a write
+ *   can come at most about 20 cycles sooner after the last one than a tick
+ *   (the loop has that much to spare when it does not sleep), and any amount
+ *   later; later by 100 cycles or more in one go would be misread.
  *   Requires a tick of exactly 128 core cycles (which makes "modulo the
  *   tick" and "FS * delta / tick" shifts by a constant): 2.93 MHz at a
  *   375 MHz core clock, where the blocking write takes 49 of the 128 cycles.
  *   SysTick's pending bit is cleared before the write, so that a write that
- *   lands after the next tick cannot wipe that tick out. The count that means
- *   "on time" is found at the start of each stream: the first to come four
- *   times running.
+ *   lands after the next tick does not wipe that tick out as well.
  *   A late write holds this loop up as well, so it needs cycles to spare on
- *   every tick, more than the writes are late by on average (3.5 cycles while
- *   the display is redrawn with one-word DMA bursts, measured), or it falls
+ *   every tick, more than the writes are late by on average, or it falls
  *   further and further behind. Hence no interpolation here: each sample is
  *   held (shift 0), which saves the two adds and leaves r10 and lr for the
- *   both-high GPIO word and the on-time count; and fewer steps, M0_COMP_STEPS.
- *   That leaves about 17 cycles on a plain tick and 10 on the longest step.
- *   r12 holds the previous d plus the word written then; the tick starts with
- *   its word in r11, not r7. Not in PROFILE builds. Built with COMP_STATS=1
- *   the plain ticks also add up the lateness they see (5 cycles); with
- *   COMP_STATS=2 they count how often each lateness occurred (10 cycles).
+ *   both-high GPIO word and the GPIO address; and fewer steps, M0_COMP_STEPS.
+ *   That leaves about 19 cycles on a plain tick and 12 on the longest step.
+ *   r12 holds the previous count plus the word written then; the tick starts
+ *   with its word in r11, not r7. Not in PROFILE builds. Built with
+ *   COMP_STATS=1 the plain ticks also add up by how much their writes came
+ *   later than a tick after the one before (about 7 cycles).
  *
  * LAYOUT
  *   The loop is longer than a Thumb branch reaches in a PROFILE build, so the
@@ -168,6 +172,7 @@
 	.equ	S, M0_BUS_STEPS + M0_PROFILE_STEPS	@ number of the last SRAM step
 	.equ	COMP_LSL, DSM_FS_SHIFT - M0_COMP_LOG2_CYCLES
 	.equ	COMP_MOD, 32 - M0_COMP_LOG2_CYCLES
+	.equ	COMP_BACK, M0_COMP_BACK
 
 /* For check_play.py, which has to know how this build schedules a sample */
 	.global	m0_step_ticks
@@ -214,44 +219,37 @@ m0_play_state:
 	add	r7, r11
 	.endm
 
-/* m0_play_comp: tick taken, pin write, and how late it was. Leaves d in r6. */
+/* m0_play_comp: tick taken, pin write, and when the pin changed: leaves the
+ * SysTick count in r6. */
 	.macro	WRITE_TIMED
 	ldr	r7, [sp, #PS_K_ICSR]
 	movs	r6, #1
 	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
 	str	r6, [r7]		@ tick taken: clear SysTick's pending bit
-	ldr	r6, [sp, #PS_K_GPIO]
+	mov	r6, lr
 	mov	r7, r11
 	str	r7, [r6]		@ OUTPUT, and wait until the pin has changed
 	ldr	r6, [sp, #PS_K_CVR]
 	ldr	r6, [r6]		@ when was that
-	mov	r7, lr			@ the count when on time
-	subs	r6, r7, r6
-	lsls	r6, r6, #COMP_MOD
-	lsrs	r6, r6, #COMP_MOD	@ d = cycles late, modulo the tick
 	.endm
 
 /* Wait for the tick, put out the bits, run both modulators.
  * comp 0: enters with the GPIO word in r7 and its address in r6, leaves the
  *         next word in r7; r6 is free.
  * comp 1: enters and leaves with the word in r11; r6, r7 are free. stats:
- *         also add the lateness to the total. */
+ *         also add what the write came late by to the total. */
 	.macro	TICK comp, stats=0
 	wfi
 	.if	\comp
 	WRITE_TIMED
-#if M0_COMP_STATS == 1
-	.if	\stats
-	ldr	r7, [sp, #PS_DSUM]
-	adds	r7, r7, r6
-	str	r7, [sp, #PS_DSUM]
-	.endif
-#endif
-	mov	r7, r12			@ the previous d + the word written then
+	mov	r7, r12			@ the previous count + the word written then
 	mov	r12, r6
-	add	r12, r11		@ this d + this word, for the next tick
-	subs	r6, r6, r7
-	sxtb	r6, r6			@ delta = d - previous d (the words are bits 10 up)
+	add	r12, r11		@ this count + this word, for the next tick
+	subs	r6, r7, r6		@ (the words are bits 10 up)
+	adds	r6, #COMP_BACK
+	lsls	r6, r6, #COMP_MOD
+	lsrs	r6, r6, #COMP_MOD
+	subs	r6, #COMP_BACK		@ delta: this write came a tick + delta after the last
 	lsls	r6, r6, #COMP_LSL	@ m = FS * delta / tick
 	lsls	r7, r7, #31 - GPIO4_B2_BIT	@ the levels that just ended: N = left, C = right
 	bcs	2f
@@ -277,21 +275,19 @@ m0_play_state:
 	subs	r3, r3, r6
 	subs	r4, r4, r6
 9:
+#if M0_COMP_STATS == 1
+	.if	\stats
+	asrs	r6, r6, #COMP_LSL	@ delta again
+	bmi	7f
+	ldr	r7, [sp, #PS_DSUM]
+	adds	r7, r7, r6
+	str	r7, [sp, #PS_DSUM]
+7:
+	.endif
+#endif
 	MODULATE 0
 	add	r7, r10			@ both-high word minus the bits that are 0
 	mov	r11, r7
-#if M0_COMP_STATS == 2
-	.if	\stats
-	mov	r6, r12			@ this tick's d again (the word is bits 10 up)
-	lsls	r6, r6, #COMP_MOD
-	lsrs	r6, r6, #COMP_MOD
-	add	r7, sp, #PS_HIST
-	adds	r7, r7, r6		@ d is a multiple of 4 (the GPIO clock): a word offset
-	ldr	r6, [r7]
-	adds	r6, #1
-	str	r6, [r7]
-	.endif
-#endif
 	.else
 	str	r7, [r6]		@ OUTPUT: bits from the previous tick
 	ldr	r7, [sp, #PS_K_ICSR]
@@ -442,42 +438,17 @@ m0_play_state:
 #endif
 
 	.if	\comp
-	/* The SysTick count straight after an undisturbed pin write: one that
-	 * comes M0_COMP_CAL_RUN times running. Disturbed writes give other
-	 * counts, and different ones each time; so does the first tick here,
-	 * which SysTick may have started without us. */
+	/* One tick with both pins low, for a count to measure the next from */
 	ldr	r0, =GPIO4_DR_B23_LOW
 	mov	r11, r0
-	movs	r0, #0
+	ldr	r0, [sp, #PS_K_GPIO]
 	mov	lr, r0
+	movs	r0, #0
 	str	r0, [sp, #PS_DSUM]
-#if M0_COMP_STATS == 2
-	add	r1, sp, #PS_HIST
-	movs	r2, #M0_COMP_CYCLES / 4
-12:	stmia	r1!, {r0}
-	subs	r2, #1
-	bne	12b
-#endif
-	movs	r3, #M0_COMP_CAL_TICKS	@ give up after this many, with the latest
-	movs	r4, #255		@ the count seen last: none yet
-	movs	r5, #0			@ and how many times running
-10:	wfi
-	WRITE_TIMED			@ d = -count, modulo the tick, lr being 0
-	negs	r6, r6
-	lsls	r6, r6, #COMP_MOD
-	lsrs	r6, r6, #COMP_MOD	@ the count
-	cmp	r6, r4
-	beq	11f
-	mov	r4, r6
-	movs	r5, #0
-11:	adds	r5, #1
-	cmp	r5, #M0_COMP_CAL_RUN
-	beq	13f
-	subs	r3, #1
-	bne	10b
-13:
-	str	r4, [sp, #PS_C0]	@ (kept in lr; here for whoever looks)
-	mov	r12, r11		@ no lateness yet, and the word on the pins
+	wfi
+	WRITE_TIMED
+	mov	r12, r6
+	add	r12, r11
 	ldr	r1, [sp, #PS_K_SHMEM]
 	ldr	r2, [sp, #PS_K_MASK]
 	.endif
@@ -508,9 +479,7 @@ m0_play_state:
 	mov	r9, r0
 	.if	\comp
 	ldr	r6, =GPIO4_DR_B23_HIGH
-	mov	r10, r6
-	ldr	r6, [sp, #PS_C0]
-	mov	lr, r6
+	mov	r10, r6			@ (lr: the GPIO address, set above)
 	.else
 	mov	r10, r0
 	mov	lr, r0

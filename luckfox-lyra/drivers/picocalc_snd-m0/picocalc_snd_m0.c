@@ -360,7 +360,7 @@ static void m0_report_pace(struct picocalc_m0 *m)
 		u64 ticks = frames * (m->tick_ticks - M0_COMP_STEPS);
 
 		dev_info(&m->pdev->dev,
-			 "pin writes: %u core cycles per tick, timed and corrected; late by %u cycles in all, %llu per 1000 ticks\n",
+			 "pin writes: %u core cycles per tick, timed and corrected; pushed later by %u cycles in all, %llu per 1000 ticks\n",
 			 m->tick_cycles, late, ticks ? div64_u64((u64)late * 1000, ticks) : 0);
 	}
 }
