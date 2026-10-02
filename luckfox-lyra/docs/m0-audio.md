@@ -425,6 +425,43 @@ core cycles: 1.46 MHz, with the quiet-system noise floor near -64 dBFS
 instead of -79.5. Not worth it as it stands; it depends on getting the loop
 shorter first.
 
+**The display: DMA burst length.** The kernel's `spi-rockchip` sends pixel
+data by DMA in bursts of a quarter of the FIFO, and the M0's pin write waits
+out a whole burst. Measured as above during a console flood, with a copy of
+the driver built as a module that takes the burst length as a parameter:
+
+| TX DMA burst (16-bit words) | M0 writes late | Worst | Mean |
+|---|---|---|---|
+| 16 (the driver's own) | 25 % | +72 cycles | +8.7 |
+| 4 | 27 % | +40 | +5.4 |
+| 2 | 22 % | +24 | +2.8 |
+| 1 | 16 % | +16 | +1.3 |
+
+From those figures a burst of 1 takes the timing-error power during display
+activity down by about 15 dB, or about 11 dB per redraw, since redraws then
+take 2.6 times as long. The change is one line in the kernel
+(`dst_maxburst` in `rockchip_spi_prepare_dma()`), not in this repository;
+by ear it is not yet judged. Each beat can still hold the M0 for up to 16
+cycles, so this reduces the pops and does not remove them.
+
+The display cannot be moved off this bus: its pins are on the routable pin
+matrix, but the matrix only offers SPI0 and SPI1, both on the same
+low-speed peripheral bus as GPIO4 (the SoC's "SPI2" is a slave-only
+SPI-to-APB bridge on fixed pins).
+
+**Measuring lateness without a blocking write does not work.** With
+bufferable writes a second GPIO write straight after the first returns at
+once (two take 8 cycles): the write buffer holds several, so a later write
+says nothing about whether an earlier one has landed.
+
+**Where the cycles go** (TCM, from the disassembly and the measured costs):
+wake 3, pin write 7, clearing SysTick's pending bit 6, both modulators and
+the next pin word 21: 37 for the core of a tick. A plain tick is 44 with
+the loop; a step tick 49 to 56. The tick is 62, set by the step ticks and,
+for interpolation, by a sample having to fit in 64 ticks; there is little
+to gain for plain playback. A correction for late pin writes would add the
+blocking write (26) and about 35 of arithmetic on every tick.
+
 `poptest.sh` in the test directory on the board plays silence in phases
 marked by beeps while it freezes the display, stops the keyboard polling,
 takes Wi-Fi down and floods the console, for telling by ear which matters.
