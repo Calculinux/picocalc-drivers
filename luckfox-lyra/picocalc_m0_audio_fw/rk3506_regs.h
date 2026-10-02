@@ -98,7 +98,7 @@
  * instruction (1 as TCM); see play.S for what a tick costs and build with
  * PROFILE=1 to measure it. */
 #define M0_DEFAULT_CORE_HZ      187500000U
-#define M0_DEFAULT_TICK_CYCLES  188U
+#define M0_DEFAULT_TICK_CYCLES  160U  /* 24 ticks per sample: one more than play.S needs */
 
 /* Modulator: both stages use +/-full-scale (1 << DSM_FS_SHIFT) feedback.
  * The second integrator is clamped to +/-(1 << DSM_CLAMP_SHIFT), 32x full
@@ -125,6 +125,7 @@
  * cycles between a write and the following access to pay nothing. */
 #define GRF_SOC_CON0          0x0000U
 #define GRF_CON0_MCU_BUFFERABLE 0x10001000U
+#define GRF_CON0_MCU_UNBUFFERED 0x10000000U
 #define GRF_SOC_CON37         0x0094U
 #define GRF_CON37_RXEV_BIT    3U   /* grf_con_mcu_rxev: sets the event register, completes WFE */
 #define GRF_CON37_WICENREQ_BIT 5U  /* grf_con_mcu_wicenreq: request WIC-based deep sleep */

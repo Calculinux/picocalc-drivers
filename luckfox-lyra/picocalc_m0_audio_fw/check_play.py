@@ -9,6 +9,14 @@ WFI is replaced by a no-op, so each pass through a tick is one tick. GPIO4 DR
 writes are recorded. The ring is pre-filled and kept non-empty except in the
 underrun test. This checks the arithmetic and the per-sample schedule; timing
 on the real core is what PROFILE=1 and picocalc_m0_diag_fw are for.
+
+m0_play_comp() reads the SysTick count after each pin write to see how late
+it was. Nothing counts here, so the harness puts the count there itself: the
+on-time value normally, less (modulo the tick) on the ticks it declares late.
+Besides comparing with the model, those runs check from the pin writes alone
+that what the firmware puts back into the modulator does cancel the late
+edges: a model that shared a sign error with the firmware would pass the
+comparison.
 """
 import math
 import random
@@ -33,8 +41,13 @@ RET_ADDR = 0x10000000
 CTRL, WRITE_IDX, READ_IDX = 4, 8, 12
 PS_FRAC, PS_PLAIN = 4, 8                    # m0_play_state: what main.c sets
 PS_SHIFT, PS_DX_MASK = 72, 76
-BUS_STEPS, STEPS = 6, 15                    # a PROFILE build has three more after the bus steps
+PS_DSUM = 140                               # m0_play_comp: lateness of plain ticks, added up
+BUS_STEPS, STEPS = 8, 19                    # a PROFILE build has three more after the bus steps
 MAX_SHIFT = 6
+SYST_CVR = PPB + 0x18
+COMP_CYCLES = 128                           # m0_play_comp: core cycles per tick, fixed
+ON_TIME = 58                                # SysTick count after an undisturbed pin write
+CAL_TICKS = 16                              # m0_play_comp finds that out on its first ticks
 TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
 TRACE_UNDERRUN = 30
 
@@ -45,9 +58,9 @@ IDX_MASK = RING - 4
 
 
 def timing(core_hz, tick_cycles):
-    """(whole ticks per sample, fraction in 2^-32 tick), as the host computes them."""
+    """(whole ticks per sample, fraction in 2^-32 tick, cycles per tick), as the host computes them."""
     den = tick_cycles * SAMPLE_RATE
-    return core_hz // den, ((core_hz % den) << 32) // den
+    return core_hz // den, ((core_hz % den) << 32) // den, tick_cycles
 
 
 def s32(v):
@@ -65,10 +78,17 @@ class Model:
     Each of the first `steps` ticks of a sample does one step after its
     modulator pass; the remaining ticks are plain."""
 
-    def __init__(self, frames, read_idx, write_idx_fn, tm, steps, shift, interp):
+    def __init__(self, frames, read_idx, write_idx_fn, tm, steps, shift, interp, comp):
         self.frames = frames            # list of (l, r), index = ring offset / 4
         self.write_idx_fn = write_idx_fn
-        self.base, self.frac = tm
+        self.base, self.frac, self.cycles = tm
+        self.comp = comp
+        self.cal_left = CAL_TICKS if comp else 0
+        self.late = 0                   # how late the previous pin write was, core cycles
+        self.written = 0x0C000000       # the word on the pins
+        self.late_sum = 0               # lateness of the plain ticks' writes, added up
+        self.x_used = 0                 # left input that went into the last pass
+        self.nxt = 0
         self.steps = steps
         self.cur = ((read_idx & IDX_MASK) - 4) & IDX_MASK
         self.widx = 0
@@ -101,12 +121,14 @@ class Model:
         if not -lim <= self.i2[ch] < lim:
             self.i2[ch] = lim - 1 if self.i2[ch] >= 0 else -lim
 
-    def sample_in(self, ch):
+    def sample_new(self, ch):
         self.new[ch] = scale(self.frame[ch])
-        self.next_dx[ch] = self.new[ch] - self.prev[ch]
 
     def sample_start(self, ch):
         self.next_x[ch] = self.prev[ch] << self.shift
+
+    def sample_step(self, ch):
+        self.next_dx[ch] = self.new[ch] - self.prev[ch]
         self.prev[ch] = self.new[ch]
 
     def sample_go(self, ch):
@@ -121,16 +143,19 @@ class Model:
         elif n == 2:
             self.widx = self.write_idx_fn(self.tick_no)
         elif n == 3:
-            nxt = (self.cur + 4) & IDX_MASK
-            if nxt != self.widx:
-                self.cur = nxt
+            self.nxt = (self.cur + 4) & IDX_MASK
+        elif n == 4:
+            if self.nxt != self.widx:
+                self.cur = self.nxt
             else:
                 self.empties.append(self.sample_no)
-        elif n == 4:
-            self.frame = self.frames[self.cur // 4]
         elif n == 5:
-            self.pub = (self.cur + 4) & IDX_MASK
+            pass                        # the frame's address
         elif n == 6:
+            self.frame = self.frames[self.cur // 4]
+        elif n == 7:
+            self.pub = (self.cur + 4) & IDX_MASK
+        elif n == 8:
             self.published = self.pub
         elif n <= BUS_STEPS + profile:
             # PROFILE builds: two steps publish statistics, the third counts
@@ -144,25 +169,46 @@ class Model:
                 self.acc &= MASK32
                 self.length = self.base + carry
             elif n == 2:
-                self.sample_in(0)
+                self.sample_new(0)
             elif n == 3:
                 self.sample_start(0)
             elif n == 4:
-                self.sample_in(1)
+                self.sample_step(0)
             elif n == 5:
-                self.sample_start(1)
+                self.sample_new(1)
             elif n == 6:
-                self.sample_go(0)
+                self.sample_start(1)
             elif n == 7:
-                self.sample_go(1)
+                self.sample_step(1)
             elif n == 8:
-                self.clamp(0)
+                self.sample_go(0)
             elif n == 9:
+                self.sample_go(1)
+            elif n == 10:
+                self.clamp(0)
+            elif n == 11:
                 self.clamp(1)
 
-    def tick(self, ctrl):
-        """Returns the GPIO word written at this tick."""
+    def tick(self, ctrl, late=0):
+        """Returns the GPIO word written at this tick. late: by how many core
+        cycles that write was late (m0_play_comp)."""
+        if self.cal_left:
+            self.cal_left -= 1
+            return 0x0C000000
         out = self.word
+        if self.comp:
+            # The level that has just ended lasted a tick plus the change in
+            # lateness: its feedback, +FS or -FS, was short by that fraction.
+            m = ((late - self.late) << (FS_SHIFT + self.shift)) // self.cycles
+            for ch, bit in ((0, 10), (1, 11)):
+                d = -m if self.written >> bit & 1 else m
+                self.i1[ch] = s32(self.i1[ch] + d)
+                self.i2[ch] = s32(self.i2[ch] + d)
+            self.late = late
+            self.written = out
+            if self.pos >= self.steps:      # the tick now starting is a plain one
+                self.late_sum = (self.late_sum + late) & MASK32
+        self.x_used = self.x[0]
         word = 0x0C000C00
         for ch, bit in ((0, 10), (1, 11)):
             self.i1[ch] = s32(self.i1[ch] + self.x[ch] - self.g[ch])
@@ -184,7 +230,7 @@ class Model:
         return out
 
 
-def load(path):
+def load(path, comp=False):
     uc = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
     uc.ctl_set_cpu_model(UC_CPU_ARM_CORTEX_M0)
     uc.mem_map(CODE_BASE, CODE_SIZE)
@@ -199,15 +245,47 @@ def load(path):
                 assert seg['p_paddr'] + seg['p_memsz'] <= CODE_SIZE, 'image outside the 8 KB window'
                 uc.mem_write(seg['p_paddr'], seg.data().replace(b'\x30\xbf', b'\x00\xbf'))  # wfi -> nop
         symtab = elf.get_section_by_name('.symtab')
-        entry = symtab.get_symbol_by_name('m0_play')[0]['st_value']
+        syms = symtab.get_symbol_by_name('m0_play_comp' if comp else 'm0_play')
+        if not syms:
+            return None, None, None, None       # a PROFILE build has no m0_play_comp
+        entry = syms[0]['st_value']
         state = symtab.get_symbol_by_name('m0_play_state')[0]['st_value']
         steps = symtab.get_symbol_by_name('m0_step_ticks')[0]['st_value']
     return uc, entry, state, steps
 
 
-def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=True):
-    """Returns the number of mismatches."""
-    uc, entry, state_addr, steps = load(path)
+def cancels(name, trace, cycles, fs):
+    """trace: per tick (left bit, cycles late, left input). The level delivered
+    in a tick is the bit, less what a late edge took from it. Averaged over
+    blocks long enough to lose the modulator's own noise, it must follow the
+    input far better than the late edges alone would let it."""
+    block = 2048
+    lvl = [2 * b - 1 for b, _, _ in trace]
+    err = [0.0] + [(lvl[i - 1] - lvl[i]) * trace[i][1] / cycles for i in range(1, len(trace))]
+    got = [lvl[i] + err[i] for i in range(len(trace))]
+    resid = unc = n = 0
+    for i in range(block, len(trace) - block, block):
+        want = sum(x for _, _, x in trace[i:i + block]) / block / fs
+        resid += (sum(got[i:i + block]) / block - want) ** 2
+        unc += (sum(err[i:i + block]) / block) ** 2
+        n += 1
+    resid, unc = (resid / n) ** 0.5, (unc / n) ** 0.5
+    if resid > unc / 4:
+        print(f'  {name}: late edges not cancelled: residual {resid:.2e}, the late edges alone {unc:.2e}')
+        return 1
+    return 0
+
+
+def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=True,
+        comp=False, late=0.0, late_max=32, cancel=False):
+    """Returns the number of mismatches. comp: run m0_play_comp; late: the
+    fraction of its pin writes that are late, by 2 to late_max core cycles;
+    cancel: also check that the late edges are cancelled (needs a slow input
+    and enough of them to stand out from the modulator's own noise)."""
+    uc, entry, state_addr, steps = load(path, comp)
+    if uc is None:
+        print(f'{name:36s} (not in this build)')
+        return 0
     # as main.c does: the smallest shift the longest sample fits in
     shift = 0
     while (1 << shift) < tm[0] + 1:
@@ -216,6 +294,13 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         interp = False
     if not interp:
         shift = 0
+    cycles = tm[2]
+    if comp:
+        assert cycles == COMP_CYCLES and tm[0] + 1 <= 1 << MAX_SHIFT
+        shift = MAX_SHIFT
+    rnd = random.Random(7)
+    trace = []
+    uc.mem_write(SYST_CVR, struct.pack('<I', ON_TIME))
     for i, (l, r) in enumerate(frames):
         uc.mem_write(SHMEM + HDR + 4 * i, struct.pack('<hh', l, r))
     # write_idx = 2 can never equal a frame-aligned index: ring never empty.
@@ -244,12 +329,21 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         if n >= state['stop_at']:
             uc.mem_write(SHMEM + CTRL, struct.pack('<I', 0))
         ctrl_at.append(0 if n >= state['stop_at'] else 1)
+        # how late this write was, as the firmware will read it from SysTick
+        d = 0
+        if comp and n == 3:
+            d = 5                       # one of the calibration ticks: must not count
+        elif comp and n > CAL_TICKS and rnd.random() < late:
+            d = rnd.randint(2, late_max)
+        uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - d) % cycles))
         # keep the model in step so the hooks above can look at its state
-        expect.append(model.tick(ctrl_at[-1]))
+        expect.append(model.tick(ctrl_at[-1], d))
+        if comp and n > CAL_TICKS:
+            trace.append((value >> 10 & 1, d, model.x_used))
 
     uc.hook_add(UC_HOOK_MEM_WRITE, on_gpio, begin=GPIO4_DR, end=GPIO4_DR + 3)
 
-    model = Model(frames, read_idx, write_idx_at, tm, steps, shift, interp)
+    model = Model(frames, read_idx, write_idx_at, tm, steps, shift, interp, comp)
     expect = []
     saved = {UC_ARM_REG_R4: 0x44444444, UC_ARM_REG_R5: 0x55555555, UC_ARM_REG_R6: 0x66666666,
              UC_ARM_REG_R7: 0x77777777, UC_ARM_REG_R8: 0x88888888, UC_ARM_REG_R9: 0x99999999,
@@ -298,6 +392,13 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
             if entry != (model.empties[-1] << 5 | TRACE_UNDERRUN):
                 print(f'  {name}: last log entry {entry:#x}, model sample {model.empties[-1]}')
                 bad += 1
+    if comp:
+        dsum = struct.unpack('<I', uc.mem_read(state_addr + PS_DSUM, 4))[0]
+        if dsum != model.late_sum:
+            print(f'  {name}: lateness total {dsum}, model {model.late_sum}')
+            bad += 1
+    if cancel:
+        bad += cancels(name, trace, cycles, 1 << (FS_SHIFT + shift))
     ones_l = sum((w >> 10) & 1 for w in words) / max(len(words), 1)
     print(f'{name:36s} {len(words):7d} ticks  left duty {ones_l:.4f}  {"FAIL" if bad else "ok"}')
     return bad
@@ -311,7 +412,7 @@ def main():
     noise = [(rnd.randint(-32768, 32767), rnd.randint(-32768, 32767)) for _ in range(n)]
     rails = [(rnd.choice((-32768, 32767)), rnd.choice((-32768, 32767))) for _ in range(n)]
     dc = [(16384, -8000)] * n
-    t915k = timing(187500000, 205)      # 19.05 ticks per sample: the shortest allowed
+    t915k = timing(187500000, 168)      # 23.25 ticks per sample: the shortest allowed
     t1m2 = timing(187500000, 156)       # 25.04
     t2m4 = timing(187500000, 78)        # 50.08
     t2m9 = timing(187500000, 64)        # 61.04
@@ -320,7 +421,7 @@ def main():
     bad = 0
     bad += run(path, 'silence', [(0, 0)] * n, 20000, t1m2)
     bad += run(path, 'dc', dc, 60000, t1m2)
-    bad += run(path, 'sine, 915 kHz', sine, 150000, t915k)
+    bad += run(path, 'sine, 1.1 MHz', sine, 150000, t915k)
     bad += run(path, 'sine, 1.2 MHz', sine, 150000, t1m2)
     bad += run(path, 'sine, 1.2 MHz, held', sine, 150000, t1m2, interp=False)
     bad += run(path, 'sine, 2.4 MHz', sine, 150000, t2m4)
@@ -332,6 +433,16 @@ def main():
     bad += run(path, 'rail to rail (clamps)', rails, 250000, t2m4)
     bad += run(path, 'rail to rail, 3.0 MHz', rails, 400000, t3m0)
     bad += run(path, 'underrun holds', sine, 60000, t1m2, underrun_after=30000)
+    # m0_play_comp: 128 cycles per tick at a 375 MHz core clock, 61.04 ticks per sample
+    slow = [(int(12000 * math.sin(2 * math.pi * k / 512)), int(9000 * math.sin(2 * math.pi * k / 256))) for k in range(n)]
+    tcomp = timing(375000000, COMP_CYCLES)
+    bad += run(path, 'corrected, none late', sine, 250000, tcomp, comp=True)
+    bad += run(path, 'corrected, 16 % late, to 32', slow, 600000, tcomp, comp=True, late=0.16, cancel=True)
+    bad += run(path, 'corrected, 25 % late, to 127', slow, 600000, tcomp, comp=True, late=0.25, late_max=127, cancel=True)
+    bad += run(path, 'corrected, 2 % late, held', slow, 600000, tcomp, comp=True, late=0.02, interp=False)
+    bad += run(path, 'corrected, noise, 25 % late', noise, 400000, tcomp, comp=True, late=0.25, late_max=100)
+    bad += run(path, 'corrected, rails, 25 % late', rails, 400000, tcomp, comp=True, late=0.25, late_max=100)
+    bad += run(path, 'corrected, underrun', sine, 60000, tcomp, comp=True, late=0.1, underrun_after=30000)
     bad += run(path, 'unaligned read_idx', sine, 20000, t1m2, read_idx=0x12346)
     if bad:
         print(f'check_play: {bad} FAILED')

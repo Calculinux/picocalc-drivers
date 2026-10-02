@@ -64,18 +64,23 @@
 #define M0_SHMEM_STAT_OVERRUNS 60
 
 /* One sample must last at least this many ticks: play.S gives each step of
- * the per-sample work a tick of its own (18 in a PROFILE build) and needs one
+ * the per-sample work a tick of its own (22 in a PROFILE build) and needs one
  * more. */
-#define M0_MIN_TICKS_PER_SAMPLE 19
+#define M0_MIN_TICKS_PER_SAMPLE 23
 
 /* flags */
 #define M0_FLAG_NO_INTERP 1   /* hold each sample; default is to ramp to the next */
+/* Time every pin write and correct for late ones (play.S, m0_play_comp). Only
+ * with tick_cycles = 128 and at most 63 ticks per sample, and not in a PROFILE
+ * build: otherwise the firmware plays uncorrected and says so in stat_late. */
+#define M0_FLAG_COMP      2
+#define M0_STAT_LATE_NONE M0_U32(0xFFFFFFFF)  /* stat_late: played uncorrected */
 
 /*
  * Event log of a PROFILE=1 firmware, in the SRAM after the ring; read it with
  * m0trace. Word 0 counts the events since the stream started; event n is in
  * word 1 + (n & (M0_TRACE_ENTRIES - 1)), as (sample number << 5) | code:
- *   1..18  that step tick was still working when the next tick fell due
+ *   1..22  that step tick was still working when the next tick fell due
  *   31     a plain tick was
  *   30     the ring was empty when the firmware wanted the next frame
  */
@@ -107,7 +112,12 @@ typedef struct {
 	volatile uint32_t tick_cycles;
 	volatile uint32_t ticks_base;
 	volatile uint32_t ticks_frac;
-	volatile uint32_t _reserved;
+	/*
+	 * Written by the firmware when a stream ends. M0_STAT_LATE_NONE if it
+	 * played uncorrected; else the lateness, in core cycles, of all its pin
+	 * writes on plain ticks added up (modulo 2^32).
+	 */
+	volatile uint32_t stat_late;
 	/*
 	 * Written by a PROFILE=1 firmware build, read by the host: the lowest
 	 * SysTick count seen at the end of a tick's work (the tick's work took

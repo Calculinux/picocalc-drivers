@@ -25,6 +25,7 @@ _Static_assert(__builtin_offsetof(m0_audio_shmem_t, read_idx) == M0_SHMEM_READ_I
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_min_cvr) == M0_SHMEM_STAT_MIN_CVR, "stat_min_cvr");
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_overruns) == M0_SHMEM_STAT_OVERRUNS, "stat_overruns");
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, buffer) == M0_HEADER_SIZE, "header");
+_Static_assert(DSM_FS_SHIFT + M0_MAX_SHIFT >= M0_COMP_LOG2_CYCLES, "comp scaling");
 _Static_assert((M0_RING_BYTES & (M0_RING_BYTES - 1U)) == 0, "ring size must be a power of two");
 _Static_assert(M0_IDLE_CYCLES <= SYST_MAX + 1U, "idle period does not fit SysTick");
 
@@ -56,13 +57,15 @@ static void tick_set(uint32_t cycles)
 }
 
 /* Take the tick timing from the header if it is usable, else the defaults,
- * hand the per-sample part to m0_play() and switch SysTick to the tick rate. */
-static void tick_start(const m0_audio_shmem_t *shmem)
+ * hand the per-sample part to m0_play() and switch SysTick to the tick rate.
+ * Returns whether the stream can be played by m0_play_comp(). */
+static int tick_start(const m0_audio_shmem_t *shmem)
 {
 	uint32_t cycles = shmem->tick_cycles;
 	uint32_t base = shmem->ticks_base;
 	uint32_t frac = shmem->ticks_frac;
 	uint32_t shift = 0, interp = ~0U;
+	int comp = 0;
 
 	if (cycles < 2U || cycles > SYST_MAX + 1U || base < M0_MIN_TICKS_PER_SAMPLE) {
 		cycles = M0_DEFAULT_TICK_CYCLES;
@@ -83,19 +86,25 @@ static void tick_start(const m0_audio_shmem_t *shmem)
 	 * state far further than a ramped one: keep the headroom. */
 	if (!interp)
 		shift = 0;
+#ifndef M0_PROFILE
+	/* The corrected loop is written for one tick length and one shift
+	 * (play.S); with those, holding has to live with the smaller headroom. */
+	if ((shmem->flags & M0_FLAG_COMP) && cycles == M0_COMP_CYCLES &&
+	    base + 1U <= (1U << M0_MAX_SHIFT)) {
+		comp = 1;
+		shift = M0_MAX_SHIFT;
+	}
+#endif
 	m0_play_state[PS_FRAC / 4] = frac;
 	m0_play_state[PS_PLAIN / 4] = base - M0_STEP_TICKS;
 	m0_play_state[PS_SHIFT / 4] = shift;
 	m0_play_state[PS_DX_MASK / 4] = interp;
 	tick_set(cycles);
+	return comp;
 }
 
 static void hardware_init(void)
 {
-	/* Let bus writes complete behind our back: the GPIO write in every tick
-	 * then costs a few cycles instead of 32 (see rk3506_regs.h). */
-	REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_BUFFERABLE;
-
 	/* CRU: ungate GPIO4 (pclk + dbclk). Nothing else is needed: the tick is
 	 * inside the core. */
 	REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
@@ -124,8 +133,21 @@ int main(void)
 
 		shmem->m0_state = M0_STATE_PLAY;
 		REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
-		tick_start(shmem);
-		m0_play(); /* until ctrl != PLAY */
+		if (tick_start(shmem)) {
+#ifndef M0_PROFILE
+			/* Blocking writes: the loop times each pin write */
+			REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
+			m0_play_comp(); /* until ctrl != PLAY */
+			shmem->stat_late = m0_play_state[PS_DSUM / 4];
+#endif
+		} else {
+			/* Let bus writes complete behind our back: the GPIO write
+			 * in every tick then costs a few cycles instead of 32
+			 * (rk3506_regs.h). */
+			REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_BUFFERABLE;
+			m0_play(); /* until ctrl != PLAY */
+			shmem->stat_late = M0_STAT_LATE_NONE;
+		}
 		gpio_write_both(0, 0);
 	}
 }

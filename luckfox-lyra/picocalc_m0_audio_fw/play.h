@@ -40,7 +40,13 @@
 #define PS_VR         112
 #define PS_DXR        116
 #define PS_XR         120
-#define PS_SIZE       128
+#define PS_NEXT       124 /* ring offset of the frame after PS_CUR */
+#define PS_FADDR      128 /* address of the frame being played */
+/* m0_play_comp only */
+#define PS_C0         132 /* SysTick count straight after an on-time pin write */
+#define PS_K_HIGH     136 /* GPIO word, both high */
+#define PS_DSUM       140 /* the lateness of every plain tick's pin write, added up */
+#define PS_SIZE       144
 
 /*
  * Ticks at the start of every sample that each carry one step of the
@@ -48,17 +54,24 @@
  * M0_BUS_STEPS (and the M0_PROFILE_STEPS after them) are the only ones that
  * touch the shared SRAM; the host times its ring writes by that.
  */
-#define M0_BUS_STEPS  6
+#define M0_BUS_STEPS  8
 #ifdef M0_PROFILE
 #define M0_PROFILE_STEPS 3
 #else
 #define M0_PROFILE_STEPS 0
 #endif
-#define M0_STEP_TICKS (15 + M0_PROFILE_STEPS)
+#define M0_STEP_TICKS (19 + M0_PROFILE_STEPS)
 
 /* The input moves 2^-shift of the way to the next sample per tick, so a
  * sample may last at most 2^shift ticks; the state has room for this much. */
 #define M0_MAX_SHIFT  6
+
+/* m0_play_comp(): a tick is exactly this many core cycles (2^7), the shift is
+ * M0_MAX_SHIFT, and the count of an on-time pin write is taken from this many
+ * ticks before anything is played. */
+#define M0_COMP_LOG2_CYCLES 7
+#define M0_COMP_CYCLES      (1 << M0_COMP_LOG2_CYCLES)
+#define M0_COMP_CAL_TICKS   16
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>
@@ -69,6 +82,10 @@ extern uint32_t m0_play_state[PS_SIZE / 4];
  * PS_PLAIN, PS_SHIFT and PS_DX_MASK set.
  * Returns when shmem->ctrl leaves M0_CTRL_PLAY, pins as the last tick left them. */
 void m0_play(void);
+/* The same, timing each pin write and correcting for late ones (play.S). Also
+ * needs: a tick of M0_COMP_CYCLES, PS_SHIFT = M0_MAX_SHIFT, the M0's bus
+ * writes not bufferable. Not in PROFILE builds. */
+void m0_play_comp(void);
 #endif
 
 #endif /* M0_PLAY_H */

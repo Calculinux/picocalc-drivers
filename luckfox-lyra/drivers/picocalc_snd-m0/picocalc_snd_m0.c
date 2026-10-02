@@ -45,8 +45,15 @@
 #define M0_FIXED_SAMPLE_RATE_HZ  48000U
 #define M0_FIXED_BUF_SIZE        8192U
 /* The firmware gives each step of its per-sample work a tick of its own */
-#define M0_MIN_TICKS_PER_SAMPLE  19U
+#define M0_MIN_TICKS_PER_SAMPLE  23U
 #define M0_FLAG_NO_INTERP        1U
+#define M0_FLAG_COMP             2U
+#define M0_STAT_LATE_NONE        0xFFFFFFFFU
+/* The firmware's corrected loop is written for this tick and at most this
+ * many ticks per sample (play.S, m0_play_comp) */
+#define M0_COMP_CYCLES           128U
+#define M0_COMP_MAX_TICKS        63U
+#define M0_ALL_STEP_TICKS        19U         /* of a sample's ticks, not plain ones */
 #define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
 
 /*
@@ -86,6 +93,34 @@ MODULE_PARM_DESC(tick_even, "Make the tick a whole number of GPIO clock periods 
  * rate down by 15 to 30 dB; the noise in the audio band is the same. Off:
  * hold, to compare. Next playback start.
  */
+/*
+ * The M0's pin writes wait while this CPU's SPI controllers (the display's
+ * pixel data above all) or its GPIO writes have the peripheral bus: a redraw
+ * makes a quarter of them up to 0.4 us late, heard as a click per redraw and
+ * as loud noise while something scrolls. With comp the firmware times every
+ * pin write and puts what a late one cost back into its modulator, which
+ * moves the error out of the audio band. That loop needs a tick of exactly
+ * 128 core cycles, which is only fast enough with the M0's clock raised to
+ * 375 MHz (2.93 MHz; picocalc_m0_diag_fw/m0clk): comp_min_hz is the slowest
+ * bit rate at which it is used, and at the stock 187.5 MHz the driver plays
+ * uncorrected at tick_hz instead. Not with a PROFILE=1 firmware. Next
+ * playback start.
+ *
+ * Off by default: timing a pin write means waiting for it, so a late write
+ * holds the firmware's loop up too, and the loop has only a few cycles per
+ * tick to spare. With the kernel's own SPI driver, whose DMA bursts make a
+ * quarter of the writes 70 cycles late on average, it falls further and
+ * further behind while the display is redrawn, which is far worse than not
+ * correcting. It needs those bursts shortened to one word (docs/m0-audio.md).
+ */
+static bool comp;
+module_param(comp, bool, 0644);
+MODULE_PARM_DESC(comp, "Correct for pin writes delayed by other bus traffic, where the core clock allows (default off)");
+
+static unsigned int comp_min_hz = 2500000;
+module_param(comp_min_hz, uint, 0644);
+MODULE_PARM_DESC(comp_min_hz, "Lowest bit rate at which comp is used (default 2500000)");
+
 static bool interp = true;
 module_param(interp, bool, 0644);
 MODULE_PARM_DESC(interp, "Interpolate between samples (default on)");
@@ -104,14 +139,21 @@ static bool ring_sync = true;
 module_param(ring_sync, bool, 0644);
 MODULE_PARM_DESC(ring_sync, "Write the ring only between the M0's own accesses to it (default on)");
 
-/* Ticks at the start of a sample in which the firmware uses the SRAM: six
- * (read_idx is written in the sixth), and three more in a PROFILE build,
+/* Ticks at the start of a sample in which the firmware uses the SRAM: eight
+ * (read_idx is written in the eighth), and three more in a PROFILE build,
  * which we cannot tell apart from here. play.h: M0_BUS_STEPS. */
-#define M0_STEP_TICKS     6U
+#define M0_STEP_TICKS     8U
 #define M0_PROFILE_TICKS  3U
 #define M0_SAMPLE_NS      (NSEC_PER_SEC / M0_FIXED_SAMPLE_RATE_HZ)
-/* Words written between two looks at the clock */
-#define M0_SYNC_BURST     32U
+/*
+ * Words written to the ring between two looks at the clock. Our writes to the
+ * SRAM also hold up the M0's pin writes, and written back to back they shut
+ * it out for the whole run: fewer at a time, with the clock read in between
+ * for a pause, costs this CPU more time per period and the M0 less each time.
+ */
+static unsigned int ring_burst = 32;
+module_param(ring_burst, uint, 0644);
+MODULE_PARM_DESC(ring_burst, "Ring words written back to back (default 32)");
 
 struct m0_audio_shmem {
 	volatile uint32_t magic;
@@ -127,7 +169,7 @@ struct m0_audio_shmem {
 	volatile uint32_t tick_cycles;   /* core clock cycles per tick */
 	volatile uint32_t ticks_base;    /* ticks per sample: whole part ... */
 	volatile uint32_t ticks_frac;    /* ... and fraction, in 2^-32 tick */
-	volatile uint32_t _reserved;
+	volatile uint32_t stat_late;     /* written by the firmware: see m0_report_pace() */
 	volatile uint32_t stat_min_cvr;  /* PROFILE firmware: see m0_report_profile() */
 	volatile uint32_t stat_overruns;
 	uint8_t           buffer[];
@@ -147,6 +189,8 @@ struct picocalc_m0 {
 	struct clk *core_clk;      /* hclk_m0: what the M0's SysTick counts */
 	struct clk *pin_clk;       /* pclk of the GPIO bank: when a pin can change */
 	uint32_t tick_cycles;      /* as last given to the firmware */
+	bool comp;                 /* and whether it was asked to correct late pin writes */
+	uint32_t tick_ticks;       /* whole ticks per sample */
 	struct m0_audio_shmem *shmem;
 	void *shmem_virt;  /* device mapping of the SRAM: header and ring */
 	size_t shmem_size;
@@ -196,6 +240,7 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 {
 	unsigned long hclk = m->core_clk ? clk_get_rate(m->core_clk) : 0;
 	uint32_t hz = READ_ONCE(tick_hz);
+	bool with_comp = false;
 	uint32_t cycles = 0, den = 0, base = 0;
 	u64 den64;
 
@@ -212,6 +257,14 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		if (!READ_ONCE(tick_even))
 			step = 1;
 		cycles = step * DIV_ROUND_CLOSEST(hclk, step * (unsigned long)hz);
+		/* The corrected loop: one tick length only, a whole number of
+		 * GPIO clock periods, a sample of no more than 63 ticks */
+		if (READ_ONCE(comp) && M0_COMP_CYCLES % step == 0 &&
+		    hclk / M0_COMP_CYCLES >= READ_ONCE(comp_min_hz) &&
+		    hclk / (M0_COMP_CYCLES * M0_FIXED_SAMPLE_RATE_HZ) <= M0_COMP_MAX_TICKS) {
+			cycles = M0_COMP_CYCLES;
+			with_comp = true;
+		}
 		den64 = (u64)cycles * M0_FIXED_SAMPLE_RATE_HZ;
 		if (cycles >= 2 && cycles <= M0_MAX_TICK_CYCLES && den64 <= U32_MAX) {
 			den = den64;
@@ -226,6 +279,9 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		cycles = den = base = 0;
 	}
 	m->tick_cycles = cycles;
+	m->comp = with_comp && cycles;
+	m->tick_ticks = base;
+	m->shmem->stat_late = M0_STAT_LATE_NONE;
 	m->sync_skip_ns = m->sync_len_ns = 0;
 	if (cycles) {
 		/* Core cycles to ns; a tick is at most 2^24 cycles */
@@ -272,6 +328,7 @@ static void m0_report_pace(struct picocalc_m0 *m)
 {
 	unsigned long flags;
 	u64 ns, frames, due_us, got_us;
+	uint32_t late;
 	bool valid;
 
 	spin_lock_irqsave(&m->lock, flags);
@@ -291,6 +348,19 @@ static void m0_report_pace(struct picocalc_m0 *m)
 	dev_info(&m->pdev->dev,
 		 "ring updates: longest %u us, written in %u samples' quiet ticks, %u not synchronised\n",
 		 m->stat_update_ns / 1000, m->stat_windows, m->stat_unsynced);
+	/* The firmware adds up how late its pin writes were, in core cycles,
+	 * over the plain ticks: all of a sample's but the steps. */
+	late = m->shmem->stat_late;
+	if (late == M0_STAT_LATE_NONE || !m->tick_ticks) {
+		dev_info(&m->pdev->dev, "pin writes: %u core cycles per tick, not timed%s\n",
+			 m->tick_cycles, m->comp ? " (firmware cannot: PROFILE build?)" : "");
+	} else {
+		u64 ticks = frames * (m->tick_ticks - M0_ALL_STEP_TICKS);
+
+		dev_info(&m->pdev->dev,
+			 "pin writes: %u core cycles per tick, timed and corrected; late by %u cycles in all, %llu per 1000 ticks\n",
+			 m->tick_cycles, late, ticks ? div64_u64((u64)late * 1000, ticks) : 0);
+	}
 }
 
 struct m0_sync {
@@ -341,9 +411,10 @@ static void m0_ring_write(struct picocalc_m0 *m, struct m0_sync *sync,
 	void __iomem *dst = (void __iomem __force *)(m->shmem->buffer + rpos);
 	const u32 *src = (const u32 *)from;
 	uint32_t words = bytes / 4, n, i;
+	uint32_t burst = clamp(READ_ONCE(ring_burst), 1U, 1024U);
 
 	while (words) {
-		n = min(words, M0_SYNC_BURST);
+		n = min(words, burst);
 		m0_sync_wait(m, sync);
 		for (i = 0; i < n; i++)
 			__raw_writel(src[i], dst + 4 * i);
@@ -372,7 +443,8 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 	m->shmem->sample_rate = M0_FIXED_SAMPLE_RATE_HZ;
 	m->shmem->channels = 2;
 	m->shmem->format = M0_FMT_S16_LE;
-	m->shmem->flags = READ_ONCE(interp) ? 0 : M0_FLAG_NO_INTERP;
+	m->shmem->flags = (READ_ONCE(interp) ? 0 : M0_FLAG_NO_INTERP) |
+			  (m->comp ? M0_FLAG_COMP : 0);
 	m->shmem->ctrl = M0_CTRL_PLAY;
 	dma_wmb();
 	m->last_read_idx = 0;
