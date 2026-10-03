@@ -1,215 +1,158 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* M0 delta-sigma audio: single TIMER0_CH5 ISR drives both GPIO4_B2 (L) and B3 (R).
- * Power saving: WFE when idle; host must wake M0 via GRF rxev (TRM GRF_SOC_CON37 bit 4).
- * Optional WIC deep sleep: if host sets M0_SHMEM_FLAG_WIC_WAKE and grf_con_mcu_wicenreq
- * (CON37 bit 6), M0 uses WFI+SLEEPDEEP so it can fully power down; host asserts rxev
- * to wake. See RK3506 TRM Part 1 §4.6 (M0 status signals), GRF_SOC_CON37. */
+/* M0 delta-sigma audio: bit-bangs GPIO4_B2 (L) and B3 (R) from a ring in system
+ * SRAM, one output bit per SysTick tick. The playback loop itself is
+ * m0_play() in play.S; this file is pin/tick setup and the idle loop.
+ *
+ * The firmware is loaded once and never exits (in TCM mode it cannot be
+ * reloaded before the next reboot). Between streams it idles: SysTick slowed
+ * to one wake every few milliseconds, the core asleep in WFI in between,
+ * looking at the host's control word on each wake. See shmem.h for the
+ * handshake.
+ *
+ * Interrupts stay masked (PRIMASK) for good: the firmware has no handlers.
+ * SysTick's pending exception only ever wakes WFI. */
 
 #include "rk3506_regs.h"
 #include "shmem.h"
+#include "play.h"
 
 #define REG(addr)   (*(volatile uint32_t *)(addr))
 
-/* Host driver must assert GRF rxev to wake M0: write GRF_SOC_CON37 (GRF_BASE+0x94) with
- * (GRF_CON37_WREN(GRF_CON37_RXEV_BIT) | (1u<<GRF_CON37_RXEV_BIT)), then clear rxev.
- * For WIC deep sleep set CON37 bit 6 (wicenreq) and shmem->flags M0_SHMEM_FLAG_WIC_WAKE. */
-#define __WFI()            __asm volatile ("wfi")
-#define __WFE()            __asm volatile ("wfe")
+/* Offsets play.S uses; keep the struct and the assembler in step. */
+_Static_assert(__builtin_offsetof(m0_audio_shmem_t, ctrl) == M0_SHMEM_CTRL, "ctrl");
+_Static_assert(__builtin_offsetof(m0_audio_shmem_t, write_idx) == M0_SHMEM_WRITE_IDX, "write_idx");
+_Static_assert(__builtin_offsetof(m0_audio_shmem_t, read_idx) == M0_SHMEM_READ_IDX, "read_idx");
+_Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_min_cvr) == M0_SHMEM_STAT_MIN_CVR, "stat_min_cvr");
+_Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_overruns) == M0_SHMEM_STAT_OVERRUNS, "stat_overruns");
+_Static_assert(__builtin_offsetof(m0_audio_shmem_t, buffer) == M0_HEADER_SIZE, "header");
+_Static_assert(DSM_FS_SHIFT >= M0_COMP_LOG2_CYCLES, "comp scaling");
+_Static_assert(M0_MIN_TICKS_PER_SAMPLE > M0_COMP_STEPS, "a sample needs a plain tick too");
+_Static_assert((M0_RING_BYTES & (M0_RING_BYTES - 1U)) == 0, "ring size must be a power of two");
+_Static_assert(M0_IDLE_CYCLES <= SYST_MAX + 1U, "idle period does not fit SysTick");
 
-/*
- * Fixed config: fewer memory loads in the ISR and no format/sample-rate logic.
- * ALSA on the host can do sample-rate conversion to this rate.
- * Linux driver must use the same sample_rate and buf_size.
- */
-#define M0_FIXED_SAMPLE_RATE_HZ  48000U
-#define M0_FIXED_BUF_SIZE        8192U
-#define M0_FIXED_BUF_MASK         (M0_FIXED_BUF_SIZE - 1U)
-
-/*
- * Single struct for hand-tuned asm ISR: state and constants inlined (one load per
- * access). Only timer_irq, gpio_dr, buf_ptr, shmem_base are addresses; rest are values.
- * Layout byte offsets must match isr.S. Left and right DSM state are contiguous
- * for LDM/STM (I1, I2, LAST, OUT per channel).
- */
-typedef struct {
-	uint32_t timer_irq;
-	uint32_t gpio_dr;
-	uint32_t phase_acc;
-	uint32_t read_idx;
-	uint32_t buf_ptr;
-	uint32_t shmem_ctr;
-	uint32_t _pad0;
-	uint32_t _pad1;
-	/* Left channel DSM state (contiguous for LDM/STM) */
-	int32_t  integ1_l;
-	int32_t  integ2_l;
-	int32_t  last_l;
-	uint32_t out_l;
-	/* Right channel DSM state (contiguous for LDM/STM) */
-	int32_t  integ1_r;
-	int32_t  integ2_r;
-	int32_t  last_r;
-	uint32_t out_r;
-	uint32_t shmem_base;
-	uint32_t rate_48k;
-	uint32_t ds_rate;
-	uint32_t buf_mask;
-	uint32_t dsm_half;
-	uint32_t dsm_full;
-	uint32_t batch;
-	uint32_t gpio_base_mask;
-} m0_isr_globs_t;
-
-m0_isr_globs_t m0_isr_globs __attribute__((used)) = {
-	.timer_irq     = TIMER0_CH5_BASE + TIMER_INTSTAT,
-	.gpio_dr       = GPIO4_BASE + GPIO_DR_L,
-	.rate_48k      = M0_FIXED_SAMPLE_RATE_HZ,
-	.ds_rate       = DS_RATE_HZ,
-	.buf_mask      = M0_FIXED_BUF_MASK,
-	.dsm_half      = (uint32_t)DSM_HALF_SCALE,
-	.dsm_full      = (uint32_t)DSM_FULL_SCALE,
-	.batch         = 8,
-	.gpio_base_mask = (0x0C00U << 16),
-	.shmem_base    = (uint32_t)M0_SHMEM_ADDR,
-};
+/* Tick timing when the host gives none (see rk3506_regs.h) */
+#define DEF_DEN   (M0_DEFAULT_TICK_CYCLES * M0_SAMPLE_RATE_HZ)
+#define DEF_BASE  (M0_DEFAULT_CORE_HZ / DEF_DEN)
+#define DEF_FRAC  ((uint32_t)(((unsigned long long)(M0_DEFAULT_CORE_HZ % DEF_DEN) << 32) / DEF_DEN))
+_Static_assert(DEF_BASE >= M0_MIN_TICKS_PER_SAMPLE, "default tick rate too low");
+_Static_assert(M0_MIN_TICKS_PER_SAMPLE > M0_STEP_TICKS, "a sample needs a plain tick too");
 
 __attribute__((always_inline)) static inline void gpio_write_both(uint32_t bit_l, uint32_t bit_r)
 {
 	REG(GPIO4_BASE + GPIO_DR_L) = GPIO4_DR_WRITE(bit_l, bit_r);
 }
 
-static void timer5_start(void)
+__attribute__((always_inline)) static inline void tick_ack(void)
 {
-	REG(TIMER0_CH5_BASE + TIMER_LOAD0) = DS_PERIOD_TICKS;
-	REG(TIMER0_CH5_BASE + TIMER_CTRL) = TIMER_RUN;
+	REG(SCB_ICSR) = 1u << ICSR_PENDSTCLR_BIT;
 }
 
-static void timer5_stop(void)
+/* One SysTick wake every 'cycles' core clock cycles */
+static void tick_set(uint32_t cycles)
 {
-	REG(TIMER0_CH5_BASE + TIMER_CTRL) = TIMER_STOP;
+	REG(SYST_CSR) = 0;
+	REG(SYST_RVR) = cycles - 1U;
+	REG(SYST_CVR) = 0;
+	tick_ack();
+	REG(SYST_CSR) = SYST_CSR_RUN;
 }
 
-__attribute__((always_inline)) static inline void clear_timer5_irq(void)
+/* Take the tick timing from the header if it is usable, else the defaults,
+ * hand the per-sample part to m0_play() and switch SysTick to the tick rate.
+ * Returns whether the stream can be played by m0_play_comp(). */
+static int tick_start(const m0_audio_shmem_t *shmem)
 {
-	REG(TIMER0_CH5_BASE + TIMER_INTSTAT) = 1;
-}
+	uint32_t cycles = shmem->tick_cycles;
+	uint32_t base = shmem->ticks_base;
+	uint32_t frac = shmem->ticks_frac;
+	uint32_t shift = 0, interp = ~0U, steps = M0_STEP_TICKS;
+	int comp = 0;
 
-/* Advance read_idx by step bytes and batch-write to shared memory every 8 frames. */
-__attribute__((always_inline)) static inline void advance_read_idx(uint32_t step)
-{
-	m0_isr_globs.read_idx = (m0_isr_globs.read_idx + step) & m0_isr_globs.buf_mask;
-	if (++m0_isr_globs.shmem_ctr >= m0_isr_globs.batch) {
-		m0_isr_globs.shmem_ctr = 0;
-		((m0_audio_shmem_t *)m0_isr_globs.shmem_base)->read_idx = m0_isr_globs.read_idx;
-		__dmb();
+	if (cycles < 2U || cycles > SYST_MAX + 1U || base < M0_MIN_TICKS_PER_SAMPLE) {
+		cycles = M0_DEFAULT_TICK_CYCLES;
+		base = DEF_BASE;
+		frac = DEF_FRAC;
 	}
-}
-
-/* S16 LE stereo only (fixed config). Used from main loop only; ISR uses asm consume. */
-__attribute__((always_inline)) static inline void consume_s16_stereo(int32_t *s32_l, int32_t *s32_r)
-{
-	m0_audio_shmem_t *shmem = (m0_audio_shmem_t *)m0_isr_globs.shmem_base;
-	uint8_t *buf = (uint8_t *)m0_isr_globs.buf_ptr;
-	uint32_t i;
-
-	if (shmem->write_idx == m0_isr_globs.read_idx)
-		return; /* empty: hold last sample */
-	i = m0_isr_globs.read_idx & m0_isr_globs.buf_mask;
-	*s32_l = (int16_t)(buf[i] | (buf[(i + 1) & m0_isr_globs.buf_mask] << 8));
-	i = (m0_isr_globs.read_idx + 2) & m0_isr_globs.buf_mask;
-	*s32_r = (int16_t)(buf[i] | (buf[(i + 1) & m0_isr_globs.buf_mask] << 8));
-	advance_read_idx(4);
-}
-
-/* Hand-tuned asm ISR: load-order scheduling to avoid stalls, minimal push/pop. */
-void TIMER0_CH5_IRQHandler(void);
-
-static void nvic_enable_timer5(void)
-{
-	/* NVIC_ISER0: set bit 19 to enable IRQ 19 */
-	REG(0xE000E100) = (1u << TIMER0_CH5_IRQ);
-}
-
-static void nvic_disable_timer5(void)
-{
-	/* NVIC_ICER0: set bit 19 to disable IRQ 19 */
-	REG(0xE000E180) = (1u << TIMER0_CH5_IRQ);
+	/* The input steps 2^-shift of the way to the next sample per tick: the
+	 * smallest shift that does not overshoot in the longest sample. */
+	while ((1U << shift) < base + 1U)
+		shift++;
+	if (shift > M0_MAX_SHIFT) {
+		shift = M0_MAX_SHIFT;
+		interp = 0;
+	}
+	if (shmem->flags & M0_FLAG_NO_INTERP)
+		interp = 0;
+	/* Holding needs no fraction, and a held full-scale square drives the
+	 * state far further than a ramped one: keep the headroom. */
+	if (!interp)
+		shift = 0;
+#ifndef M0_PROFILE
+	/* The corrected loop is written for one tick length; it holds each
+	 * sample and has fewer steps (play.S). */
+	if ((shmem->flags & M0_FLAG_COMP) && cycles == M0_COMP_CYCLES) {
+		comp = 1;
+		shift = 0;
+		steps = M0_COMP_STEPS;
+	}
+#endif
+	m0_play_state[PS_FRAC / 4] = frac;
+	m0_play_state[PS_PLAIN / 4] = base - steps;
+	m0_play_state[PS_SHIFT / 4] = shift;
+	m0_play_state[PS_DX_MASK / 4] = interp;
+	tick_set(cycles);
+	return comp;
 }
 
 static void hardware_init(void)
 {
-	/* CRU: enable TIMER0_CH5 and PCLK_TIMER */
-	REG(CRU_BASE + CRU_GATE_CON06) = CRU_TIMER5_EN;
-	REG(CRU_BASE + CRU_CLKSEL_CON23) = CRU_TIMER5_100M;
+	/* CRU: ungate GPIO4 (pclk + dbclk). Nothing else is needed: the tick is
+	 * inside the core. */
 	REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
 
 	/* GPIO4 B2/B3: digital mode then output, both low */
 	REG(GPIO4_IOC_BASE + SARADC_CON) = SARADC_CON_B23_EN;
 	REG(GPIO4_BASE + GPIO_DDR_L) = GPIO4_B23_OUT_DIR;
 	gpio_write_both(0, 0);
-
-	/* Timer: load period, don't start yet */
-	REG(TIMER0_CH5_BASE + TIMER_LOAD0) = DS_PERIOD_TICKS;
-	REG(TIMER0_CH5_BASE + TIMER_CTRL) = TIMER_STOP;
-}
-
-/* Re-enable TIMER5 and GPIO4 clocks before starting playback (idle may gate them). */
-static void clocks_ungate_play(void)
-{
-	REG(CRU_BASE + CRU_GATE_CON06) = CRU_TIMER5_EN;
-	REG(CRU_BASE + CRU_CLKSEL_CON23) = CRU_TIMER5_100M;
-	REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
-}
-
-/*
- * Gate TIMER5/GPIO4 clocks when idle to save power. Intentionally a stub:
- * with the current Linux integration we always rproc_shutdown() on stop, so
- * the M0 is never kept alive between play cycles and this path has no effect.
- * If we move to a "keep M0 alive" model, implement actual gate-disable values
- * per TRM for CRU_GATE_CON06 / CRU_GATE_CON13; those registers may be shared
- * with other peripherals — use read-modify-write if needed.
- */
-static void clocks_gate_idle(void)
-{
 }
 
 int main(void)
 {
+	m0_audio_shmem_t *shmem = (m0_audio_shmem_t *)M0_SHMEM_ADDR;
+
+	__asm volatile ("cpsid i");
 	hardware_init();
 
 	for (;;) {
-		m0_audio_shmem_t *shmem = (m0_audio_shmem_t *)m0_isr_globs.shmem_base;
+		/* Idle: asleep except for a look at ctrl every M0_IDLE_CYCLES */
+		tick_set(M0_IDLE_CYCLES);
+		shmem->m0_state = M0_STATE_IDLE;
+		do {
+			__asm volatile ("wfi");
+			tick_ack();
+		} while (shmem->magic != M0_AUDIO_MAGIC || shmem->ctrl != M0_CTRL_PLAY);
 
-		while (shmem->magic != M0_AUDIO_MAGIC)
-			__WFE();
-		if (shmem->flags & M0_SHMEM_FLAG_WIC_WAKE) {
-			REG(SCB_SCR) = SCB_SCR_SLEEPDEEP;
-			while (shmem->ctrl != M0_CTRL_PLAY)
-				__WFI();
-			REG(SCB_SCR) = 0;
+		shmem->m0_state = M0_STATE_PLAY;
+		REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
+		if (tick_start(shmem)) {
+#ifndef M0_PROFILE
+			/* Blocking writes: the loop times each pin write */
+			REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
+			m0_play_comp(); /* until ctrl != PLAY */
+#if M0_COMP_STATS == 1
+			shmem->stat_late = m0_play_state[PS_DSUM / 4];
+#else
+			shmem->stat_late = M0_STAT_LATE_UNKNOWN;
+#endif
+#endif
 		} else {
-			while (shmem->ctrl != M0_CTRL_PLAY)
-				__WFE();
+			/* Let bus writes complete behind our back: the GPIO write
+			 * in every tick then costs a few cycles instead of 32
+			 * (rk3506_regs.h). */
+			REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_BUFFERABLE;
+			m0_play(); /* until ctrl != PLAY */
+			shmem->stat_late = M0_STAT_LATE_NONE;
 		}
-
-		clocks_ungate_play();
-		m0_isr_globs.buf_ptr = (uint32_t)shmem->buffer;
-		m0_isr_globs.read_idx = shmem->read_idx;
-		m0_isr_globs.shmem_ctr = 0;
-		m0_isr_globs.integ1_l = m0_isr_globs.integ2_l = 0;
-		m0_isr_globs.integ1_r = m0_isr_globs.integ2_r = 0;
-		m0_isr_globs.out_l = m0_isr_globs.out_r = 0;
-		m0_isr_globs.phase_acc = 0;
-		m0_isr_globs.last_l = m0_isr_globs.last_r = 0;
-		__asm volatile("" ::: "memory"); /* compiler barrier: state visible before IRQ */
-		nvic_enable_timer5();
-		timer5_start();
-		while (shmem->ctrl == M0_CTRL_PLAY)
-			__WFE();
-		timer5_stop();
-		REG(TIMER0_CH5_BASE + TIMER_INTSTAT) = 1; /* clear any pending IRQ before masking */
-		nvic_disable_timer5();
 		gpio_write_both(0, 0);
-		clocks_gate_idle();
 	}
 }

@@ -4,11 +4,18 @@
 #ifndef RK3506_REGS_H
 #define RK3506_REGS_H
 
+/* Shared with play.S: constants the assembler needs are written with U32()
+ * so they lose the C suffix there. */
+#ifdef __ASSEMBLER__
+#define U32(x)            x
+#else
 #include <stdint.h>
+#define U32(x)            x##U
+#endif
 
 /* GPIO4 — bit-bang output (GPIO4_B2 = left, GPIO4_B3 = right) */
-#define GPIO4_BASE        0xFF1E0000U
-#define GPIO_DR_L          0x0000U
+#define GPIO4_BASE        U32(0xFF1E0000)
+#define GPIO_DR_L          U32(0x0000)
 #define GPIO_DDR_L         0x0008U
 #define GPIO4_B2_MASK     (1u << (16+10))
 #define GPIO4_B3_MASK     (1u << (16+11))
@@ -18,70 +25,110 @@
 /* Build atomic GPIO write: mask bits 26,27; data bits 10,11 from bit_l and bit_r */
 #define GPIO4_DR_WRITE(bit_l, bit_r) \
 	((0x0C00U << 16) | ((bit_l) << 10) | ((bit_r) << 11))
+/* Same word for play.S: write-enable B2/B3 with both low / both high */
+#define GPIO4_DR_B23_LOW  U32(0x0C000000)
+#define GPIO4_DR_B23_HIGH U32(0x0C000C00)
+#define GPIO4_B2_BIT      10
+#define GPIO4_B3_BIT      11
 
-/* GPIO4 IOC — enable digital mode for B2/B3 */
+/* GPIO4 IOC — GPIO4_B0..B3 are shared with SARADC_IN0..3 and are 1.8 V pads
+ * (TRM 17.6.1). GPIO4_IOC_SARADC_CON[7:4] = per-pad GPIO input enable (B0..B3),
+ * write-enable in the upper half; 0x00C000C0 sets it for B2/B3 only. */
 #define GPIO4_IOC_BASE    0xFF4D8000U
 #define SARADC_CON        0x0840U
 #define SARADC_CON_B23_EN 0x00C000C0U
 
-/* TIMER0_CH5 — 2 MHz delta-sigma interrupt */
-#define TIMER0_CH5_BASE   0xFF255000U
+/* TIMER0_CH5. The audio firmware does not use it (its tick is SysTick, see
+ * below); the diagnostic firmware does.
+ * TIMER0_CH4/CH5 (and TIMER1_CH4/CH5) are wired straight to the Cortex-M0
+ * NVIC as IRQ 18/19 (20/21); see TRM Table 1-5 / Table 4-4. Channels 0-3 only
+ * reach the M0 through the INTMUX (NVIC 28-31). The channel's clock parent
+ * has to be selected and enabled by Linux (clocks / assigned-clock-parents
+ * in the device tree): "clk_gpll_div_100m" is gated when Linux has no user
+ * for it, and is 93.75 MHz rather than 100 on a 1500 MHz GPLL. */
+#define TIMER0_CH5_BASE   U32(0xFF255000)
 #define TIMER_LOAD0       0x0000U
 #define TIMER_LOAD1       0x0004U
 #define TIMER_CTRL        0x0010U
-#define TIMER_INTSTAT     0x0018U
-#define TIMER_RUN         0x07U
+#define TIMER_INTSTAT     U32(0x0018)
+/* TIMER_6CH_TIMERn_CONTROL (TRM 10.4.3):
+ *   bit0 timer_en    1 = enable
+ *   bit1 timer_mode  0 = free-running (auto-reload), 1 = user-defined (counts
+ *                    to LOAD once and stops until reprogrammed, TRM 10.3.2)
+ *   bit2 int_en      1 = interrupt enable
+ *   bit3 count_mode  0 = count up
+ * Periodic tick = free-running, count up, interrupt on = 0b0101; the period
+ * is LOAD + 1 counts (measured). */
+#define TIMER_RUN         0x05U
 #define TIMER_STOP        0x00U
+#define TIMER0_CH5_IRQ    19
+#define NVIC_ISER0        U32(0xE000E100)
+#define NVIC_ICER0        U32(0xE000E180)
+#define NVIC_ICPR0        U32(0xE000E280)
 
-/* CRU */
+/* CRU registers carry a per-bit write enable in the upper half; in the gate
+ * registers a 1 DISABLES the clock, so ungating writes wren bits with data 0.
+ * GATE_CON06: bit 2 pclk_timer0, bit 8 clk_timer0_ch5.
+ * GATE_CON13: bit 2 pclk_gpio4, bit 3 dbclk_gpio4. */
 #define CRU_BASE          0xFF9A0000U
 #define CRU_GATE_CON06    0x0818U
 #define CRU_GATE_CON13    0x0834U
-#define CRU_CLKSEL_CON23  0x035CU
-#define CRU_TIMER5_EN     0x01040000U
 #define CRU_GPIO4_EN      0x000C0000U
-#define CRU_TIMER5_100M   0x01C00040U
 
-/* Delta-sigma: 1-bit modulator, 48 kHz sample rate. Effective resolution (ENOB) from
- * oversampling: ENOB ≈ 1 + 2.5*log2(OSR) with OSR = ISR/48000. 100 MHz timer clock.
- * CPU cycles @200 MHz = 2 * period_ticks (one tick = 10 ns, one CPU cycle = 5 ns).
+/* SysTick: the audio tick. It is inside the core, so reading and clearing it
+ * costs 2 cycles where a TIMER0 access costs about 30, and it wakes WFI with
+ * its exception masked, a constant 3 cycles after the reload (all measured
+ * with picocalc_m0_diag_fw). It counts the core clock, hclk_m0. */
+#define SYST_CSR          U32(0xE000E010)
+#define SYST_RVR          U32(0xE000E014)
+#define SYST_CVR          U32(0xE000E018)
+#define SYST_CSR_RUN      0x7U          /* ENABLE | TICKINT | CLKSOURCE = core clock */
+#define SYST_MAX          0x00FFFFFFU
+#define SCB_ICSR          U32(0xE000ED04)
+#define ICSR_PENDSTSET_BIT 26
+#define ICSR_PENDSTCLR_BIT 25
+
+/* Tick timing comes from the host in the shared header (shmem.h): it knows
+ * the core clock rate, the firmware does not. These are used only when the
+ * header carries none: 187.5 MHz / 188 = 997 kHz, which fits in either mode.
  *
- *   ENOB (bits) │  OSR   │   ISR (Hz)    │ period (ticks) │ cy @200M │ note
- *   ────────────┼────────┼───────────────┼────────────────┼──────────┼────────────────────
- *       14.5    │  42.2  │   2 026 531   │      49        │    98    │ 50 ticks = 2 MHz
- *       14.0    │  36.8  │   1 764 523   │      57        │   114    │
- *       13.5    │  32.0  │   1 536 000   │      65        │   130    │
- *       13.0    │  27.9  │   1 337 269   │      75        │   150    │
- *       12.5    │  24.3  │   1 164 048   │      86        │   172    │
- *       12.0    │  21.1  │   1 013 269   │      99        │   198    │
- *       11.5    │  18.4  │     882 257   │     113        │   226    │
- *       11.0    │  16.0  │     768 000   │     130        │   260    │
- *       10.5    │  13.9  │     668 497   │     150        │   300    │
- *       10.0    │  12.1  │     582 084   │     172        │   344    │
- *        9.5    │  10.6  │     506 876   │     197        │   394    │
- *        9.0    │   9.2  │     441 128   │     227        │   454    │
- *        8.5    │   8.0  │     384 000   │     261        │   522    │
- *        8.0    │   7.0  │     334 061   │     299        │   598    │
- *
- * Current: 100 ticks = 1 MHz ISR → ~12 bits (200 cy @200M).*/
+ * The M0 core clock is hclk_m0, a plain gate on aclk_bus_root
+ * (CRU_CLKSEL_CON21, shared with the rest of the bus domain), so it cannot
+ * be raised for the M0 alone. In bus mode code runs at about 2.5 cycles per
+ * instruction (1 as TCM); see play.S for what a tick costs and build with
+ * PROFILE=1 to measure it. */
+#define M0_DEFAULT_CORE_HZ      187500000U
+#define M0_DEFAULT_TICK_CYCLES  160U  /* 24 ticks per sample: one more than play.S needs */
 
-#define DS_PERIOD_TICKS   100U
-#define DS_RATE_HZ        1000000U
-#define DSM_FULL_SCALE    32768
-#define DSM_HALF_SCALE    16384
+/* Modulator: both stages use +/-full-scale (1 << DSM_FS_SHIFT) feedback.
+ * The second integrator is clamped to +/-(1 << DSM_CLAMP_SHIFT), 32x full
+ * scale (in the modulator's units, see PS_SHIFT): normal programme stays
+ * below ~11x, while full-scale noise or Nyquist-rate square waves would
+ * otherwise run the state into int32 wrap.
+ * Simulated at a 1 MHz tick this gives about 49 dB SNR over 20 Hz-20 kHz at
+ * -3 dBFS (8-9 bits), and each doubling of the tick rate is worth up to
+ * about 12 dB, less as other effects (sample changes snapped to the tick
+ * grid, edge asymmetry) start to matter. */
+#define DSM_FS_SHIFT      15
+#define DSM_CLAMP_SHIFT   20
 
-/* Data memory barrier — ensures M0 store is visible to A55 before proceeding */
-#define __dmb()  __asm volatile("dmb" ::: "memory")
-
-#define TIMER0_CH5_IRQ    19
-
-/* GRF — M0 wake/sleep control (TRM §4.6, GRF_SOC_CON37). Host (A55) writes these to
+/* GRF — M0 wake/sleep control (TRM §4.6, GRF_SOC_CON37). Host (A7) writes these to
  * wake M0 from WFE or WIC deep sleep. Operational base 0xFF288000.
- * Write-enable: bits 31:16; to write bit N set bit (N+16). */
+ * Write-enable: bits 31:16; to write bit N set bit (N+16).
+ * Bit 4 is grf_con_mcu_sleepholdreqn (reset 1) — do not confuse with rxev. */
 #define GRF_BASE              0xFF288000U
+/* GRF_SOC_CON0 bit 12, mcu_hprot_bufferable: the M0's bus writes are
+ * acknowledged at once and completed by the interconnect. Measured: a GPIO
+ * write then costs the M0 about 5 cycles instead of 32, and still lands a
+ * constant time later (a read queued behind it returns after the same total
+ * time as before). The next bus access waits for it, so leave about 30
+ * cycles between a write and the following access to pay nothing. */
+#define GRF_SOC_CON0          0x0000U
+#define GRF_CON0_MCU_BUFFERABLE 0x10001000U
+#define GRF_CON0_MCU_UNBUFFERED 0x10000000U
 #define GRF_SOC_CON37         0x0094U
-#define GRF_CON37_RXEV_BIT    4U   /* Assert to wake M0 from WFE (or WIC wake) */
-#define GRF_CON37_WICENREQ_BIT 6U  /* Host sets 1 for WIC-based deep sleep (M0 can power down) */
+#define GRF_CON37_RXEV_BIT    3U   /* grf_con_mcu_rxev: sets the event register, completes WFE */
+#define GRF_CON37_WICENREQ_BIT 5U  /* grf_con_mcu_wicenreq: request WIC-based deep sleep */
 #define GRF_CON37_WREN(bit)   (1u << (16u + (bit)))
 
 /* Cortex-M0 System Control Block — SLEEPDEEP for WIC deep sleep (full power down). */

@@ -28,12 +28,11 @@ static uint32_t appl_avail(uint32_t appl, uint32_t copied, uint32_t boundary)
 	return boundary - copied + appl;
 }
 
-static uint32_t copy_size(uint32_t period, uint32_t space, uint32_t avail, uint32_t frame)
+/* As much as the ring takes: not capped at one period (see the driver). */
+static uint32_t copy_size(uint32_t space, uint32_t avail, uint32_t frame)
 {
-	uint32_t n = period;
+	uint32_t n = space;
 
-	if (n > space)
-		n = space;
 	if (n > avail)
 		n = avail;
 	return n - (n % frame);
@@ -56,11 +55,14 @@ int main(void)
 	assert(ring_space(100, 0, BUF) == BUF - 100 - 1);
 
 	/* Space-limited copy must stay frame-aligned (old bug: space = 4k-1). */
-	n = copy_size(PERIOD, ring_space(0, 0, BUF), PERIOD, FRAME);
+	n = copy_size(ring_space(0, 0, BUF), PERIOD, FRAME);
 	assert(n == PERIOD);
-	n = copy_size(8192, ring_space(0, 0, BUF), 8192, FRAME);
+	n = copy_size(ring_space(0, 0, BUF), 8192, FRAME);
 	assert(n == 8192 - 4);
 	assert(n % FRAME == 0);
+	/* A full PCM buffer at START fills the ring, not just one period. */
+	n = copy_size(ring_space(0, 0, BUF), ALSA_BUF, FRAME);
+	assert(n == BUF - FRAME);
 
 	/* Empty vs full PCM buffer at START (old bug: both looked like avail=0). */
 	assert(appl_avail(0, 0, BOUNDARY) == 0);
@@ -72,7 +74,7 @@ int main(void)
 		appl += PERIOD;
 		if (appl >= BOUNDARY)
 			appl -= BOUNDARY;
-		n = copy_size(PERIOD, ring_space(w, r, BUF),
+		n = copy_size(ring_space(w, r, BUF),
 			      appl_avail(appl, copied, BOUNDARY), FRAME);
 		assert(n > 0);
 		w = (w + n) & MASK;
@@ -100,7 +102,7 @@ int main(void)
 	/* Wrap write past end of ring. */
 	w = BUF - FRAME;
 	r = 0;
-	n = copy_size(PERIOD, ring_space(w, r, BUF), PERIOD, FRAME);
+	n = copy_size(ring_space(w, r, BUF), PERIOD, FRAME);
 	assert(n % FRAME == 0);
 	w = (w + n) & MASK;
 	assert(w < BUF);
