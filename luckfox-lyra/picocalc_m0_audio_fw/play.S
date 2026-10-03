@@ -306,14 +306,17 @@ m0_play_state:
 	adds	r7, #1
 	str	r7, [sp, #PS_EVENTS]
 	ldr	r6, [sp, #PS_K_TRACE]
-	str	r7, [r6]		@ word 0: events so far
 	lsls	r7, r7, #24
 	lsrs	r7, r7, #22		@ (n & 255) * 4
 	adds	r6, r6, r7
 	ldr	r7, [sp, #PS_SAMPLE_NO]
 	lsls	r7, r7, #5
 	adds	r7, #(\code)
-	str	r7, [r6, #4]
+	str	r7, [r6, #4]		@ the entry first ...
+	ldr	r7, [sp, #PS_EVENTS]
+	ldr	r6, [sp, #PS_K_TRACE]
+	str	r7, [r6]		@ ... then word 0, events so far: a reader that
+					@ sees the count sees the entry
 	.endm
 
 /* End of a tick's work, PROFILE builds: already pending means the tick

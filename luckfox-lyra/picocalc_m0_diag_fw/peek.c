@@ -15,12 +15,18 @@ static void onbus(int s) { (void)s; siglongjmp(jb, 1); }
 int main(int argc, char **argv)
 {
 	int wr = argc > 1 && !strcmp(argv[1], "-w");
-	unsigned long addr = strtoul(argv[wr ? 2 : 1], 0, 0);
-	unsigned long n = wr ? 1 : (argc > 2 ? strtoul(argv[2], 0, 0) : 8);
-	unsigned long val = wr ? strtoul(argv[3], 0, 0) : 0, i;
-	int fd = open("/dev/mem", (wr ? O_RDWR : O_RDONLY) | O_SYNC);
+	unsigned long addr, n, val, i;
 	volatile uint32_t *p;
+	int fd;
 
+	if (argc < (wr ? 4 : 2)) {
+		fprintf(stderr, "usage: peek ADDR [WORDS]\n       peek -w ADDR VALUE\n");
+		return 1;
+	}
+	addr = strtoul(argv[wr ? 2 : 1], 0, 0);
+	n = wr ? 1 : (argc > 2 ? strtoul(argv[2], 0, 0) : 8);
+	val = wr ? strtoul(argv[3], 0, 0) : 0;
+	fd = open("/dev/mem", (wr ? O_RDWR : O_RDONLY) | O_SYNC);
 	if (fd < 0) { perror("/dev/mem"); return 1; }
 	p = mmap(0, 0x4000, wr ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, addr & ~0xFFFUL);
 	if (p == MAP_FAILED) { perror("mmap"); return 1; }

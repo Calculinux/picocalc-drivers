@@ -66,10 +66,30 @@ int main(int argc, char **argv)
 	}
 	t = (volatile uint32_t *)((char *)map + (M0_TRACE_ADDR & 0xFFFU));
 
-	total = t[0];
-	n = total < M0_TRACE_ENTRIES ? total : M0_TRACE_ENTRIES;
-	for (i = 0; i < n; i++)		/* oldest first */
-		ev[i] = t[1 + ((total - n + 1 + i) & (M0_TRACE_ENTRIES - 1))];
+	/* The firmware may be logging while we read: it writes an entry, then
+	 * the count. Entries logged during the copy have overwritten the oldest
+	 * ones we took; look at the count again and, if it has moved, take
+	 * another copy, or after a few tries drop those. */
+	for (a = 0;; a++) {
+		uint32_t moved;
+
+		total = t[0];
+		n = total < M0_TRACE_ENTRIES ? total : M0_TRACE_ENTRIES;
+		for (i = 0; i < n; i++)		/* oldest first */
+			ev[i] = t[1 + ((total - n + 1 + i) & (M0_TRACE_ENTRIES - 1))];
+		moved = t[0] - total;
+		if (!moved)
+			break;
+		if (a == 4) {
+			if (moved > n)
+				moved = n;
+			memmove(ev, ev + moved, (n - moved) * sizeof(ev[0]));
+			n -= moved;
+			fprintf(stderr, "m0trace: events are being logged faster than they can be read; "
+					"%u possibly overwritten ones left out\n", moved);
+			break;
+		}
+	}
 
 	printf("%u events since the stream started", total);
 	if (!n) {

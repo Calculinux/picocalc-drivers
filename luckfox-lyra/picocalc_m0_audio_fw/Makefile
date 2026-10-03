@@ -36,10 +36,16 @@ $(ELF): $(OBJS)
 
 HDRS = rk3506_regs.h shmem.h play.h
 
-%.o: %.c $(HDRS)
+# PROFILE and COMP_STATS only change CFLAGS: make the objects depend on a file
+# that changes when the flags do, so that asking for another build gets it.
+.buildflags: FORCE
+	@echo '$(CC) $(CFLAGS)' | cmp -s - $@ || echo '$(CC) $(CFLAGS)' > $@
+FORCE:
+
+%.o: %.c $(HDRS) .buildflags
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-%.o: %.S $(HDRS)
+%.o: %.S $(HDRS) .buildflags
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 HOSTCC ?= cc
@@ -77,6 +83,6 @@ check-emu: $(ELF)
 	$(PYTHON) check_play.py $(ELF)
 
 clean:
-	rm -f $(OBJS) $(ELF) check_ring check_dsm m0trace m0hammer m0level
+	rm -f $(OBJS) $(ELF) .buildflags check_ring check_dsm m0trace m0hammer m0level
 
-.PHONY: all clean check check-emu
+.PHONY: all clean check check-emu FORCE

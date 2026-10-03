@@ -119,6 +119,19 @@ static bool comp;
 module_param(comp, bool, 0644);
 MODULE_PARM_DESC(comp, "Correct for pin writes delayed by other bus traffic, where the core clock allows (default off)");
 
+/*
+ * Set by the driver when a corrected stream has fallen behind by more than
+ * M0_COMP_BEHIND_US a second: the loop cannot keep up with what is holding
+ * its pin writes up (most likely the display's SPI driver still sending
+ * 16-word DMA bursts: no "rockchip,tx-dma-burst" support in this kernel),
+ * and playing uncorrected is better than that. Streams are uncorrected from
+ * then on; write 0 here to have comp tried again.
+ */
+static bool comp_gave_up;
+module_param(comp_gave_up, bool, 0644);
+MODULE_PARM_DESC(comp_gave_up, "comp is being ignored because a corrected stream could not keep pace; write 0 to retry");
+#define M0_COMP_BEHIND_US  1000
+
 static unsigned int comp_min_hz = 2500000;
 module_param(comp_min_hz, uint, 0644);
 MODULE_PARM_DESC(comp_min_hz, "Lowest bit rate at which comp is used (default 2500000)");
@@ -244,11 +257,11 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 	uint32_t hz = READ_ONCE(tick_hz);
 	bool with_comp = false;
 	uint32_t cycles = 0, den = 0, base = 0;
+	unsigned long step = 2;
 	u64 den64;
 
 	if (hclk && hz) {
 		unsigned long pclk = m->pin_clk ? clk_get_rate(m->pin_clk) : 0;
-		unsigned long step = 2;
 
 		if (pclk && pclk <= hclk && hclk % pclk == 0)
 			step = hclk / pclk;
@@ -261,7 +274,7 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		cycles = step * DIV_ROUND_CLOSEST(hclk, step * (unsigned long)hz);
 		/* The corrected loop: one tick length only, which has to be a
 		 * whole number of GPIO clock periods */
-		if (READ_ONCE(comp) && M0_COMP_CYCLES % step == 0 &&
+		if (READ_ONCE(comp) && !READ_ONCE(comp_gave_up) && M0_COMP_CYCLES % step == 0 &&
 		    hclk / M0_COMP_CYCLES >= READ_ONCE(comp_min_hz)) {
 			cycles = M0_COMP_CYCLES;
 			with_comp = true;
@@ -272,11 +285,26 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 			base = hclk / den;
 		}
 	}
-	if (base < M0_MIN_TICKS_PER_SAMPLE) {
-		if (hclk)
+	if (base < M0_MIN_TICKS_PER_SAMPLE && hclk) {
+		/* Too slow a tick for the firmware's per-sample work (or none
+		 * asked for). Its built-in timing assumes a core clock that may
+		 * not be this one, so give it the slowest tick that works here. */
+		cycles = hclk / (M0_MIN_TICKS_PER_SAMPLE * M0_FIXED_SAMPLE_RATE_HZ);
+		cycles -= cycles % step;
+		den = cycles * M0_FIXED_SAMPLE_RATE_HZ;
+		base = den ? hclk / den : 0;
+		with_comp = false;
+		if (cycles >= 2 && cycles <= M0_MAX_TICK_CYCLES && base >= M0_MIN_TICKS_PER_SAMPLE)
 			dev_warn(&m->pdev->dev,
-				 "tick_hz %u not usable with a %lu Hz core clock, using firmware defaults\n",
-				 hz, hclk);
+				 "tick_hz %u too low for a %lu Hz core clock, using %lu\n",
+				 hz, hclk, hclk / cycles);
+		else
+			base = 0;
+	}
+	if (base < M0_MIN_TICKS_PER_SAMPLE) {
+		/* No usable core clock: all the firmware can do is its defaults */
+		if (hclk)
+			dev_err(&m->pdev->dev, "no usable tick with a %lu Hz core clock\n", hclk);
 		cycles = den = base = 0;
 	}
 	m->tick_cycles = cycles;
@@ -349,6 +377,12 @@ static void m0_report_pace(struct picocalc_m0 *m)
 	dev_info(&m->pdev->dev,
 		 "ring updates: longest %u us, written in %u samples' quiet ticks, %u not synchronised\n",
 		 m->stat_update_ns / 1000, m->stat_windows, m->stat_unsynced);
+	if (m->comp && ns >= 2 * (u64)NSEC_PER_SEC &&
+	    (s64)(due_us - got_us) * USEC_PER_SEC > (s64)due_us * M0_COMP_BEHIND_US) {
+		WRITE_ONCE(comp_gave_up, true);
+		dev_warn(&m->pdev->dev,
+			 "the corrected loop fell behind: playing uncorrected from now on (does this kernel's SPI driver have rockchip,tx-dma-burst? write 0 to comp_gave_up to retry)\n");
+	}
 	/* The firmware adds up how late its pin writes were, in core cycles,
 	 * over the plain ticks: all of a sample's but the steps. */
 	late = m->shmem->stat_late;

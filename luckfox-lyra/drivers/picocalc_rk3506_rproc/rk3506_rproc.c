@@ -209,6 +209,15 @@ static void rk3506_fast_bus_off(struct rk3506_fast_bus *fb)
 	fb->on = false;
 }
 
+/*
+ * The SRAM is the M0's now and stays so until reboot: no more loading, and
+ * nothing of ours may touch it. Not per device: the device can be unbound and
+ * bound again (sysfs, or its overlay removed and applied again) while the
+ * SRAM stays as it is; only the module cannot go (it holds a reference to
+ * itself from then on).
+ */
+static bool rk3506_tcm_engaged;
+
 typedef struct {
 	struct rproc *rproc;
 	struct clk_bulk_data *clks;
@@ -223,7 +232,6 @@ typedef struct {
 	uint8_t *regs_GRF;
 	struct platform_device *pdev;
 	bool tcm;           /* "rockchip,tcm": run the image as TCM */
-	bool tcm_engaged;   /* the SRAM is the M0's now; no more loading */
 	uint32_t code_addr; /* where M0 address 0 is */
 	uint32_t code_size;
 	struct rk3506_fast_bus fast_bus; /* "picocalc,double-core-clock" */
@@ -248,7 +256,7 @@ static int rk3506_rproc_start(struct rproc *rproc)
 	 * initial SP and reset vector from here. */
 	uint32_t mcu_entry = mcu->code_addr;
 
-	if (mcu->tcm_engaged) {
+	if (rk3506_tcm_engaged) {
 		/* Address map and image are already in place; just let it run. */
 		dev_info(&rproc->dev, "Restarting M0 MCU from its TCM image");
 		rk3506_rproc_mcu_run(mcu, true);
@@ -269,7 +277,7 @@ static int rk3506_rproc_start(struct rproc *rproc)
 		return -EIO;
 	}
 	if (mcu->tcm) {
-		mcu->tcm_engaged = true;
+		rk3506_tcm_engaged = true;
 		/* The state above must outlive any attempt to unload us. */
 		__module_get(THIS_MODULE);
 		dev_info(&rproc->dev,
@@ -298,7 +306,7 @@ static int rk3506_rproc_load(struct rproc *rproc, const struct firmware *fw)
 
 	void __iomem *dst = mcu->tcm_virt + (mcu->code_addr - RK3506_MCU_TCM_ADDR);
 
-	if (mcu->tcm_engaged)
+	if (rk3506_tcm_engaged)
 		return 0;
 	if (fw->size > mcu->code_size) {
 		dev_err(&rproc->dev, "M0 MCU FW is too big: size=%u", (uint32_t)fw->size);
@@ -334,9 +342,7 @@ static void *my_da_to_va(struct rproc *rproc, u64 da, size_t len, bool *is_iomem
 /* Once the SRAM is TCM the A7 must not touch it: the image stays as loaded. */
 static int rk3506_rproc_elf_load(struct rproc *rproc, const struct firmware *fw)
 {
-	rk3506_mcu_t *mcu = rproc->priv;
-
-	if (mcu->tcm_engaged)
+	if (rk3506_tcm_engaged)
 		return 0;
 	return rproc_elf_load_segments(rproc, fw);
 }
@@ -407,6 +413,13 @@ static int rk3506_rproc_probe(struct platform_device *pdev)
 	mcu->tcm = of_property_read_bool(pdev->dev.of_node, "rockchip,tcm");
 	mcu->code_addr = mcu->tcm ? RK3506_MCU_TCM_ADDR : RK3506_MCU_CODE_ADDR;
 	mcu->code_size = mcu->tcm ? RK3506_MCU_TCM_SIZE : RK3506_MCU_CODE_SIZE;
+	if (rk3506_tcm_engaged && !mcu->tcm) {
+		/* The bus-mode image address is inside what is now TCM */
+		dev_err(&pdev->dev,
+			"the SRAM became M0 TCM earlier in this boot: only \"rockchip,tcm\" can be used until reboot\n");
+		ret = -EBUSY;
+		goto free_rproc;
+	}
 
 	mcu->num_clks = devm_clk_bulk_get_all(&pdev->dev, &mcu->clks);
 	if (mcu->num_clks < 0) {

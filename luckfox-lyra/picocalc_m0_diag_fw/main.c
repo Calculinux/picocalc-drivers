@@ -297,20 +297,25 @@ static void systick_tick(volatile struct m0_diag_lat *l)
 
 	while (l->n < M0_DIAG_LAT_N && res->syst_nowake < 16U) {
 		uint32_t cvr = diag_wfi_read((volatile uint32_t *)SYST_CVR);
+		uint32_t backstop = REG(NVIC_ISPR0) & TICK_IRQ_BIT;
 
 		if (REG(SCB_ICSR) & ICSR_PENDSTSET) {
 			REG(SCB_ICSR) = ICSR_PENDSTCLR;
-			l->pend_seen++;
-			since_backstop++;
-			cvr = (M0_DIAG_SYST_PERIOD - 1U) - cvr;
-			lat_add(l, cvr, cvr);
-		} else if (!(REG(NVIC_ISPR0) & TICK_IRQ_BIT)) {
+			/* With the backstop pending too, this wake may be its doing:
+			 * a SysTick that sets its pending bit but wakes nothing
+			 * would otherwise pass for one that does. */
+			if (!backstop) {
+				l->pend_seen++;
+				since_backstop++;
+				cvr = (M0_DIAG_SYST_PERIOD - 1U) - cvr;
+				lat_add(l, cvr, cvr);
+			}
+		} else if (!backstop) {
 			l->spurious++;
 		}
-		/* The backstop also wakes WFI (and delays the SysTick sample that
-		 * follows it: those are the few large values in the histogram). It
-		 * only counts against SysTick if SysTick woke nothing in between. */
-		if (REG(NVIC_ISPR0) & TICK_IRQ_BIT) {
+		/* The backstop also wakes WFI. It only counts against SysTick if
+		 * SysTick woke nothing in between. */
+		if (backstop) {
 			REG(TIMER0_CH5_BASE + TIMER_INTSTAT) = 1;
 			REG(NVIC_ICPR0) = TICK_IRQ_BIT;
 			if (!since_backstop)
