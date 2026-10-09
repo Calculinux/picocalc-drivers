@@ -467,11 +467,43 @@ takes 31 core cycles:
 
 So traffic through the SPI controllers and Linux's GPIO writes hold up the
 M0's pin write, far longer than one host write takes; the SDMMC controller
-and USB do not. The TRM has no priority setting for the M0 on the bus. In
+and USB do not. The TRM has no priority setting for the M0 on the bus, and
+the undocumented ones change nothing (see "Bus priorities" below). In
 normal use it is the display that matters: each redraw (every keypress
 echoed, every frame of a game) is a burst of late edges, a click. Simulated at 3 MHz under a -40 dBFS tone, a quarter of the
 pin writes late by up to 72 cycles puts the in-band noise at -22 dBFS for as
 long as it lasts; 2 % late, -32 dBFS.
+
+### Bus priorities
+
+The interconnect has priority (QoS) registers the TRM does not list. They
+are where the RK3308 has its "Interconnect Service" region, in the layout
+Rockchip's U-Boot uses on other chips (`+0x08` priority, two 3-bit levels;
+`+0x0c` mode; `+0x10` bandwidth; `+0x14` saturation). Found by reading
+(2026-10-09); nothing in U-Boot, the kernel or Rockchip's HAL for the
+RK3506 touches them:
+
+| Address | Blocks | Priority as booted |
+|---|---|---|
+| `0xff5c0100` | 1 (the CPU's, by the RK3308's layout) | `0x202` |
+| `0xff5c8000`, `+0x400`... | 4 of other kinds (error log, probes) | - |
+| `0xff5d8000`...`0xff5d8300`, `0x80` apart | 7 | `0x101 0x303 0x303 0x101 0x404 0x404 0x101` |
+| `0xff5e0000`...`0xff5e0200`, `0x80` apart | 5 | `0x303` each |
+
+**Reading `0xff5d0000` or `0xff5e8000` hangs the board** (no bus error, the
+read never returns; power cycle). `aclk_vio_root` is gated, which may be why
+for one of them. Everything else from `0xff588000` to `0xff5f0000` gives a
+bus error.
+
+They do not help. Measured by how far the M0 falls behind while 10 s of
+silence plays and the SPI SD card is read (1.7 MB/s; `comp` on, 375 MHz):
+26 ms a second as booted (25-66), against 2 us a second with no read. Then
+with each of the three priority-1 blocks at `0xff5d8000` raised to 5 alone,
+all three at 7, those at 7 with the two priority-4 blocks at 0, and those
+at 7 with every other block there and the CPU's at 0: 25.3 to 26.4 ms a
+second every time. Whichever block is the M0's, if any is, its priority
+does not decide who gets the peripheral bus. The five blocks at
+`0xff5e0000` were not tried.
 
 ### Correcting for late pin writes
 
