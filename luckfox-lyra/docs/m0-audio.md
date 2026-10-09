@@ -625,6 +625,30 @@ whether it was still there. The board file now names the pin `gpios`
 polling. Not yet booted. Reading or writing the card while audio plays is
 still as above.
 
+**Reading the card: the card clock, and burst length.** How far the M0
+falls behind while 10 s of silence plays and the card is read with `dd`
+(`comp` on, 375 MHz), with the card clock set through
+`/sys/kernel/debug/mmc1/clock`:
+
+| Card clock | Read speed | M0 behind |
+|---|---|---|
+| 25 MHz (as booted) | 1.7 MB/s | 26 ms/s (25-66) |
+| 12.5 MHz | 1.1 MB/s | 16 ms/s |
+| 6.25 MHz | 667 kB/s | 1 ms/s |
+| no read | - | 0.002 ms/s |
+
+Half the clock helps in proportion to the data; a quarter helps far more,
+which is not understood. The data blocks do go by DMA (SPI1 has its
+channels; transfers of 64 words or more use them), in bursts of 16 words
+each way, and the working explanation is the display's: a burst cannot be
+interrupted, and 16 words to a peripheral take about as long as a tick.
+The bus priorities above make no difference, which fits. So the kernel
+patch now also takes `rockchip,rx-dma-burst`, the board file asks for 4
+words each way on SPI1, and both lengths can be changed while running
+(`tx_dma_burst`, `rx_dma_burst` in `/sys/bus/platform/devices/ff130000.spi/`).
+Not yet booted or measured: which lengths work, and whether short bursts
+allow a faster card clock (`cap-sd-highspeed` for 50 MHz).
+
 **The display: DMA burst length.** The kernel's `spi-rockchip` sends pixel
 data by DMA in bursts of a quarter of the FIFO, and the M0's pin write waits
 out a whole burst. Measured as above during a console flood, with a copy of

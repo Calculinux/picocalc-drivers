@@ -137,6 +137,14 @@
 	status = "okay";
 	pinctrl-names = "default";
 	pinctrl-0 = <&rm_io29_spi1_clk &rm_io28_spi1_mosi &rm_io31_spi1_miso &rm_io30_spi1_csn0>;
+	/* As for the display: the M0's pin write waits out a whole DMA burst,
+	 * and a card read is 16-word bursts both ways, which costs the M0
+	 * 2.6 % of its output bits at 25 MHz (docs/m0-audio.md). 4 is where
+	 * to start, not yet measured; both can be changed while running in
+	 * /sys/bus/platform/devices/ff130000.spi/. Needs the kernel patch
+	 * (docs/spi-rockchip-tx-burst.patch); ignored without. */
+	rockchip,tx-dma-burst = <4>;
+	rockchip,rx-dma-burst = <4>;
 
 	spi_mmc: mmc@0 {
 		compatible = "mmc-spi-slot";
