@@ -150,6 +150,11 @@
 		compatible = "mmc-spi-slot";
 		reg = <0>;  // Chip Select 0
 		spi-max-frequency = <50000000>;
+		/* On trial: without this the card stays at 25 MHz whatever
+		 * spi-max-frequency says. Whether the slot's wiring and M0
+		 * audio take 50 MHz is not yet tested; the clock can be
+		 * lowered while running in /sys/kernel/debug/mmc1/clock. */
+		cap-sd-highspeed;
 		pinctrl-names = "default";
 		pinctrl-0 = <&spi_mmc_cd>;
 		/* Card detect. mmc-spi-slot does not take the usual cd-gpios:
