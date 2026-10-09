@@ -422,28 +422,31 @@ when a stream ends says how many updates were synchronised. With too few
 plain ticks in a sample (a slow tick in bus mode) there is no room and the
 driver writes unsynchronised.
 
-What is left with `ring_sync` on is the display. A few ticks are late at
-multiples of 1.0133 s, which is how often the console's terminal program
-redraws; stop it and the bare console cursor blinks instead, and the late
-ticks move to multiples of 203 ms. The heartbeat LED and the battery
-monitor make no difference. The cause is the same kind of thing as before,
+What is left with `ring_sync` on is traffic on the SPI controllers. A few
+ticks are late at multiples of 1.0133 s. That was first put down to the
+console's terminal program redrawing, wrongly: it is the kernel asking the
+card in the SPI slot (`mmc1`) whether it is still there, once a second (see
+"An idle card ticked once a second" below). With the terminal program stopped the
+bare console cursor blinks, and there are late ticks at multiples of 203 ms
+as well. The heartbeat LED and the battery monitor make no difference. The cause is the same kind of thing as before,
 on another bus: host *writes* to peripheral registers get in the way of the
 M0's pin write, which it makes every tick.
 
 | Host activity (`m0hammer`, `ring_sync` on) | Late ticks | M0 behind |
 |---|---|---|
-| nothing extra (terminal redrawing once a second) | 0-1.5 a second | 0-2 us/s |
+| nothing extra (SD card on SPI polled once a second) | 0-1.5 a second | 0-2 us/s |
 | writing a GPIO data register (bank 0 or 4, masked no-op) 16.5 million times a second | 250000 a second | 341000 us/s |
 | the same 1000 times a second | 1 a second | 1 us/s |
 | writing `GRF_SOC_CON0` (masked no-op) 16.5 million times a second | as nothing extra | 0 |
 | reading a GPIO or SPI register 5 million times a second | 0.4-2.7 a second | 0 |
 
-So a host GPIO write costs the M0 about 21 ns when they meet, and a redraw
-(SPI transfer plus the display's D/C pin on GPIO0) makes two to four
-consecutive ticks late about once: pin edges tens of nanoseconds late, where
+So a host GPIO write costs the M0 about 21 ns when they meet, and one poll
+of the SD card (a short SPI transfer) makes two to four consecutive ticks
+late about once: pin edges tens of nanoseconds late, where
 the ring copy made them late by most of a microsecond a dozen times a
-second. Nothing in the driver can prevent this; whether it can be heard has
-not been checked.
+second. Nothing in the sound driver can prevent this. It can be heard: on
+headphones, as a faint tick a second in silence, even with the correction
+below.
 
 ### Pops: what delays the pin write
 
@@ -465,9 +468,8 @@ takes 31 core cycles:
 So traffic through the SPI controllers and Linux's GPIO writes hold up the
 M0's pin write, far longer than one host write takes; the SDMMC controller
 and USB do not. The TRM has no priority setting for the M0 on the bus. In
-normal use it is the display that matters: each redraw (the console's
-terminal program once a second, every keypress echoed) is a burst of late
-edges, a click. Simulated at 3 MHz under a -40 dBFS tone, a quarter of the
+normal use it is the display that matters: each redraw (every keypress
+echoed, every frame of a game) is a burst of late edges, a click. Simulated at 3 MHz under a -40 dBFS tone, a quarter of the
 pin writes late by up to 72 cycles puts the in-band noise at -22 dBFS for as
 long as it lasts; 2 % late, -32 dBFS.
 
@@ -575,6 +577,21 @@ does not just get late edges, it falls about 2 % behind (20 ms a second,
 the same at 187.5 and 375 MHz): the SPI driver moves that card's data with
 the CPU, in long runs of back-to-back register accesses, and the M0 is shut
 out for whole ticks at a time. Not yet looked into.
+
+**An idle card ticked once a second** (found 2026-10-09, with the corrected
+loop, 375 MHz and four-word display bursts all in use). With a card in the
+slot, mounted or not, the SPI1 interrupt fired every 1.014 s while the
+display's controller and its DMA channels were silent, and a faint tick
+could be heard at that rate in silence on headphones. Unbinding `mmc_spi`
+from `spi1.0` stopped both. The cause: `mmc_spi` does not read the usual
+`cd-gpios` property, only `gpios` (0: card detect, 1: write protect), so the
+slot's card-detect pin was never requested (`cd polling` in the boot log)
+and the MMC core sent the card a status command once a second to see
+whether it was still there. The board file now names the pin `gpios`
+(GPIO1_B2, low with a card in, pulled up on the mainboard: 0 with a card,
+1 without, read from the pin), which gives the driver an interrupt and no
+polling. Not yet booted. Reading or writing the card while audio plays is
+still as above.
 
 **The display: DMA burst length.** The kernel's `spi-rockchip` sends pixel
 data by DMA in bursts of a quarter of the FIFO, and the M0's pin write waits
