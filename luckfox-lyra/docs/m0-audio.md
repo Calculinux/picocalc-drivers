@@ -632,7 +632,11 @@ burst of in-band noise when its input drops to digital silence.
 high-quality jazz internet radio stream played with `ffmpeg` on the PicoCalc
 itself, through the ALSA device, on wired headphones. Configuration: the
 current defaults, TCM at 3 MHz with the M0 at 375 MHz and `comp` on (the
-corrected playback loop).
+corrected playback loop). The kernel was the 6.1.99 image whose `spi-rockchip`
+reads `rockchip,tx-dma-burst` (checked by finding the property lookup in the
+decompressed image), and the display's SPI0 sets it to 4, so the display ran
+with four-word DMA bursts. Over a stream of 35 to 86 s the driver reported the
+M0 12 to 56 us behind (0 us per second), so no stall long enough to matter.
 
 - **Overall:** much better than expected. Even the most subtle sounds render
   clearly, and no frequency range heard was a problem. By ear, comparable to
@@ -655,9 +659,10 @@ Leads on the tick (not yet tested):
   about 1.0133 s to the terminal redraw.
 - Run `ffmpeg -nostats -loglevel quiet`, or play from a file with the
   console display frozen (`poptest.sh`), and listen again. If the tick
-  goes, it is late pin writes from the display. `comp` was already on, so the
-  correction ("Correcting for late pin writes") did not remove it: check
-  that the display driver has the four-word DMA bursts it needs.
+  goes, it is the display redraw. `comp` and the four-word bursts were
+  both already active, so it would be a redraw effect they do not remove.
+  The M0's "behind" figure being near zero argues against it: a stall big
+  enough to hear would show there.
 - Play digital silence locally (`-f lavfi -i anullsrc`) to rule out the
   stream and network.
 - Record the headphone output on a PC line input and look at the tick: a
