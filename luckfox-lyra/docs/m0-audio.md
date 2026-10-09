@@ -630,9 +630,9 @@ burst of in-band noise when its input drops to digital silence.
 
 2026-10-09, first critical listening, by the author (not an audiophile): a
 high-quality jazz internet radio stream played with `ffmpeg` on the PicoCalc
-itself, through the ALSA device, on wired headphones. Firmware mode, tick
-rate, core clock and whether `comp` was on were not recorded for this run;
-note them next time.
+itself, through the ALSA device, on wired headphones. Configuration: the
+current defaults, TCM at 3 MHz with the M0 at 375 MHz and `comp` on (the
+corrected playback loop).
 
 - **Overall:** much better than expected. Even the most subtle sounds render
   clearly, and no frequency range heard was a problem. By ear, comparable to
@@ -655,8 +655,9 @@ Leads on the tick (not yet tested):
   about 1.0133 s to the terminal redraw.
 - Run `ffmpeg -nostats -loglevel quiet`, or play from a file with the
   console display frozen (`poptest.sh`), and listen again. If the tick
-  goes, it is late pin writes from the display, and the correction ("Correcting
-  for late pin writes") is the fix to check.
+  goes, it is late pin writes from the display. `comp` was already on, so the
+  correction ("Correcting for late pin writes") did not remove it: check
+  that the display driver has the four-word DMA bursts it needs.
 - Play digital silence locally (`-f lavfi -i anullsrc`) to rule out the
   stream and network.
 - Record the headphone output on a PC line input and look at the tick: a
