@@ -467,11 +467,43 @@ takes 31 core cycles:
 
 So traffic through the SPI controllers and Linux's GPIO writes hold up the
 M0's pin write, far longer than one host write takes; the SDMMC controller
-and USB do not. The TRM has no priority setting for the M0 on the bus. In
+and USB do not. The TRM has no priority setting for the M0 on the bus, and
+the undocumented ones change nothing (see "Bus priorities" below). In
 normal use it is the display that matters: each redraw (every keypress
 echoed, every frame of a game) is a burst of late edges, a click. Simulated at 3 MHz under a -40 dBFS tone, a quarter of the
 pin writes late by up to 72 cycles puts the in-band noise at -22 dBFS for as
 long as it lasts; 2 % late, -32 dBFS.
+
+### Bus priorities
+
+The interconnect has priority (QoS) registers the TRM does not list. They
+are where the RK3308 has its "Interconnect Service" region, in the layout
+Rockchip's U-Boot uses on other chips (`+0x08` priority, two 3-bit levels;
+`+0x0c` mode; `+0x10` bandwidth; `+0x14` saturation). Found by reading
+(2026-10-09); nothing in U-Boot, the kernel or Rockchip's HAL for the
+RK3506 touches them:
+
+| Address | Blocks | Priority as booted |
+|---|---|---|
+| `0xff5c0100` | 1 (the CPU's, by the RK3308's layout) | `0x202` |
+| `0xff5c8000`, `+0x400`... | 4 of other kinds (error log, probes) | - |
+| `0xff5d8000`...`0xff5d8300`, `0x80` apart | 7 | `0x101 0x303 0x303 0x101 0x404 0x404 0x101` |
+| `0xff5e0000`...`0xff5e0200`, `0x80` apart | 5 | `0x303` each |
+
+**Reading `0xff5d0000` or `0xff5e8000` hangs the board** (no bus error, the
+read never returns; power cycle). `aclk_vio_root` is gated, which may be why
+for one of them. Everything else from `0xff588000` to `0xff5f0000` gives a
+bus error.
+
+They do not help. Measured by how far the M0 falls behind while 10 s of
+silence plays and the SPI SD card is read (1.7 MB/s; `comp` on, 375 MHz):
+26 ms a second as booted (25-66), against 2 us a second with no read. Then
+with each of the three priority-1 blocks at `0xff5d8000` raised to 5 alone,
+all three at 7, those at 7 with the two priority-4 blocks at 0, and those
+at 7 with every other block there and the CPU's at 0: 25.3 to 26.4 ms a
+second every time. Whichever block is the M0's, if any is, its priority
+does not decide who gets the peripheral bus. The five blocks at
+`0xff5e0000` were not tried.
 
 ### Correcting for late pin writes
 
@@ -592,6 +624,30 @@ whether it was still there. The board file now names the pin `gpios`
 1 without, read from the pin), which gives the driver an interrupt and no
 polling. Not yet booted. Reading or writing the card while audio plays is
 still as above.
+
+**Reading the card: the card clock, and burst length.** How far the M0
+falls behind while 10 s of silence plays and the card is read with `dd`
+(`comp` on, 375 MHz), with the card clock set through
+`/sys/kernel/debug/mmc1/clock`:
+
+| Card clock | Read speed | M0 behind |
+|---|---|---|
+| 25 MHz (as booted) | 1.7 MB/s | 26 ms/s (25-66) |
+| 12.5 MHz | 1.1 MB/s | 16 ms/s |
+| 6.25 MHz | 667 kB/s | 1 ms/s |
+| no read | - | 0.002 ms/s |
+
+Half the clock helps in proportion to the data; a quarter helps far more,
+which is not understood. The data blocks do go by DMA (SPI1 has its
+channels; transfers of 64 words or more use them), in bursts of 16 words
+each way, and the working explanation is the display's: a burst cannot be
+interrupted, and 16 words to a peripheral take about as long as a tick.
+The bus priorities above make no difference, which fits. So the kernel
+patch now also takes `rockchip,rx-dma-burst`, the board file asks for 4
+words each way on SPI1, and both lengths can be changed while running
+(`tx_dma_burst`, `rx_dma_burst` in `/sys/bus/platform/devices/ff130000.spi/`).
+Not yet booted or measured: which lengths work, and whether short bursts
+allow a faster card clock (`cap-sd-highspeed` for 50 MHz).
 
 **The display: DMA burst length.** The kernel's `spi-rockchip` sends pixel
 data by DMA in bursts of a quarter of the FIFO, and the M0's pin write waits
