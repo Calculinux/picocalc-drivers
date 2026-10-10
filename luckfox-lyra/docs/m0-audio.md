@@ -578,6 +578,54 @@ the same at 187.5 and 375 MHz): the SPI driver moves that card's data with
 the CPU, in long runs of back-to-back register accesses, and the M0 is shut
 out for whole ticks at a time. Not yet looked into.
 
+**Reading the SPI SD card with four-word SPI1 bursts** (measured 2026-10-10,
+kernel with `rockchip,tx-dma-burst` / `rx-dma-burst` = 4 on `&spi1`, card
+clock 25 MHz, 3 MHz bit rate, TCM, 375 MHz core clock). `sd-audio-test.sh`
+(firmware directory, as root on the board) plays 12-15 s of digital silence
+while `dd` reads the raw card at about 1.6 MB/s and prints the driver's
+"behind" figure for each SPI1 burst length. "Behind" is time the M0's
+schedule slipped, and it does not mean the same in the two loops: the
+uncorrected loop is paced by SysTick, so a late pin write is absorbed in the
+loop's slack (about 70 cycles a tick at 375 MHz) and counts as nothing,
+while the corrected loop has about 19 spare, so the same lateness slips its
+schedule and is counted. The two columns are not comparable, and the
+uncorrected figure says nothing about how late the edges were.
+
+| SPI1 bursts (rx and tx) | Uncorrected: behind | Corrected (`comp`): behind |
+|---|---|---|
+| 16 (the driver's own) | 58-106 ms/s | 100 ms/s |
+| 8 | 2.2 ms/s | |
+| 4 | 0.014 ms/s | 3.1-4.1 ms/s |
+| 2 | 0.014 ms/s | 3.3 ms/s |
+| 1 | 0.014 ms/s | 3.1 ms/s |
+
+- Burst length matters a great deal down to 4, and not below it: the corrected
+  loop's remaining 3-4 ms/s (0.3-0.4 % slow, a twelfth of a semitone) is
+  the same at 4, 2 and 1.
+- It scales with the data rate, faster than linearly: 4.1, 1.6 and
+  0.65 ms/s at card clocks of 25, 12.5 and 6.25 MHz (1.55, 1.06, 0.65 MB/s).
+- It settles: a 40 s stream was 3.7 ms/s behind (148 ms in all), not
+  growing. The loop just plays 0.37 % slow while the card is read.
+- During a read the SPI1 interrupt fires about 25,000 times a second, 7.5
+  per 512-byte sector, plus 2 DMA completions a sector (idle: none). The
+  kernel's mmc-spi sends the command, polls for the data token, moves the
+  data, then reads the CRC, as separate transfers, and only the data moves by
+  DMA. So this is probably the CPU's register writes to the SPI controller
+  (which the M0's pin write waits for, as with GPIO data writes), not DMA
+  beats. Not checked.
+- The driver's give-up check (`M0_COMP_BEHIND_US`, 1 ms/s) is made when a
+  stream **ends**, over the whole stream, and then ignores `comp` for every
+  later stream until `comp_gave_up` is written 0. So with the shipped
+  settings the first stream played during a card read ends with
+  `comp_gave_up` set, and the display redraw correction is gone for the rest
+  of the session. A corrected loop 0.4 % slow is better than that.
+- With `COMP_STATS=1` (7 fewer spare cycles) the same reads are 5.9-8.7
+  ms/s behind, twice as bad: the loop is that sensitive to its spare cycles.
+  Pin writes pushed later averaged 3.5-8 cycles a tick (burst 16 and 4), against 3.5 for
+  the full-screen display redraw at 48 a second.
+- The card's 50 MHz trial (`cap-sd-highspeed`) was not in effect: the
+  card ran at 25 MHz in legacy timing.
+
 **An idle card ticked once a second** (found 2026-10-09, with the corrected
 loop, 375 MHz and four-word display bursts all in use). With a card in the
 slot, mounted or not, the SPI1 interrupt fired every 1.014 s while the
