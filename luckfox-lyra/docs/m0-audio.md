@@ -802,6 +802,20 @@ far from them) is silent. RF at the SPI clock and its harmonics, demodulated by 
 channel's own stages, would give what was measured: independent per-channel
 waveforms with a common envelope that follows the read bursts.
 
+Where the noise is (scope, same cal tone and reads, AC-coupled, audio band):
+at the jack tip the 1 kHz tone is 25 mV rms and silence is 0.17 / 0.20 / 0.27 / 0.40 mV
+rms in 200-1k / 1-4k / 4-10k / 10-20k Hz; with the card read (25 MHz, 2-word
+bursts) 0.54 / 1.05 / 1.42 / 1.58 mV, 50 MHz 0.61 / 1.21 / 1.65 / 1.84, 25 MHz with
+a 93.75 MHz bus 0.63 / 1.23 / 1.70 / 1.88 (-20 dB re the tone, as the recorder
+gave). The same excess is at the buffer's output (pin 6) and at its input (pin 31,
+the M0's own pad): after scaling by the 1.83 V against 3.23 V swing it is 4.8 / 5.8 /
+8.8 mV at pin 31 and 5.5 / 6.8 / 11 mV at pin 6. So the noise is already in the
+M0's bitstream at the pin; the buffer and the output filter only pass it, and the
+buffer's edges match the pin's (same edge count to 0.1 %, same share of narrow
+pulses). Supply, ground, ring, threshold, missing pulses and pickup are excluded.
+(Two-channel scope captures show spurious 64-sample mismatches between channels; do not
+match edges across channels at this fidelity.)
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
