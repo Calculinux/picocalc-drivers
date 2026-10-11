@@ -141,6 +141,17 @@ int main(void)
 			m0_play_comp(); /* until ctrl != PLAY */
 #if M0_COMP_STATS == 1
 			shmem->stat_late = m0_play_state[PS_DSUM / 4];
+#elif M0_COMP_STATS == 2
+			/* Counts of plain ticks late by >= 32, 64, 100 cycles: read with
+			 * dd from /dev/mem at M0_TRACE_ADDR (no PROFILE build uses it) */
+			{
+				volatile uint32_t *h = (volatile uint32_t *)M0_TRACE_ADDR;
+
+				h[0] = m0_play_state[PS_H32 / 4];
+				h[1] = m0_play_state[PS_H64 / 4];
+				h[2] = m0_play_state[PS_H100 / 4];
+			}
+			shmem->stat_late = M0_STAT_LATE_UNKNOWN;
 #else
 			shmem->stat_late = M0_STAT_LATE_UNKNOWN;
 #endif

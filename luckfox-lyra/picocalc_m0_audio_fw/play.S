@@ -284,6 +284,26 @@ m0_play_state:
 	str	r7, [sp, #PS_DSUM]
 7:
 	.endif
+#elif M0_COMP_STATS == 2
+	.if	\stats
+	asrs	r6, r6, #COMP_LSL	@ delta again
+	cmp	r6, #32
+	blt	7f
+	ldr	r7, [sp, #PS_H32]
+	adds	r7, #1
+	str	r7, [sp, #PS_H32]
+	cmp	r6, #64
+	blt	7f
+	ldr	r7, [sp, #PS_H64]
+	adds	r7, #1
+	str	r7, [sp, #PS_H64]
+	cmp	r6, #100
+	blt	7f
+	ldr	r7, [sp, #PS_H100]
+	adds	r7, #1
+	str	r7, [sp, #PS_H100]
+7:
+	.endif
 #endif
 	MODULATE 0
 	add	r7, r10			@ both-high word minus the bits that are 0
@@ -448,6 +468,11 @@ m0_play_state:
 	mov	lr, r0
 	movs	r0, #0
 	str	r0, [sp, #PS_DSUM]
+#if M0_COMP_STATS == 2
+	str	r0, [sp, #PS_H32]
+	str	r0, [sp, #PS_H64]
+	str	r0, [sp, #PS_H100]
+#endif
 	wfi
 	WRITE_TIMED
 	mov	r12, r6

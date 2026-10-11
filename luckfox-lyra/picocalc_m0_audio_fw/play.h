@@ -45,7 +45,11 @@
 /* m0_play_comp, COMP_STATS=1: by how many core cycles the plain ticks' pin
  * writes came later than a tick after the write before, added up */
 #define PS_DSUM       132
-#define PS_SIZE       136
+/* COMP_STATS=2: plain ticks whose write came 32, 64, 100 or more cycles late */
+#define PS_H32        136
+#define PS_H64        140
+#define PS_H100       144
+#define PS_SIZE       148
 
 /*
  * Ticks at the start of every sample that each carry one step of the
