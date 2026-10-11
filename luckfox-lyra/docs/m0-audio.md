@@ -780,6 +780,28 @@ a far larger reservoir, or a ferrite bead or a few ohms in the VDD feed, for the
 ripple to drop by 20 dB. The decisive measurement remains the ripple on the
 audio buffer's own supply (ALDO4 at U501).
 
+Two more tests, with the scope's fourth channel tacked (fine wire) onto the
+buffer's VCC pin (U501 pin 5, ALDO4):
+- 47 pF ceramics from pin 31 and from pin 32 to ground (pin 33): the ring after each
+  edge drops (median overshoot after a rise 2.25 -> 1.9 V, undershoot after a fall
+  -0.47 -> -0.04 V), the tone level is unchanged (-11.6 dBFS), and the read noise is
+  unchanged: -30.3 dBFS in every condition (before: -30.2 to -30.4). Ringing of the
+  signal at the buffer's input, and its closeness to the switching threshold, is
+  not the cause. (The idle reference rose from -50.8 to -44.4 dBFS, probably the
+  added wire on VCC.)
+- Supply ripple (mV RMS, AC-coupled, full bandwidth), 20 kHz-1 MHz / 1-5 / 5-30 /
+  30-150 MHz. Buffer VCC: no stream, no read 0.30 / 0.50 / 2.1 / 5.7; stream, no read
+  2.34 / 2.84 / 5.9 / 20.2; stream + read 25 MHz 2.39 / 2.88 / 5.8 / 19.5; stream +
+  read 50 MHz 2.40 / 2.90 / 5.9 / 19.7; no stream + read 0.34 / 0.60 / 2.6 / 6.4. The
+  card's VDD, at the same time: 2.6 -> 7.5 mV (25 MHz) and 8.5 mV (50 MHz) in
+  20 kHz-1 MHz when reading. So reading ripples the card's supply but not the
+  buffer's: the buffer's supply is not how the noise arrives.
+What is left is interference picked up after the pins: the SPI1 traces, the socket
+and the card itself are near the audio parts, and the SDMMC card (on the Lyra,
+far from them) is silent. RF at the SPI clock and its harmonics, demodulated by each
+channel's own stages, would give what was measured: independent per-channel
+waveforms with a common envelope that follows the read bursts.
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
