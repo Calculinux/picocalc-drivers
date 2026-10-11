@@ -618,7 +618,11 @@ uncorrected figure says nothing about how late the edges were.
   later stream until `comp_gave_up` is written 0. So with the shipped
   settings the first stream played during a card read ends with
   `comp_gave_up` set, and the display redraw correction is gone for the rest
-  of the session. A corrected loop 0.4 % slow is better than that.
+  of the session. A corrected loop 0.4 % slow is better than that, so the
+  limit is now 20 ms/s (2 %): above the 3-9 ms/s the loop settles at during
+  card reads, far below the ~100 ms/s it runs away at with 16-word bursts.
+  Not yet run on the board (no package built with it); the effect to check is
+  that `comp_gave_up` stays N across a stream played during `dd` of the card.
 - With `COMP_STATS=1` (7 fewer spare cycles) the same reads are 5.9-8.7
   ms/s behind, twice as bad: the loop is that sensitive to its spare cycles.
   Pin writes pushed later averaged 3.5-8 cycles a tick (burst 16 and 4), against 3.5 for
