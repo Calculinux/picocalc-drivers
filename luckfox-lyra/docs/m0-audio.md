@@ -621,8 +621,9 @@ uncorrected figure says nothing about how late the edges were.
   of the session. A corrected loop 0.4 % slow is better than that, so the
   limit is now 20 ms/s (2 %): above the 3-9 ms/s the loop settles at during
   card reads, far below the ~100 ms/s it runs away at with 16-word bursts.
-  Not yet run on the board (no package built with it); the effect to check is
-  that `comp_gave_up` stays N across a stream played during `dd` of the card.
+  Checked on the board with the module built against the image's kernel tree:
+  three back-to-back 8 s streams during `dd` of the card (1.5 MB/s) ran
+  corrected at 3.5-4.1 ms/s behind and `comp_gave_up` stayed N throughout.
 - With `COMP_STATS=1` (7 fewer spare cycles) the same reads are 5.9-8.7
   ms/s behind, twice as bad: the loop is that sensitive to its spare cycles.
   Pin writes pushed later averaged 3.5-8 cycles a tick (burst 16 and 4), against 3.5 for
