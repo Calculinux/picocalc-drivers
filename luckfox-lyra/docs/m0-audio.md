@@ -719,6 +719,56 @@ else running; levels are total 20 Hz to 20 kHz, relative, not calibrated):
   50 MHz card burst 4 -21 (2.67 MB/s), burst 2 -35 (2.67 MB/s), burst 1 -34
   (1.98 MB/s). Before (93.75 MHz, burst 4): -22 at 25 MHz and -14 at 50 MHz.
 
+**A loop-free baseline, and what it rules out** (2026-10-11, evening; Tascam
+through a ground-loop isolator on the headphone jack, PicoCalc on battery with no
+scope or meter attached, both channels checked with a 1 kHz tone at -11.6 dBFS;
+left channel, total 20 Hz to 20 kHz, dBFS; the right channel is the same to
+within 1 dB). Silence is -55.
+Any extra ground connection (a scope probe ground, a meter lead) changes the
+absolute numbers by an order of magnitude, so only compare within one session.
+
+| SPI clock | DMA burst | register bus | noise | M0 lag |
+|---|---|---|---|---|
+| 25 MHz | 4 | 93.75 MHz | -28.9 (-21 in another run) | 2.5 ms/s |
+| 25 MHz | 2 / 1 | 93.75 MHz | -31.3 / -31.7 | 1.8 / 1.4 ms/s |
+| 50 MHz | 4 | 93.75 MHz | **-17.1** (`comp` gave up) | 90 ms/s |
+| 50 MHz | 2 / 1 | 93.75 MHz | -30.0 / -31.9 | 7.6 / 27 ms/s |
+| 25 MHz | 4 / 1 | 187.5 MHz | -21.2 / -30.6 | 2 / 4 us/s |
+| 50 MHz | 4 / 2 / 1 | 187.5 MHz | -21.9 / -28.8 / -30.3 | 4 / 6 / 3 us/s |
+
+- 4-word bursts are loud and erratic (-17 to -29 dBFS); 2- and 1-word bursts
+  give a steady -29 to -32. That is up to 13 dB, and it was confirmed by ear on
+  headphones (phases with 2-word bursts are clearly quieter; the noise that is
+  left is still too noticeable against silence).
+- A floor of about -30 dBFS (A-weighted -32) remains in every short-burst setting
+  and barely moves with the card clock (12.5 MHz: -33; 25 MHz: -31; 50 MHz: -30)
+  or the card (two cards). `comp` on or off makes no difference once the bursts
+  are short (-29.3 off, -30.4 on, 25 MHz, burst 2, bus 187.5); at 4-word bursts
+  `comp` off was 13 dB worse (-15.5 against -28.9).
+- With `comp` off the noise rises smoothly with the M0 bit rate: 1.5 MHz -33.7,
+  2 MHz -30.1, 3 MHz -29.3, 4 MHz -26.9 (about the number of edges per second).
+- The noise in the left and right channels is uncorrelated as a waveform
+  (correlation -0.02, coherence 0.006 in every band) but the loudness envelopes
+  (10 ms) correlate at +0.9: both get loud and quiet at the same moments. An
+  additive supply or ground disturbance would be correlated in the waveform
+  (the idle reference's hum is: +0.57). So it is multiplicative: a common event
+  in time acting on each channel's own independent bit stream.
+- It is not data dependent (reading zeros and reading data are the same), not
+  the ground return between the SD socket shield and the jack's ground lug (the
+  DC differential moves by 4 to 5 uV; 50 mV DC range of an XDM1041), not a
+  droop of the card's VDD (3.2965 V idle, 3.294 V reading), not a voltage step in
+  the audio pad (drive 0 to 3, slew limit on or off make the ring after each edge
+  nearly vanish or grow, and the noise stays at -30.2 to -30.4), not the
+  M0's pin edges: scoped during real reads with `comp` on, the edge phases
+  against the 341.34 ns tick are unchanged from idle (no edges in phases never
+  seen at idle, 0.05 to 0.06 % in both). Measured at the SD socket's VDD pin
+  (AC-coupled, full bandwidth, ambient FM pickup with the board off is
+  0.3 mV in 20 kHz to 1 MHz): reading adds about 12 mV RMS in 20 kHz to 1 MHz
+  (13.3 against 4.8 mV) and lines at the SPI clock and its harmonics (23.4375,
+  46.875, 70.3 MHz, 20 to 27 dB above idle); the audio stream alone adds 15 to
+  32 mV of ripple at 5 to 150 MHz. The buffer's own supply (ALDO4 at U501, input
+  from IPS/VSYS) has not been probed: that is the open measurement.
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
