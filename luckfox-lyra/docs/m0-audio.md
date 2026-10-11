@@ -769,6 +769,17 @@ absolute numbers by an order of magnitude, so only compare within one session.
   32 mV of ripple at 5 to 150 MHz. The buffer's own supply (ALDO4 at U501, input
   from IPS/VSYS) has not been probed: that is the open measurement.
 
+A 10 uF + 100 nF ceramic pair soldered across the SD socket's VDD and VSS1 pads
+(leads a few millimetres) changed the recorded noise by nothing (reads -30.3 before,
+-30.5 after; references -50.8 and -50.7; same conditions, 25 MHz, burst 2, bus
+187.5 MHz). It also did not remove the ripple it was meant to: the 20 kHz to 1 MHz
+ripple at the VDD pin while reading went 13.3 -> 10.9 mV (idle 4.9 -> 1.8 mV, the
+23.4375 MHz clock line 19.7 -> 14.1 dB above idle). So that test does not exclude
+the card's supply: a card pulling tens of milliamps for tens of microseconds needs
+a far larger reservoir, or a ferrite bead or a few ohms in the VDD feed, for the
+ripple to drop by 20 dB. The decisive measurement remains the ripple on the
+audio buffer's own supply (ALDO4 at U501).
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
