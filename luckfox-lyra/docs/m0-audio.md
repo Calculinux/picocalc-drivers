@@ -675,8 +675,33 @@ value would be 187.5; `CRU_CLKSEL_CON29` at `0xFF9A0374`, bits 4:0 divide
 | /4 (as booted) | 93.75 MHz | 680-800 us/s |
 | /3 | 125 MHz | 17-21 us/s (40 times less); 5 us/s with a console flood |
 
-The board's device tree now asks for 125 MHz (`&cru` in the base dtsi). By ear
-it did not change the "rain" (below): the time behind is not what is heard.
+The board's device tree now asks for 187.5 MHz (`&cru` in the base dtsi). The
+time behind turned out not to be what is heard: see "What the noise is".
+
+**What the noise is** (2026-10-11, recorded at the headphone output with a
+Tascam DR-series recorder, `-60 dBFS` with digital silence playing and nothing
+else running; levels are total 20 Hz to 20 kHz, relative, not calibrated):
+
+- Reading the SPI SD card gives broadband (white) noise at -22 dBFS (25 MHz
+  card) to -14 dBFS (50 MHz); `comp` on or off, slow or fast pad slew, made no
+  difference; reading the SDMMC card at 22 MB/s: -58 (nothing).
+- It does not need the card: SPI1 clocking all-ones with the card selected and
+  idle gives -26 dBFS; disconnecting all four SPI1 pads from the controller
+  (IOMUX to GPIO) changes nothing (-26); with the M0 not playing, SPI1 at full
+  speed adds nothing (-83, the recorder's floor). So it is neither the card,
+  nor wiring or supply crosstalk, nor the pads: it needs the M0 toggling its
+  pins and the SPI1 controller running, on the same register bus. It is the
+  time the M0's pin edge lands moving, and the lag the driver reports (the
+  pin write's return time) does not see it.
+- SPI1 DMA burst length under the pure clocking load (25 MHz, 93.75 MHz
+  register bus unless noted), dBFS: 16: -17, 8: -22, 4: -26 (at 125 MHz), 2:
+  -31, 1: -41, 32-byte PIO transfers: -30.
+- Register bus 93.75 / 125 / 187.5 MHz at burst 4: -22.5 / -26 / -31; at burst
+  1 125 and 187.5 MHz are both -41.
+- Real card reads at a 187.5 MHz register bus: 25 MHz card burst 4 -28 dBFS,
+  burst 1 -38 (1.8 MB/s either way); 50 MHz card burst 4 -21 (2.67 MB/s), burst
+  2 -35 (2.67 MB/s), burst 1 -34 (1.98 MB/s). Before (93.75 MHz, burst 4):
+  -22 at 25 MHz and -14 at 50 MHz.
 
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
