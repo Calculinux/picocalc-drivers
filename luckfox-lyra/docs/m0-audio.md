@@ -663,6 +663,33 @@ uncorrected figure says nothing about how late the edges were.
 - The card's 50 MHz trial (`cap-sd-highspeed`) was not in effect: the
   card ran at 25 MHz in legacy timing.
 
+**The register bus clock** (2026-10-11, kernel with the register-write cache,
+`comp` on, 4-word bursts, card read at 1.6 MB/s). The SPI controllers' and
+GPIO4's register bus, `pclk_lsperi_root`, runs at 93.75 MHz (the CRU's reset
+value would be 187.5; `CRU_CLKSEL_CON29` at `0xFF9A0374`, bits 4:0 divide
+`clk_gpll_div`, 375 MHz, bits 6:5 select the parent). Written live through
+`/dev/mem` (the board stayed up; two 64 MB card reads gave identical sums):
+
+| Divider | Register bus | Behind during the card read |
+|---|---|---|
+| /4 (as booted) | 93.75 MHz | 680-800 us/s |
+| /3 | 125 MHz | 17-21 us/s (40 times less); 5 us/s with a console flood |
+
+The board's device tree now asks for 125 MHz (`&cru` in the base dtsi). By ear
+it did not change the "rain" (below): the time behind is not what is heard.
+
+**What the "rain" is not** (by ear, same day, digital silence, comp on): the
+noise that remains while the SPI SD card is read sounds like rain, gets
+quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
+absent when the SDMMC card (`mmcblk0`, 22 MB/s, and throttled to 1.6 MB/s) is
+read, and does not change with the audio pad's drive strength or slew
+(`GPIO4_IOC_SARADC_CON` `0xFF4D8840`: drive 0 to 3, slew limit on or off). It
+is therefore not the M0 being late (40 times less lag changed nothing audible)
+and not storage reads in general. The SPI1 pins are already at 2 mA. Left: the
+mainboard's SD slot (and the display) coupling into the audio buffer's supply
+or input. Not measured: nobody has put a scope on the buffer's supply or input
+during a card read.
+
 **An idle card ticked once a second** (found 2026-10-09, with the corrected
 loop, 375 MHz and four-word display bursts all in use). With a card in the
 slot, mounted or not, the SPI1 interrupt fired every 1.014 s while the

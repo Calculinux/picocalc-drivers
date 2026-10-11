@@ -174,6 +174,22 @@
 };
 
 /*
+ * Register bus of the low-speed peripherals (SPI0/1, GPIO2/3/4, I2C, UARTs...).
+ * The bootloader leaves hclk_lsperi_root at clk_gpll_div / 4 = 93.75 MHz; the
+ * SoC's reset value is / 2 (187.5 MHz). Every register access the CPU makes to
+ * a SPI controller (the display's, the SD card's) holds up the M0's write to
+ * GPIO4 for as long as it takes, and that is the one thing that makes the M0
+ * audio loop late. Measured with the SPI SD card being read (docs/m0-audio.md):
+ * 125 MHz takes the corrected loop's lag from about 780 to about 20 us a second.
+ * Only the register bus changes: the controllers' own clocks (clk_spi1...) have
+ * their own nodes.
+ */
+&cru {
+    assigned-clocks = <&cru HCLK_LSPERI_ROOT>;
+    assigned-clock-rates = <125000000>;
+};
+
+/*
  * PicoCalc audio (M0 delta-sigma or PWM) is configured via runtime device tree
  * overlays. Apply one of:
  *   - m0-audio overlay: picocalc,snd-m0 (default firmware path)
