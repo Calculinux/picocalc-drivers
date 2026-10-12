@@ -1,0 +1,36 @@
+--- play.h	2026-10-10 21:34:55.352059074 -0400
++++ /home/benklop/.claude/jobs/96c5cf3c/tmp/fw8/play.h	2026-10-12 15:13:01.666085846 -0400
+@@ -49,7 +49,15 @@
+ #define PS_H32        136
+ #define PS_H64        140
+ #define PS_H100       144
+-#define PS_SIZE       148
++#define PS_LFSR       148 /* M0_INJECT: xorshift32 state */
++#define PS_INJ_K      152 /* M0_INJECT: delay in 4-cycle loops (copied from SRAM at PS_K_INJ) */
++#define PS_INJ_MASK   156 /* M0_INJECT: inject when (lfsr & mask) == 0 */
++#define PS_INJ_MODE   160 /* M0_INJECT: 0 every write, 1 only writes with B2 high, 2 only with B2 low */
++#define PS_TMP0       164
++#define PS_TMP1       168
++#define PS_INJ_N      172 /* M0_INJECT: delays injected so far */
++#define PS_K_INJ      176 /* M0_INJECT: address of the three control words in SRAM */
++#define PS_SIZE       180
+ 
+ /*
+  * Ticks at the start of every sample that each carry one step of the
+@@ -72,11 +80,14 @@
+ /* m0_play_comp(): a tick is exactly this many core cycles (2^7), samples are
+  * held (shift 0) and take this many steps. The time from one pin write to
+  * the next is taken to be a tick less at most M0_COMP_BACK cycles. */
+-#define M0_COMP_LOG2_CYCLES 7
++#define M0_COMP_LOG2_CYCLES 8
+ #define M0_COMP_CYCLES      (1 << M0_COMP_LOG2_CYCLES)
+ #define M0_COMP_STEPS       13
+-#define M0_COMP_BACK        28
++#define M0_COMP_BACK        128
+ 
++#ifndef M0_INJECT
++#define M0_INJECT 0
++#endif
+ #ifndef M0_COMP_STATS
+ #define M0_COMP_STATS 0
+ #endif

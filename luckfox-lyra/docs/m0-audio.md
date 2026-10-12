@@ -875,6 +875,23 @@ tick by tick, 3 x 939 ticks per condition):
   0.6 / 1.2 / 8.8 %. Pin intervals that even the pre-write count does not explain
   (off by 1.5 steps or more): 2.3 / 9.9 / 15.4 % of ticks.
 
+Does the correction cancel a known timing error? (injection test, `noise-rig/injection-test`; 256-cycle tick,
+jack-tip noise in 0.2-20 kHz, left channel, silence; the loop delays the pin write by K cycles on a random 1 in 8
+of the plain ticks). Noise added over the K = 0 floor, correction off / on (mV rms, in quadrature with the floor,
+which is 2.19 / 1.37 mV total): K = 8 cycles 1.8 / 0; 16: 2.4 / 0; 32: 4.0 / 0; 48: 4.8 / 0.5; 64: 5.9 / 0.56; 96: 8.3 / 0.72;
+128: 10.1 / 22 (the window edge). So the correction removes about 90 % of the amplitude (about 20 dB of
+the power) of a pre-write delay anywhere inside its window; what is left is a steady 9 to 10 % of the uncorrected
+error, rising in proportion to it, and not understood (a gain or pulse-shape error of about that size,
+or something the filter does). At the window edge (delay = half the tick modulus) the loop misreads the delay by a
+whole tick and the noise doubles. With the production window (-28 to +99 cycles) a delayed write that is
+followed by an early one misreads as well: the first run of this test, with the window at 28, gave 12.8 mV with
+the correction on against 6.6 mV off for a 64-cycle delay. The error power scales as the square root of the injection rate (1/2, 1/8, 1/32, 1/128 of the
+plain ticks gave 6.1, 3.8, 1.9, 0.8 mV with the correction off), as for independent random timing errors.
+Delaying only the writes that carry B2 high changed nothing audible with the correction off (0.3 mV
+added) while delaying only those with B2 low gave the whole effect (4.1 mV); that asymmetry is unexplained.
+Consequence: lateness that the firmware sees before the write is cancelled well; what is left under card reads is
+lateness the loop does not see, or sees wrongly.
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is

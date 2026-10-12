@@ -1,0 +1,37 @@
+--- main.c	2026-10-10 21:34:55.352577810 -0400
++++ /home/benklop/.claude/jobs/96c5cf3c/tmp/fw8/main.c	2026-10-12 15:10:30.076135113 -0400
+@@ -90,12 +90,24 @@
+ #ifndef M0_PROFILE
+ 	/* The corrected loop is written for one tick length; it holds each
+ 	 * sample and has fewer steps (play.S). */
++#if M0_INJECT
++	if (cycles == M0_COMP_CYCLES) {	/* test build: corrected whatever the flag */
++#else
+ 	if ((shmem->flags & M0_FLAG_COMP) && cycles == M0_COMP_CYCLES) {
++#endif
+ 		comp = 1;
+ 		shift = 0;
+ 		steps = M0_COMP_STEPS;
+ 	}
+ #endif
++#if M0_INJECT
++	m0_play_state[PS_LFSR / 4] = 0x2545F491U;
++	m0_play_state[PS_INJ_K / 4] = 0;
++	m0_play_state[PS_INJ_MASK / 4] = 0xFFFFFFFFU;
++	m0_play_state[PS_INJ_MODE / 4] = 0;
++	m0_play_state[PS_INJ_N / 4] = 0;
++	m0_play_state[PS_K_INJ / 4] = M0_SHMEM_ADDR + 0x2100;
++#endif
+ 	m0_play_state[PS_FRAC / 4] = frac;
+ 	m0_play_state[PS_PLAIN / 4] = base - steps;
+ 	m0_play_state[PS_SHIFT / 4] = shift;
+@@ -164,6 +176,9 @@
+ 			m0_play(); /* until ctrl != PLAY */
+ 			shmem->stat_late = M0_STAT_LATE_NONE;
+ 		}
++#if M0_INJECT
++		*(volatile uint32_t *)(M0_SHMEM_ADDR + 0x2110) = m0_play_state[PS_INJ_N / 4];
++#endif
+ 		gpio_write_both(0, 0);
+ 	}
+ }
