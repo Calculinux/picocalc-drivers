@@ -50,9 +50,10 @@
 #define M0_FLAG_COMP             2U
 #define M0_STAT_LATE_NONE        0xFFFFFFFFU
 #define M0_STAT_LATE_UNKNOWN     0xFFFFFFFEU
-/* The firmware's corrected loop is written for this tick; it has this many
- * step ticks per sample, the rest being plain ones (play.S, m0_play_comp) */
-#define M0_COMP_CYCLES           128U
+/* The firmware's corrected loop is written for one tick length, 128 cycles
+ * or, in a firmware built with COMP_LOG2=8, 256 (comp_cycles below); it has
+ * this many step ticks per sample, the rest being plain ones (play.S,
+ * m0_play_comp) */
 #define M0_COMP_STEPS            13U
 #define M0_MAX_TICK_CYCLES       (1U << 24)  /* SysTick is 24 bits */
 
@@ -139,6 +140,9 @@ module_param(comp_gave_up, bool, 0644);
 MODULE_PARM_DESC(comp_gave_up, "comp is being ignored because a corrected stream could not keep pace; write 0 to retry");
 #define M0_COMP_BEHIND_US  20000
 
+static unsigned int comp_cycles = 128;
+module_param(comp_cycles, uint, 0644);
+MODULE_PARM_DESC(comp_cycles, "Tick length of the corrected loop in core cycles; must be what the firmware was built for: 128 (default) or 256 (make COMP_LOG2=8, with comp_min_hz below 1.46 MHz)");
 static unsigned int comp_min_hz = 2500000;
 module_param(comp_min_hz, uint, 0644);
 MODULE_PARM_DESC(comp_min_hz, "Lowest bit rate at which comp is used (default 2500000)");
@@ -281,9 +285,9 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		cycles = step * DIV_ROUND_CLOSEST(hclk, step * (unsigned long)hz);
 		/* The corrected loop: one tick length only, which has to be a
 		 * whole number of GPIO clock periods */
-		if (READ_ONCE(comp) && !READ_ONCE(comp_gave_up) && M0_COMP_CYCLES % step == 0 &&
-		    hclk / M0_COMP_CYCLES >= READ_ONCE(comp_min_hz)) {
-			cycles = M0_COMP_CYCLES;
+		if (READ_ONCE(comp) && !READ_ONCE(comp_gave_up) && READ_ONCE(comp_cycles) % step == 0 &&
+		    hclk / READ_ONCE(comp_cycles) >= READ_ONCE(comp_min_hz)) {
+			cycles = READ_ONCE(comp_cycles);
 			with_comp = true;
 		}
 		den64 = (u64)cycles * M0_FIXED_SAMPLE_RATE_HZ;

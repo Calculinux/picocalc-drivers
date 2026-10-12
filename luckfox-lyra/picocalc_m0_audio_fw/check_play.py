@@ -20,6 +20,7 @@ back into the modulator does cancel the late edges: a model that shared a
 sign error with the firmware would pass the comparison.
 """
 import math
+import os
 import random
 import struct
 import sys
@@ -49,9 +50,11 @@ MAX_SHIFT = 6
 SYST_CVR = PPB + 0x18
 TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
 TRACE_UNDERRUN = 30
-COMP_CYCLES = 128                           # m0_play_comp: core cycles per tick, fixed
+COMP_LOG2 = int(os.environ.get('COMP_LOG2', '7'))   # build with make COMP_LOG2=8 for the 256-cycle tick
+COMP_CYCLES = 1 << COMP_LOG2                # m0_play_comp: core cycles per tick, fixed
+COMP_WINDOW = COMP_CYCLES - 29              # latest a write can be told from its place in the tick: 99 at 128
 COMP_BACK = 28                              # a write comes at most this much sooner than a tick after the last
-ON_TIME = 58                                # SysTick count after a pin write that is on time
+ON_TIME = COMP_CYCLES - 70                  # SysTick count after a pin write that is on time (58 at 128)
 CATCH_UP = 15                               # cycles a late loop gains back per tick, in these tests
 
 SAMPLE_RATE = 48000
@@ -272,7 +275,7 @@ def cancels(name, trace, cycles, fs):
     blocks long enough to lose the modulator's own noise, what the pin
     delivers must follow the input far better than those changes alone would
     let it."""
-    block = 2048
+    block = 2048 * (cycles // 128) ** 2   # the slower modulator has more noise of its own to average out
     lvl = [2 * b - 1 for b, _, _ in trace]
     err = [0.0] + [lvl[i - 1] * (trace[i][1] - trace[i - 1][1]) / cycles for i in range(1, len(trace))]
     got = [0.0] + [lvl[i - 1] + err[i] for i in range(1, len(trace))]
@@ -458,10 +461,10 @@ def main():
     tcomp = timing(375000000, COMP_CYCLES)
     bad += run(path, 'corrected, none late', sine, 250000, tcomp, comp=True)
     bad += run(path, 'corrected, 25 % held up, to 64', slow, 600000, tcomp, comp=True, late=0.25, late_max=64, cancel=True)
-    bad += run(path, 'corrected, 30 % held up, to 99', slow, 600000, tcomp, comp=True, late=0.3, late_max=99, cancel=True)
+    bad += run(path, f'corrected, 30 % held up, to {COMP_WINDOW}', slow, 600000, tcomp, comp=True, late=0.3, late_max=COMP_WINDOW, cancel=True)
     bad += run(path, 'corrected, 2 % held up', slow, 600000, tcomp, comp=True, late=0.02)
-    bad += run(path, 'corrected, noise, 25 % held up', noise, 400000, tcomp, comp=True, late=0.25, late_max=99)
-    bad += run(path, 'corrected, rails, 25 % held up', rails, 400000, tcomp, comp=True, late=0.25, late_max=99)
+    bad += run(path, 'corrected, noise, 25 % held up', noise, 400000, tcomp, comp=True, late=0.25, late_max=COMP_WINDOW)
+    bad += run(path, 'corrected, rails, 25 % held up', rails, 400000, tcomp, comp=True, late=0.25, late_max=COMP_WINDOW)
     bad += run(path, 'corrected, underrun', sine, 60000, tcomp, comp=True, late=0.1, underrun_after=30000)
     bad += run(path, 'unaligned read_idx', sine, 20000, t1m2, read_idx=0x12346)
     if bad:

@@ -26,6 +26,14 @@ ifneq ($(COMP_STATS),)
 CFLAGS += -DM0_COMP_STATS=$(COMP_STATS)
 endif
 
+# make COMP_LOG2=8: a corrected-loop tick of 2^8 = 256 core cycles (1.46 MHz at
+# 375 MHz) instead of 2^7: the loop can tell a late write apart up to 227
+# cycles instead of 99 (play.S), and has far more cycles to spare. The driver
+# needs comp_cycles=256 and comp_min_hz below 1.46 MHz to match.
+ifneq ($(COMP_LOG2),)
+CFLAGS += -DM0_COMP_LOG2_CYCLES=$(COMP_LOG2)
+endif
+
 OBJS = startup.o main.o play.o resource_table.o
 ELF  = rk3506-m0-audio.elf
 

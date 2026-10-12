@@ -72,7 +72,9 @@
 /* m0_play_comp(): a tick is exactly this many core cycles (2^7), samples are
  * held (shift 0) and take this many steps. The time from one pin write to
  * the next is taken to be a tick less at most M0_COMP_BACK cycles. */
-#define M0_COMP_LOG2_CYCLES 7
+#ifndef M0_COMP_LOG2_CYCLES
+#define M0_COMP_LOG2_CYCLES 7		/* make COMP_LOG2=8: a 256-cycle tick (1.46 MHz) */
+#endif
 #define M0_COMP_CYCLES      (1 << M0_COMP_LOG2_CYCLES)
 #define M0_COMP_STEPS       13
 #define M0_COMP_BACK        28
