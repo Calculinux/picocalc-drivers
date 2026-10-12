@@ -817,19 +817,21 @@ pulses). Supply, ground, ring, threshold, missing pulses and pickup are excluded
 match edges across channels at this fidelity.)
 
 **Correction (2026-10-12, later): the "10 MHz grid" described in the next two paragraphs
-is unconfirmed, and I withdraw it as a finding.** The board can now output a 10 MHz
-reference (GPLL / 150, the same PLL as the M0's 375 MHz core clock; `noise-rig/ref10m.py`,
-Lyra pin 34) that the scope records on a second channel. Measured against it, and on the
-scope's own time base, the pin-31 edges showed no 10 MHz structure (coherence 0.001-0.06
-against 0.95 in the earlier captures). But those later captures are not clean: pin 31
-carried 1.3-1.7 times as many edges as the firmware can produce (one per tick), including
-real-looking pulses of about 100 ns, which would hide a grid; and with the reference
-running, a 10 MHz ripple and edge glitches couple between the pin-31 and reference probes.
-So the grid is neither confirmed nor excluded. What changed since the earlier captures
-(probe wiring, the charger and USB cabling, hard reboots, the scope's acquisition state) is
-not known. Treat the grid, the "slot" intervals and every number computed from them in the
-next two paragraphs as unverified; the comparison of the count before the write and the count
-after it needs repeating on clean edges.
+is withdrawn, and the "extra edges" that obscured it were measurement artefacts.**
+With pin 31 jumpered to pin 34, an on-chip counter (`noise-rig/pincount.py`: PWM1's
+counter mode on RMIO24) counts the pad's rising edges with no scope involved. For the
+toggling diagnostic firmware (one write per tick) it counts 1.001, 0.999, 1.015 and 1.014
+times the exact rate (1.4648 M cycles/s; the 1.5 % scatter is the timing of the read), and
+the scope's own hardware frequency counter reads 1,464,802 Hz at trigger levels from 0.5 to
+1.3 V (the expected rate less the scope clock's 28.9 ppm offset). So the pad has exactly one
+edge per tick. The edge lists taken from the scope's waveform memory had 1.64 times as
+many edges (ringing and acquisition artefacts; a 200 ns hold-off in the extractor
+brings them to 1.005 times), which is also what hid any grid. Edge-time analysis from those
+lists is unreliable until it has been redone on validated edges (the MSO digital
+channels, or this counter plus a hold-off checked against it). Treat the grid, the "slot"
+intervals and every number computed from them in the next two paragraphs as unverified.
+Stock firmware, silence: the counter gives 1.034 M rising edges/s (0.70 edges per tick),
+the same in every stream.
 
 The pin does not change when the M0's blocking write returns (timing diagnostic
 firmware: pin 31 toggled every tick with the corrected loop's own write and SysTick
