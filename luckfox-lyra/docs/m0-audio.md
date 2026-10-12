@@ -903,7 +903,7 @@ match edges across channels at this fidelity.)
 
 **Correction (2026-10-12, later): the "10 MHz grid" and "pin follows issue time" claims earlier versions of this section made
 are withdrawn, and the "extra edges" that obscured it were measurement artefacts.**
-With pin 31 jumpered to pin 34, an on-chip counter (`noise-rig/pincount.py`: PWM1's
+With pin 31 jumpered to pin 34, an on-chip counter (a small script, not kept in the repo: PWM1's
 counter mode on RMIO24) counts the pad's rising edges with no scope involved. For the
 toggling diagnostic firmware (one write per tick) it counts 1.001, 0.999, 1.015 and 1.014
 times the exact rate (1.4648 M cycles/s; the 1.5 % scatter is the timing of the read), and
@@ -925,7 +925,7 @@ channels). What is measured and kept: a write blocks for 53 cycles normally and 
 113 with the card read (27 % of ticks stalled at all at 25 MHz), and the injection test below
 shows the loop cancels delays it sees before the write.
 
-Does the correction cancel a known timing error? (injection test, `noise-rig/injection-test`; 256-cycle tick,
+Does the correction cancel a known timing error? (injection test, not kept in the repo; 256-cycle tick,
 jack-tip noise in 0.2-20 kHz, left channel, silence; the loop delays the pin write by K cycles on a random 1 in 8
 of the plain ticks). Noise added over the K = 0 floor, correction off / on (mV rms, in quadrature with the floor,
 which is 2.19 / 1.37 mV total): K = 8 cycles 1.8 / 0; 16: 2.4 / 0; 32: 4.0 / 0; 48: 4.8 / 0.5; 64: 5.9 / 0.56; 96: 8.3 / 0.72;
