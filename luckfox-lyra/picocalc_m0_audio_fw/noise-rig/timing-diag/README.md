@@ -5,6 +5,8 @@ Measured 2026-10-12 on the Lyra with the PicoCalc SD card read over SPI1.
 
 ## Findings (128-cycle tick; numbers in docs/m0-audio.md, section after "What the noise is")
 
+**Correction 2026-10-12: finding 1 (the 10 MHz grid) and everything below that is expressed in grid slots could not be reproduced against the board's own 10 MHz reference (ref10m.py) and is withdrawn; see the correction paragraph in docs/m0-audio.md.**
+
 1. The GPIO4 pin does not change when the blocking write returns. Pin edges sit on a
    10 MHz grid (37.5 core cycles = 100 ns) in every condition: edge time =
    37.5 * ceil((issue_time + x) / 37.5) + C. x (the grid's phase against SysTick) is

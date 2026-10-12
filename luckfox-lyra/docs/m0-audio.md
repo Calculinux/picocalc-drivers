@@ -816,6 +816,21 @@ pulses). Supply, ground, ring, threshold, missing pulses and pickup are excluded
 (Two-channel scope captures show spurious 64-sample mismatches between channels; do not
 match edges across channels at this fidelity.)
 
+**Correction (2026-10-12, later): the "10 MHz grid" described in the next two paragraphs
+could not be reproduced and is withdrawn.** The board now outputs a 10 MHz reference
+(GPLL / 150, the same PLL as the M0's 375 MHz core clock; `noise-rig/ref10m.py`, Lyra
+pin 34) that the scope records on a second channel. Measured against that reference,
+the pin-31 edges are spread evenly over its 100 ns cycle (coherence 0.001-0.007 with
+the stock firmware playing silence, 0.03-0.06 with the toggling diagnostic firmware,
+with and without card reads; a pin quantised to a clock locked to this PLL would cluster
+at one position). Captures on the scope's own time base also show no 100 ns structure
+today (0.002-0.009 coherence), whereas the captures behind the paragraphs below showed
+0.95. What differed (board wiring, charger, a hard reboot, the scope's acquisition state)
+is not known; the scope also silently fell back to 125 MS/s in one session. Treat the
+grid, the "slot" intervals and every number computed from them in the next two
+paragraphs as unverified; the pre-write count versus post-write count comparison needs
+repeating with the reference as the ruler.
+
 The pin does not change when the M0's blocking write returns (timing diagnostic
 firmware: pin 31 toggled every tick with the corrected loop's own write and SysTick
 read, each count logged, the scope's edge times matched to the log tick by tick, 128-cycle

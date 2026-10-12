@@ -2,7 +2,7 @@
 """ref10m.py on|off|status: a 10 MHz reference from the SoC on Lyra pin 34 (GPIO1_B1 / RMIO24).
 
 GPLL (1.5 GHz, the same PLL as the M0's 375 MHz core clock = GPLL / 4) -> clk_frac_common_matrix0
-(1/150) -> mclk_sai1 -> mclk_out_sai1 -> mclk_sai1_to_io (GRF_PMU 0xFF910004 bit 9) -> RMIO24
+(1/150) -> mclk_sai1 -> mclk_out_sai1 -> mclk_sai1_to_io (GRF_PMU 0xFF910004 bit 9, hiword-mask) -> RMIO24
 (RM_IO function 74 = sai1_mclk: GRF_PMU rmio reg 0xE0 = 74 - 15, pad mux 7 in IOC1 0xFF660028).
 Register addresses from drivers/clk/rockchip/clk-rk3506.c, drivers/pinctrl/pinctrl-rockchip.c and
 rk3502.dtsi in the kernel tree. Runtime only: a power cycle undoes it. `off` restores the values
@@ -53,7 +53,7 @@ elif cmd == "on":
     hi(CRU, 0x3A4, 0x0FFF, (6 << 8) | 0)            # mclk_sai1 <- clk_frac_common_matrix0, /1
     hi(CRU, 0x804, 1 << 1, 0)                       # frac0 gate open
     hi(CRU, 0x838, (1 << 2) | (1 << 4), 0)          # mclk_sai1 and mclk_out_sai1 gates open
-    wr(GRFPMU, 0x004, rd(GRFPMU, 0x004) | (1 << 9)) # mclk_sai1_to_io
+    hi(GRFPMU, 0x004, 1 << 9, 1 << 9)               # mclk_sai1_to_io (hiword-mask gate)
     hi(GRFPMU, 0x0E0, 0x7F, 74 - 15)                # RM_IO24 function: sai1_mclk
     hi(IOC1, 0x028, 0xF << 4, 7 << 4)               # pad mux: rm_io
     show()
@@ -61,7 +61,7 @@ elif cmd == "off":
     s = json.load(open("/tmp/ref10m.save"))
     hi(IOC1, 0x028, 0xF << 4, (s["gpio1_b_iomux(IOC1+0x28)"] >> 4) & 0xF)
     hi(GRFPMU, 0x0E0, 0x7F, s["rmio24(GRF_PMU+0xE0)"] & 0x7F)
-    wr(GRFPMU, 0x004, (rd(GRFPMU, 0x004) & ~(1 << 9)) | (s["mclkout_to_io(GRF_PMU+4)"] & (1 << 9)))
+    hi(GRFPMU, 0x004, 1 << 9, s["mclkout_to_io(GRF_PMU+4)"] & (1 << 9))
     v = s["sai1_gates(CLKGATE_CON14)"]; hi(CRU, 0x838, (1 << 2) | (1 << 4), v & ((1 << 2) | (1 << 4)))
     hi(CRU, 0x804, 1 << 1, s["frac0_gate(CLKGATE_CON1)"] & (1 << 1))
     hi(CRU, 0x3A4, 0x0FFF, s["mclk_sai1(CLKSEL_CON41)"] & 0x0FFF)
