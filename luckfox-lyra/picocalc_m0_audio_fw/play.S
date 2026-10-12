@@ -23,7 +23,7 @@
  *   even number of core cycles or every other edge comes out a cycle late
  *   (the host sees to that).
  *
- * ONE TICK (the TICK macro)
+ * ONE TICK (the TICK macro; m0_play_comp waits differently, see below)
  *      wfi
  *      GPIO <- word computed on the previous tick (B2 = left, B3 = right)
  *      clear SysTick's pending bit
@@ -109,19 +109,33 @@
  *   r3 i1_r   r4 i2_r           r9  x_r    lr  dx_r    r12 GPIO word, both high
  *   r2 FS     r5 plain ticks    r6, r7 scratch         sp  m0_play_state
  *   Entering a tick, r7 holds the GPIO word to write and r6 the GPIO address.
+ *   m0_play_comp: r10 both-high word, r11 the word to write, lr the word
+ *   written on the tick before, r12 when the tick is due; r8, r9 hold x.
  *
  * LATE PIN WRITES: m0_play_comp()
  *   The M0's bus writes wait while Linux's SPI controllers (the display's
- *   pixel data above all) or its GPIO writes have the peripheral bus:
- *   measured, a quarter of the pin writes are up to 0.4 us late while the
- *   display is redrawn, and every late edge is an error in the output.
- *   m0_play_comp() is the same loop with the pin write made blocking (main.c
- *   turns "bufferable" off for it), so that the SysTick count read straight
- *   after it says when the pin changed:
- *      delta  = previous count - count, modulo the tick, as a number from
- *               -28 to 99        @ the level that just ended lasted a tick
- *                                @ + delta core cycles
- *      m      = FS * delta / tick
+ *   pixel data above all, the SD card's too) or its GPIO writes have the
+ *   peripheral bus: measured, a quarter of the pin writes are up to 0.4 us
+ *   late while the display is redrawn, and every late edge is an error in the
+ *   output. m0_play_comp() is the same loop with the pin write made blocking
+ *   (main.c turns "bufferable" off for it), so that the SysTick count read
+ *   straight after it says when the pin changed, and with SysTick not
+ *   as the tick but as a clock:
+ *      SysTick runs free, reload 0xFFFFFF, no exception: a 24-bit count down
+ *      from the reload value, one count per core cycle, wrapping every
+ *      2^24 cycles (44.7 ms at 375 MHz). It is read as count << 8, in the
+ *      top of a register, so that the 32-bit subtraction of two such values is
+ *      the 24-bit difference, modulo 2^24, with its sign in bit 31.
+ *      Each tick is due a tick (128 cycles) after the one before, whatever
+ *      the loop did in between: r12 is the time it is due, in these units
+ *      but counting up (-count << 8), and the loop spins on the count until it
+ *      has reached that, however far it has gone past (the sign of the
+ *      difference; a signed comparison of the two would break where the
+ *      value crosses 2^31). Then:
+ *      delta  = this write's count and the last one's, as a difference of
+ *               the 24-bit counts, less a tick  @ the level that just ended
+ *                                @ lasted a tick + delta core cycles
+ *      m      = FS * delta / tick = (the two counts << 8, subtracted) - FS
  *      i1, i2 -= m if that level was 1, += m if it was 0, per channel
  *   i.e. the feedback already taken for that bit is brought to what the bit
  *   really delivered, and the error is shaped out of the audio band like the
@@ -130,27 +144,39 @@
  *   done on every tick, late or not, without a branch that depends on the
  *   lateness: a tick always costs the same.
  *   What is measured is the time from one pin write to the next, not the
- *   lateness against the tick grid, so it stays right when the loop has
- *   fallen a tick or more behind the grid (it then plays that much slower
- *   until it has caught up, and that is all). The window, -28 to 99: a write
- *   can come at most about 20 cycles sooner after the last one than a tick
- *   (the loop has that much to spare when it does not sleep), and any amount
- *   later; later by 100 cycles or more in one go would be misread.
- *   Requires a tick of exactly 128 core cycles (which makes "modulo the
- *   tick" and "FS * delta / tick" shifts by a constant): 2.93 MHz at a
- *   375 MHz core clock, where the blocking write takes 49 of the 128 cycles.
- *   SysTick's pending bit is cleared before the write, so that a write that
- *   lands after the next tick does not wipe that tick out as well.
+ *   lateness against the tick grid, so the correction does not depend on
+ *   where the grid is. The grid matters for the pace: a tick that comes late
+ *   leaves the next one due on time, as it was, and a loop that is behind
+ *   does not wait at all until it has made the time up (it can, by as many
+ *   cycles per tick as it has spare, see below; none of the ticks are lost
+ *   however many it is behind, up to 2^23 cycles). Its writes then come less
+ *   than a tick apart, by about 40 cycles at most: delta is
+ *   negative, and right. Any lateness up to 2^23 cycles (22 ms) is a
+ *   difference of the counts: there is no window (the version that took
+ *   SysTick's 128-cycle reload as the tick could tell -28 to +99 cycles
+ *   and misread a write 100 cycles or more late, and any write that came
+ *   early after a late one).
+ *   Requires a tick of exactly 128 core cycles: 2.93 MHz at a 375 MHz core
+ *   clock, where the blocking write takes 49 of the 128 cycles. (FS is
+ *   128 << 8 and is also the step of the grid, in the units of r12.)
  *   A late write holds this loop up as well, so it needs cycles to spare on
  *   every tick, more than the writes are late by on average, or it falls
- *   further and further behind. Hence no interpolation here: each sample is
- *   held (shift 0), which saves the two adds and leaves r10 and lr for the
- *   both-high GPIO word and the GPIO address; and fewer steps, M0_COMP_STEPS.
- *   That leaves about 19 cycles on a plain tick and 12 on the longest step.
- *   r12 holds the previous count plus the word written then; the tick starts
- *   with its word in r11, not r7. Not in PROFILE builds. Built with
- *   COMP_STATS=1 the plain ticks also add up by how much their writes came
- *   later than a tick after the one before (about 7 cycles).
+ *   further and further behind (it then plays slow: the driver reports it).
+ *   Hence no interpolation here: each sample is held (shift 0), which saves
+ *   the two adds and leaves r10 and lr for the both-high GPIO word and the
+ *   previous tick's word; and fewer steps, M0_COMP_STEPS. A tick costs
+ *   about 2.3 cycles more than it did when SysTick's reload was the tick,
+ *   and the work is about 89 of the 128 cycles (measured on the board,
+ *   docs/m0-audio.md). The writes come 0 to 7 cycles after the time they are
+ *   due (the spin reads the count every 8 cycles); the correction measures
+ *   that too.
+ *   What the loop needs the registers for, in a tick:
+ *      r12 when the tick is due, lr the word written on the tick before (the
+ *      level that has just ended), r11 the word to write now; the count of
+ *      the last write is kept in memory (PS_PREV).
+ *   The wait is a spin, not WFI: the core is awake all the time.
+ *   Not in PROFILE builds. Built with COMP_STATS=1 the plain ticks also add
+ *   up by how much their writes came later than a tick after the one before.
  *
  * LAYOUT
  *   The loop is longer than a Thumb branch reaches in a PROFILE build, so the
@@ -171,8 +197,7 @@
 	.equ	PENDST_TO_SIGN, 31 - ICSR_PENDSTSET_BIT
 	.equ	S, M0_BUS_STEPS + M0_PROFILE_STEPS	@ number of the last SRAM step
 	.equ	COMP_LSL, DSM_FS_SHIFT - M0_COMP_LOG2_CYCLES
-	.equ	COMP_MOD, 32 - M0_COMP_LOG2_CYCLES
-	.equ	COMP_BACK, M0_COMP_BACK
+	.equ	COMP_CNT_SHIFT, 32 - 24		@ SysTick's count, in the top of a register
 
 /* For check_play.py, which has to know how this build schedules a sample */
 	.global	m0_step_ticks
@@ -219,18 +244,27 @@ m0_play_state:
 	add	r7, r11
 	.endm
 
-/* m0_play_comp: tick taken, pin write, and when the pin changed: leaves the
- * SysTick count in r6. */
+/* m0_play_comp: wait for the tick, write the pin, and when did the pin change.
+ * SysTick runs free (reload 0xFFFFFF), counting down. Its 24-bit count is
+ * kept in the top of a register (<< COMP_CNT_SHIFT), so that a subtraction
+ * is modulo 2^24 cycles and its sign is the sign of a 24-bit difference.
+ * r12 is the time the tick is due, in the same units but counting up (minus
+ * the count), a tick (FS = 128 << 8) further on every tick. The spin ends at
+ * the first count at or past it, however far past. Leaves the count after
+ * the write in r6. */
 	.macro	WRITE_TIMED
-	ldr	r7, [sp, #PS_K_ICSR]
-	movs	r6, #1
-	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
-	str	r6, [r7]		@ tick taken: clear SysTick's pending bit
-	mov	r6, lr
+	ldr	r7, [sp, #PS_K_CVR]
+1:	ldr	r6, [r7]
+	lsls	r6, r6, #COMP_CNT_SHIFT
+	negs	r6, r6
+	cmp	r6, r12
+	bmi	1b			@ not due yet (the difference, modulo 2^32, is negative)
+	ldr	r6, [sp, #PS_K_GPIO]
 	mov	r7, r11
 	str	r7, [r6]		@ OUTPUT, and wait until the pin has changed
 	ldr	r6, [sp, #PS_K_CVR]
 	ldr	r6, [r6]		@ when was that
+	lsls	r6, r6, #COMP_CNT_SHIFT
 	.endm
 
 /* Wait for the tick, put out the bits, run both modulators.
@@ -239,49 +273,66 @@ m0_play_state:
  * comp 1: enters and leaves with the word in r11; r6, r7 are free. stats:
  *         also add what the write came late by to the total. */
 	.macro	TICK comp, stats=0
-	wfi
 	.if	\comp
 	WRITE_TIMED
-	mov	r7, r12			@ the previous count + the word written then
-	mov	r12, r6
-	add	r12, r11		@ this count + this word, for the next tick
-	subs	r6, r7, r6		@ (the words are bits 10 up)
-	adds	r6, #COMP_BACK
-	lsls	r6, r6, #COMP_MOD
-	lsrs	r6, r6, #COMP_MOD
-	subs	r6, #COMP_BACK		@ delta: this write came a tick + delta after the last
-	lsls	r6, r6, #COMP_LSL	@ m = FS * delta / tick
-	lsls	r7, r7, #31 - GPIO4_B2_BIT	@ the levels that just ended: N = left, C = right
+	ldr	r7, [sp, #PS_PREV]
+	str	r6, [sp, #PS_PREV]
+	subs	r7, r7, r6		@ the counts of this write and the one before:
+	subs	r7, r7, r2		@ a tick + delta apart; m = FS * delta / tick
+	add	r12, r2			@ the next tick is due a tick later
+	mov	r6, lr			@ the levels that just ended: N = left, C = right
+	mov	lr, r11			@ (and the ones that start now)
+	lsls	r6, r6, #31 - GPIO4_B2_BIT
 	bcs	2f
 	bmi	1f
-	adds	r0, r0, r6		@ left 0, right 0
-	adds	r1, r1, r6
-	adds	r3, r3, r6
-	adds	r4, r4, r6
+	adds	r0, r0, r7		@ left 0, right 0
+	adds	r1, r1, r7
+	adds	r3, r3, r7
+	adds	r4, r4, r7
 	b	9f
-1:	subs	r0, r0, r6		@ left 1, right 0
-	subs	r1, r1, r6
-	adds	r3, r3, r6
-	adds	r4, r4, r6
+1:	subs	r0, r0, r7		@ left 1, right 0
+	subs	r1, r1, r7
+	adds	r3, r3, r7
+	adds	r4, r4, r7
 	b	9f
 2:	bmi	3f
-	adds	r0, r0, r6		@ left 0, right 1
-	adds	r1, r1, r6
-	subs	r3, r3, r6
-	subs	r4, r4, r6
+	adds	r0, r0, r7		@ left 0, right 1
+	adds	r1, r1, r7
+	subs	r3, r3, r7
+	subs	r4, r4, r7
 	b	9f
-3:	subs	r0, r0, r6		@ left 1, right 1
-	subs	r1, r1, r6
-	subs	r3, r3, r6
-	subs	r4, r4, r6
+3:	subs	r0, r0, r7		@ left 1, right 1
+	subs	r1, r1, r7
+	subs	r3, r3, r7
+	subs	r4, r4, r7
 9:
 #if M0_COMP_STATS == 1
 	.if	\stats
-	asrs	r6, r6, #COMP_LSL	@ delta again
+	asrs	r6, r7, #COMP_LSL	@ delta
 	bmi	7f
 	ldr	r7, [sp, #PS_DSUM]
 	adds	r7, r7, r6
 	str	r7, [sp, #PS_DSUM]
+7:
+	.endif
+#elif M0_COMP_STATS == 2
+	.if	\stats
+	asrs	r6, r7, #COMP_LSL	@ delta
+	cmp	r6, #32
+	blt	7f
+	ldr	r7, [sp, #PS_H32]
+	adds	r7, #1
+	str	r7, [sp, #PS_H32]
+	cmp	r6, #64
+	blt	7f
+	ldr	r7, [sp, #PS_H64]
+	adds	r7, #1
+	str	r7, [sp, #PS_H64]
+	cmp	r6, #100
+	blt	7f
+	ldr	r7, [sp, #PS_H100]
+	adds	r7, #1
+	str	r7, [sp, #PS_H100]
 7:
 	.endif
 #endif
@@ -289,6 +340,7 @@ m0_play_state:
 	add	r7, r10			@ both-high word minus the bits that are 0
 	mov	r11, r7
 	.else
+	wfi
 	str	r7, [r6]		@ OUTPUT: bits from the previous tick
 	ldr	r7, [sp, #PS_K_ICSR]
 	movs	r6, #1
@@ -441,17 +493,17 @@ m0_play_state:
 #endif
 
 	.if	\comp
-	/* One tick with both pins low, for a count to measure the next from */
+	/* The pins' state before the first tick: both low (and the one before) */
 	ldr	r0, =GPIO4_DR_B23_LOW
 	mov	r11, r0
-	ldr	r0, [sp, #PS_K_GPIO]
 	mov	lr, r0
 	movs	r0, #0
 	str	r0, [sp, #PS_DSUM]
-	wfi
-	WRITE_TIMED
-	mov	r12, r6
-	add	r12, r11
+#if M0_COMP_STATS == 2
+	str	r0, [sp, #PS_H32]
+	str	r0, [sp, #PS_H64]
+	str	r0, [sp, #PS_H100]
+#endif
 	ldr	r1, [sp, #PS_K_SHMEM]
 	ldr	r2, [sp, #PS_K_MASK]
 	.endif
@@ -482,7 +534,7 @@ m0_play_state:
 	mov	r9, r0
 	.if	\comp
 	ldr	r6, =GPIO4_DR_B23_HIGH
-	mov	r10, r6			@ (lr: the GPIO address, set above)
+	mov	r10, r6			@ (lr: the previous word, set above)
 	.else
 	mov	r10, r0
 	mov	lr, r0
@@ -506,6 +558,19 @@ m0_play_state:
 	mov	r12, r6
 	ldr	r6, [sp, #PS_K_GPIO]
 	ldr	r7, =GPIO4_DR_B23_LOW	@ first tick writes both low
+	.endif
+	.if	\comp
+	/* One tick with both pins low, for a count to measure the next from,
+	 * a tick from now (FS is in r2) */
+	ldr	r6, [sp, #PS_K_CVR]
+	ldr	r6, [r6]
+	lsls	r6, r6, #COMP_CNT_SHIFT
+	negs	r6, r6
+	adds	r6, r6, r2
+	mov	r12, r6
+	WRITE_TIMED
+	str	r6, [sp, #PS_PREV]
+	add	r12, r2
 	.endif
 	b	.L_sample_\comp
 

@@ -137,11 +137,28 @@
 	status = "okay";
 	pinctrl-names = "default";
 	pinctrl-0 = <&rm_io29_spi1_clk &rm_io28_spi1_mosi &rm_io31_spi1_miso &rm_io30_spi1_csn0>;
+	/* As for the display: the M0's pin write waits out every DMA beat on
+	 * the shared register bus, and noise in the M0 audio while the card is
+	 * read follows the burst length (recorded at the headphone output,
+	 * docs/m0-audio.md): at a 187.5 MHz register bus and a 50 MHz card, 4
+	 * words is -21 dBFS, 2 words -35 dBFS at the same 2.67 MB/s, and 1 word
+	 * -34 dBFS at 1.98 MB/s (the DMA no longer keeps up). A 25 MHz card is
+	 * quietest at 1 (-38 dBFS against -28 for 4) at no cost in speed.
+	 * Both can be changed while running in
+	 * /sys/bus/platform/devices/ff130000.spi/. Needs the kernel patch
+	 * (docs/spi-rockchip-tx-burst.patch); ignored without. */
+	rockchip,tx-dma-burst = <2>;
+	rockchip,rx-dma-burst = <2>;
 
 	spi_mmc: mmc@0 {
 		compatible = "mmc-spi-slot";
 		reg = <0>;  // Chip Select 0
 		spi-max-frequency = <50000000>;
+		/* On trial: without this the card stays at 25 MHz whatever
+		 * spi-max-frequency says. Whether the slot's wiring and M0
+		 * audio take 50 MHz is not yet tested; the clock can be
+		 * lowered while running in /sys/kernel/debug/mmc1/clock. */
+		cap-sd-highspeed;
 		pinctrl-names = "default";
 		pinctrl-0 = <&spi_mmc_cd>;
 		/* Card detect. mmc-spi-slot does not take the usual cd-gpios:
@@ -158,6 +175,23 @@
 		vqmmc-supply = <&vcc_3v3>;
 		no-1-8-v;
 	};
+};
+
+/*
+ * Register bus of the low-speed peripherals (SPI0/1, GPIO2/3/4, I2C, UARTs...).
+ * The bootloader leaves hclk_lsperi_root at clk_gpll_div / 4 = 93.75 MHz; the
+ * SoC's reset value is / 2 (187.5 MHz). Every register access and DMA beat the
+ * SPI controllers make (the display's, the SD card's) holds up the M0's write
+ * to GPIO4 on this bus for as long as it takes, and the audio noise while the
+ * SPI SD card is read is exactly that (docs/m0-audio.md): SPI1 clocking at
+ * 25 MHz with 4-word DMA bursts, recorded at the headphone output, is -31 dBFS
+ * at 187.5 MHz, -26 at 125 MHz and -22.5 at 93.75 MHz (no load: -60). Only the
+ * register bus changes: the controllers' own clocks (clk_spi1...) have their
+ * own nodes.
+ */
+&cru {
+    assigned-clocks = <&cru HCLK_LSPERI_ROOT>;
+    assigned-clock-rates = <187500000>;
 };
 
 /*

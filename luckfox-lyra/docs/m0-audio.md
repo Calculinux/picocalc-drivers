@@ -467,11 +467,43 @@ takes 31 core cycles:
 
 So traffic through the SPI controllers and Linux's GPIO writes hold up the
 M0's pin write, far longer than one host write takes; the SDMMC controller
-and USB do not. The TRM has no priority setting for the M0 on the bus. In
+and USB do not. The TRM has no priority setting for the M0 on the bus, and
+the undocumented ones change nothing (see "Bus priorities" below). In
 normal use it is the display that matters: each redraw (every keypress
 echoed, every frame of a game) is a burst of late edges, a click. Simulated at 3 MHz under a -40 dBFS tone, a quarter of the
 pin writes late by up to 72 cycles puts the in-band noise at -22 dBFS for as
 long as it lasts; 2 % late, -32 dBFS.
+
+### Bus priorities
+
+The interconnect has priority (QoS) registers the TRM does not list. They
+are where the RK3308 has its "Interconnect Service" region, in the layout
+Rockchip's U-Boot uses on other chips (`+0x08` priority, two 3-bit levels;
+`+0x0c` mode; `+0x10` bandwidth; `+0x14` saturation). Found by reading
+(2026-10-09); nothing in U-Boot, the kernel or Rockchip's HAL for the
+RK3506 touches them:
+
+| Address | Blocks | Priority as booted |
+|---|---|---|
+| `0xff5c0100` | 1 (the CPU's, by the RK3308's layout) | `0x202` |
+| `0xff5c8000`, `+0x400`... | 4 of other kinds (error log, probes) | - |
+| `0xff5d8000`...`0xff5d8300`, `0x80` apart | 7 | `0x101 0x303 0x303 0x101 0x404 0x404 0x101` |
+| `0xff5e0000`...`0xff5e0200`, `0x80` apart | 5 | `0x303` each |
+
+**Reading `0xff5d0000` or `0xff5e8000` hangs the board** (no bus error, the
+read never returns; power cycle). `aclk_vio_root` is gated, which may be why
+for one of them. Everything else from `0xff588000` to `0xff5f0000` gives a
+bus error.
+
+They do not help. Measured by how far the M0 falls behind while 10 s of
+silence plays and the SPI SD card is read (1.7 MB/s; `comp` on, 375 MHz):
+26 ms a second as booted (25-66), against 2 us a second with no read. Then
+with each of the three priority-1 blocks at `0xff5d8000` raised to 5 alone,
+all three at 7, those at 7 with the two priority-4 blocks at 0, and those
+at 7 with every other block there and the CPU's at 0: 25.3 to 26.4 ms a
+second every time. Whichever block is the M0's, if any is, its priority
+does not decide who gets the peripheral bus. The five blocks at
+`0xff5e0000` were not tried.
 
 ### Correcting for late pin writes
 
@@ -485,10 +517,20 @@ feedback, out of both integrators: the modulator then treats the bit as what
 it really delivered and shapes the error out of the audio band. It does
 this on every tick, late or not, with no branch on the lateness, so a tick
 always costs the same; the tick is exactly 128 core cycles, which makes the
-arithmetic shifts by constants. Because it measures from one write to the
-next and not against the tick grid, it stays right when the loop has fallen
-a tick or more behind the grid: it then just plays that much slower until it
-has caught up. `picocalc,comp` on the sound node (the m0-audio overlay as
+arithmetic shifts by constants. SysTick is not the tick in this loop but a
+free-running 24-bit clock (reload 0xFFFFFF, no exception, 44.7 ms to wrap at
+375 MHz): the loop spins on the count until the tick is due, a tick after the
+one before whatever happened in between, and the time between two pin writes
+is the difference of their counts (the counts are kept shifted up by 8, so the
+32-bit subtraction is the 24-bit one and its sign is a 24-bit sign). So any
+lateness up to 2^23 cycles (22 ms) is seen right, a loop that is behind makes
+up the time without a tick lost (its writes come less than a tick apart,
+meanwhile, by up to the cycles it has to spare) and the correction measures
+write to write, so it does not depend on where the grid is. (Until
+2026-10-12 SysTick's reload was the tick and the loop saw the gap modulo 128:
+-28 to +99 cycles, anything outside aliased. The catch-up writes of that
+loop were not 20 but about 40 cycles early, see "Cycle budget" below, so
+they were outside the window as well.) `picocalc,comp` on the sound node (the m0-audio overlay as
 shipped has it) or `comp=1` on the sound module selects it
 (default off; it needs all of the following).
 
@@ -501,8 +543,9 @@ What it needs, each established on the board:
    as the pin. If writes are late by more on average than the loop has
    spare, it falls further and further behind, which is far worse than not
    correcting. So this loop holds each sample (no interpolation), has 13
-   steps and keeps its constants in registers: about 19 cycles spare on a
-   plain tick, 12 on the longest step.
+   steps and keeps its constants in registers. Measured (see "Cycle budget"):
+   the loop's work is 87-89 of the 128 cycles on a plain tick, so about 38
+   spare (earlier estimates of 19 do not match that measurement).
 3. **Shorter DMA bursts in the display's SPI driver** (above), and the right
    length for the display's SPI clock. With the driver's own 16-word bursts
    the loop falls further and further behind while the display is redrawn.
@@ -549,14 +592,22 @@ bursts (`COMP_STATS=2` build, which has 7 cycles spare instead of 17):
 In simulation the correction takes a redraw's noise under a -40 dBFS tone
 from -36 dBFS to -72 (16 % of writes up to 32 cycles late). By ear, with an
 earlier and worse version of the loop: a tone played through a console flood
-was "not affected at all". The limit of the present loop is a write that
-comes 100 core cycles or more later than a tick after the one before (0.27
-us): that is misread. Four-word bursts hold a write up by 80 at most.
+was "not affected at all". Since 2026-10-12 there is no limit to how late a
+write may be short of 2^23 cycles (22 ms); before, a write 100 cycles or more
+later than a tick after the one before, or sooner than 28 cycles less, was
+misread.
 
-`check_play.py` runs this loop too, puts late writes in by setting the
-SysTick count it reads, and checks both that the firmware matches the model
-and, from the pin writes alone, that the late edges are cancelled (a model
-sharing a sign error with the firmware would pass the first).
+`check_play.py` runs this loop too, with a clock of its own that every read
+of the SysTick count advances (spin passes, the tick's other work, the
+blocking write, held up by amounts it makes up: a share of the writes, by
+2 cycles to several ticks, or exactly chosen ones such as 99, 100, 127, 128,
+129, 227, 228, 256 cycles and a millisecond), and checks that the firmware
+matches the model given the counts it read, that the loop waits for exactly
+the tick's time and no tick is lost (back on the grid after a stall, writes
+less than a tick apart meanwhile), the 24-bit count wrapping (also in the
+middle of a stall, and at the sign flip of the shifted count), and, from the
+pin writes alone, that the late edges are cancelled (a model sharing a sign
+error with the firmware would pass the first).
 
 Debug build: `make COMP_STATS=1` adds up by how many cycles the pin writes
 were pushed later, and the driver prints it when a stream ends (quiet
@@ -572,11 +623,354 @@ out-of-tree copy of the driver). The display's SPI clock, if it
 is to be lowered, is `spi-max-frequency` in the board device tree. The
 375 MHz clock and `comp` come with the m0-audio overlay.
 
+#### Cycle budget of the free-running loop, and what it did on the board (2026-10-12)
+
+Cycle counts from the listing are off by a lot here, so the work per tick was
+measured by running the loop with no wait: a test build in which the next
+tick is never due (new) or SysTick's period is far shorter than the work
+(old), so that the loop runs at its own pace, silence played through the
+driver, pace = frames played against time ("behind"). The two 24-bit effects
+of the free-running loop (once 2^23 cycles behind it would wait for the wrap
+round) halve the pace of the new test build exactly, which was corrected for.
+Average of the 61-tick sample (13 step ticks, 48 plain), cycles per tick:
+old loop 88.2, new loop 90.5; with the sample stretched to 2000 more plain
+ticks, so that the figure is the plain tick's: old 87.1, new 89.4. A tick
+costs about 2.3 cycles more than before: the spin (5 instructions on the
+count, one extra pass the loop does not need when late), the count kept in
+memory (load and store) and the deadline update, against the pending-bit clear and
+the four modulo instructions that went. Plain ticks therefore have about 38
+cycles spare (128 - 89) against 41 before, and the longest step tick the same
+2.3 less than it had. (The 19 and 12 spare cycles quoted for the old loop
+above do not match this measurement; with the old loop running no faster
+than one tick per 88 cycles on the board and keeping up with 96 and 100 cycle
+ticks they cannot have been the no-load figures. The pace tests were run
+with no SD card read; under a read the writes are held up and the spare is
+what that eats.) With the loop on its grid the writes land 0 to 7 cycles
+after the due time (the spin reads the count every 8 cycles); the correction
+measures that and cancels it, with a residual: silence plays 0.16 mV rms
+noisier than with the loop on SysTick's own tick (0.67 against 0.51 mV, below).
+Without the correction that jitter is 1.28 mV.
+
+The wider misreads were not the rare very late writes: the diagnostic build
+(`COMP_STATS=2`, which counts plain ticks whose write came 32, 64, 100 or
+more cycles later than a tick after the one before) found, over 20 s of
+silence with the card read (about 46 million plain ticks): 25 MHz 2-word
+bursts 15877 / 569 / 315; 25 MHz 1-word 37227 / 579 / 347; 50 MHz 2-word 66445
+/ 872 / 499; 25 MHz 4-word 1.2 M / 685 / 339; none without a read. So 100 cycles or
+more late are about 1 in 100,000 writes, far fewer than the 0.05 % that
+would have explained the noise. What the old loop got wrong must be
+the other end of its window: after a late write the loop catches up, its
+next write comes about 40 cycles early (the loop's work is 88 cycles, not 108),
+which is -40 and below the old window's -28, so it was read as 88 cycles
+late, an error of 2/3 of a tick of feedback, after every late write.
+(Not measured separately: the old loop was not instrumented.)
+
+A/B on the board, same session, same image, `comp` on, jack-tip noise (scope
+CH4, total mV rms 0.2-20 kHz, silence, 3 streams per condition and 2 runs per
+firmware; stock = the 1.0.0-pr-235 image's firmware, new = this one, run
+order stock, stock, new, new; USB unplugged):
+
+| Condition | Stock | New |
+|---|---|---|
+| no read | 0.48-0.53 (mean 0.51) | 0.66-0.68 (0.67) |
+| read 25 MHz, 2-word bursts | 0.94-1.18 (1.04) | 0.62-0.65 (0.63) |
+| read 25 MHz, 1-word | 0.86-1.15 (0.95) | 0.65-0.68 (0.67) |
+| read 50 MHz, 2-word | 0.99-1.12 (1.05) | 0.62-0.66 (0.64) |
+| read 25 MHz, 4-word | 6.1-7.9 (7.0) | 0.62-0.65 (0.63) |
+
+The reads add nothing measurable to the new loop's floor; the stock loop's
+read noise is gone (the 4-word case, which the reference measurements put at
+1.6-1.7 mV, was 7 mV in this session's stock runs; the board or the day
+differs from that reference). Cost: the silence floor is 0.16 mV higher
+(0.67 against 0.51), from the 8-cycle spin granularity. "Behind" as the driver reports it
+was 0-2 us per second in every read condition, both firmwares. A variant that took the
+time of the write from the count read just before it (not after) was tried
+and is much worse (silence 0.95, 25 MHz 2-word read 7.1 mV): the count after
+the blocking write is the better measure. The driver needed no change: it
+reads only read_idx and the pace figures.
+
 **The SPI SD card is the worst offender.** While `mmc1` is being read the M0
 does not just get late edges, it falls about 2 % behind (20 ms a second,
 the same at 187.5 and 375 MHz): the SPI driver moves that card's data with
 the CPU, in long runs of back-to-back register accesses, and the M0 is shut
 out for whole ticks at a time. Not yet looked into.
+
+**Reading the SPI SD card with four-word SPI1 bursts** (measured 2026-10-10,
+kernel with `rockchip,tx-dma-burst` / `rx-dma-burst` = 4 on `&spi1`, card
+clock 25 MHz, 3 MHz bit rate, TCM, 375 MHz core clock). a test script
+(not kept in the repo; run as root on the board) played 12-15 s of digital silence
+while `dd` reads the raw card at about 1.6 MB/s and prints the driver's
+"behind" figure for each SPI1 burst length. "Behind" is time the M0's
+schedule slipped, and it does not mean the same in the two loops: the
+uncorrected loop is paced by SysTick, so a late pin write is absorbed in the
+loop's slack (about 70 cycles a tick at 375 MHz) and counts as nothing,
+while the corrected loop has about 19 spare, so the same lateness slips its
+schedule and is counted. The two columns are not comparable, and the
+uncorrected figure says nothing about how late the edges were.
+
+| SPI1 bursts (rx and tx) | Uncorrected: behind | Corrected (`comp`): behind |
+|---|---|---|
+| 16 (the driver's own) | 58-106 ms/s | 100 ms/s |
+| 8 | 2.2 ms/s | |
+| 4 | 0.014 ms/s | 3.1-4.1 ms/s |
+| 2 | 0.014 ms/s | 3.3 ms/s |
+| 1 | 0.014 ms/s | 3.1 ms/s |
+
+- Burst length matters a great deal down to 4, and not below it: the corrected
+  loop's remaining 3-4 ms/s (0.3-0.4 % slow, a twelfth of a semitone) is
+  the same at 4, 2 and 1.
+- It scales with the data rate, faster than linearly: 4.1, 1.6 and
+  0.65 ms/s at card clocks of 25, 12.5 and 6.25 MHz (1.55, 1.06, 0.65 MB/s).
+- It settles: a 40 s stream was 3.7 ms/s behind (148 ms in all), not
+  growing. The loop just plays 0.37 % slow while the card is read.
+- During a read the SPI1 interrupt fires about 25,000 times a second, 7.5
+  per 512-byte sector, plus 2 DMA completions a sector (idle: none). The
+  kernel's mmc-spi sends the command, polls for the data token, moves the
+  data, then reads the CRC, as separate transfers, and only the data moves by
+  DMA. So this is probably the CPU's register writes to the SPI controller
+  (which the M0's pin write waits for, as with GPIO data writes), not DMA
+  beats. Not checked.
+- The driver's give-up check (`M0_COMP_BEHIND_US`, 1 ms/s) is made when a
+  stream **ends**, over the whole stream, and then ignores `comp` for every
+  later stream until `comp_gave_up` is written 0. So with the shipped
+  settings the first stream played during a card read ends with
+  `comp_gave_up` set, and the display redraw correction is gone for the rest
+  of the session. A corrected loop 0.4 % slow is better than that, so the
+  limit is now 20 ms/s (2 %): above the 3-9 ms/s the loop settles at during
+  card reads, far below the ~100 ms/s it runs away at with 16-word bursts.
+  Checked on the board with the module built against the image's kernel tree:
+  three back-to-back 8 s streams during `dd` of the card (1.5 MB/s) ran
+  corrected at 3.5-4.1 ms/s behind and `comp_gave_up` stayed N throughout.
+- With `COMP_STATS=1` (7 fewer spare cycles) the same reads are 5.9-8.7
+  ms/s behind, twice as bad: the loop is that sensitive to its spare cycles.
+  Pin writes pushed later averaged 3.5-8 cycles a tick (burst 16 and 4), against 3.5 for
+  the full-screen display redraw at 48 a second.
+- The card's 50 MHz trial (`cap-sd-highspeed`) was not in effect: the
+  card ran at 25 MHz in legacy timing.
+
+**The register bus clock** (2026-10-11, kernel with the register-write cache,
+`comp` on, 4-word bursts, card read at 1.6 MB/s). The SPI controllers' and
+GPIO4's register bus, `pclk_lsperi_root`, runs at 93.75 MHz (the CRU's reset
+value would be 187.5; `CRU_CLKSEL_CON29` at `0xFF9A0374`, bits 4:0 divide
+`clk_gpll_div`, 375 MHz, bits 6:5 select the parent). Written live through
+`/dev/mem` (the board stayed up; two 64 MB card reads gave identical sums):
+
+| Divider | Register bus | Behind during the card read |
+|---|---|---|
+| /4 (as booted) | 93.75 MHz | 680-800 us/s |
+| /3 | 125 MHz | 17-21 us/s (40 times less); 5 us/s with a console flood |
+
+The board's device tree now asks for 187.5 MHz (`&cru` in the base dtsi). The
+time behind turned out not to be what is heard: see "What the noise is".
+
+**What the noise is** (2026-10-11, recorded at the headphone output with a
+Tascam DR-series recorder, `-60 dBFS` with digital silence playing and nothing
+else running; levels are total 20 Hz to 20 kHz, relative, not calibrated):
+
+- Reading the SPI SD card gives broadband (white) noise at -22 dBFS (25 MHz
+  card) to -14 dBFS (50 MHz) in the first recordings (-30 and -21 with the
+  isolator, below); `comp` on or off, slow or fast pad slew, made no
+  difference; reading the SDMMC card at 22 MB/s: -58 (nothing).
+- **Correction (later the same day).** Those first recordings were made with the
+  recorder's USB ground, the scope and the PicoCalc's supply all tied together.
+  With a ground-loop isolator between the recorder and the PicoCalc and the
+  PicoCalc on a clean charger, the picture changes: digital silence is -56 dBFS,
+  SPI1 clocking all-ones with the card selected and idle (spidev, 25 MHz, burst
+  4, 93.75 MHz register bus) is only -49, and 187.5 MHz with burst 1 is -51. So
+  most of the "SPI1 clocking alone makes noise" result below was the measuring
+  setup's ground loop, not the board. **Real card reads are still loud even with
+  the isolator:** 25 MHz card, burst 4, 93.75 MHz bus: -30 dBFS; 50 MHz card,
+  burst 4, 93.75 MHz bus: -21; 50 MHz, burst 2, 187.5 MHz bus: -29; burst 1:
+  -30. The register-bus and burst settings still help real reads (8 dB at 50
+  MHz), and the remaining -30 dBFS floor with a real read is not made by SPI1
+  clocking: it needs the card reading (its supply and ground current on the
+  mainboard are the suspects).
+- Measured at the pins with a scope (Rigol DS1104Z+, 10x probes) the M0's output
+  edges (timing against the 341.34 ns tick, edge counts, run lengths) and the
+  pads' high level are the same with and without SPI1 load, at any burst length
+  or bus clock: the noise is not visible at the SoC pins. The audio buffer
+  (U501, NC7WZ16) is powered from AXP2101 ALDO4, whose input is the IPS/VSYS
+  rail; a 1-bit DAC has no supply rejection, so ripple on that rail reaches the
+  output while the pins toggle. VSYS carries 36 mV RMS (187.5 MHz register bus)
+  to 108 mV RMS (93.75 MHz) in 20 Hz to 20 kHz on a clean charger, unrelated to
+  card reads; 3V3_OUT is quiet (under 3 mV).
+- The recordings below, made before the isolator, include the ground-loop
+  contribution, so compare their settings with each other, not with the
+  isolator numbers. SPI1 DMA burst length under the pure clocking load (25 MHz,
+  93.75 MHz register bus unless noted), dBFS: 16: -17, 8: -22, 4: -26 (at 125
+  MHz), 2: -31, 1: -41, 32-byte PIO transfers: -30. Register bus 93.75 / 125 /
+  187.5 MHz at burst 4: -22.5 / -26 / -31. Real card reads at a 187.5 MHz
+  register bus: 25 MHz card burst 4 -28 dBFS, burst 1 -38 (1.8 MB/s either way);
+  50 MHz card burst 4 -21 (2.67 MB/s), burst 2 -35 (2.67 MB/s), burst 1 -34
+  (1.98 MB/s). Before (93.75 MHz, burst 4): -22 at 25 MHz and -14 at 50 MHz.
+
+**A loop-free baseline, and what it rules out** (2026-10-11, evening; Tascam
+through a ground-loop isolator on the headphone jack, PicoCalc on battery with no
+scope or meter attached, both channels checked with a 1 kHz tone at -11.6 dBFS;
+left channel, total 20 Hz to 20 kHz, dBFS; the right channel is the same to
+within 1 dB). Silence is -55.
+Any extra ground connection (a scope probe ground, a meter lead) changes the
+absolute numbers by an order of magnitude, so only compare within one session.
+
+| SPI clock | DMA burst | register bus | noise | M0 lag |
+|---|---|---|---|---|
+| 25 MHz | 4 | 93.75 MHz | -28.9 (-21 in another run) | 2.5 ms/s |
+| 25 MHz | 2 / 1 | 93.75 MHz | -31.3 / -31.7 | 1.8 / 1.4 ms/s |
+| 50 MHz | 4 | 93.75 MHz | **-17.1** (`comp` gave up) | 90 ms/s |
+| 50 MHz | 2 / 1 | 93.75 MHz | -30.0 / -31.9 | 7.6 / 27 ms/s |
+| 25 MHz | 4 / 1 | 187.5 MHz | -21.2 / -30.6 | 2 / 4 us/s |
+| 50 MHz | 4 / 2 / 1 | 187.5 MHz | -21.9 / -28.8 / -30.3 | 4 / 6 / 3 us/s |
+
+- 4-word bursts are loud and erratic (-17 to -29 dBFS); 2- and 1-word bursts
+  give a steady -29 to -32. That is up to 13 dB, and it was confirmed by ear on
+  headphones (phases with 2-word bursts are clearly quieter; the noise that is
+  left is still too noticeable against silence).
+- A floor of about -30 dBFS (A-weighted -32) remains in every short-burst setting
+  and barely moves with the card clock (12.5 MHz: -33; 25 MHz: -31; 50 MHz: -30)
+  or the card (two cards). `comp` on or off makes no difference once the bursts
+  are short (-29.3 off, -30.4 on, 25 MHz, burst 2, bus 187.5); at 4-word bursts
+  `comp` off was 13 dB worse (-15.5 against -28.9).
+- With `comp` off the noise rises smoothly with the M0 bit rate: 1.5 MHz -33.7,
+  2 MHz -30.1, 3 MHz -29.3, 4 MHz -26.9 (about the number of edges per second).
+- The noise in the left and right channels is uncorrelated as a waveform
+  (correlation -0.02, coherence 0.006 in every band) but the loudness envelopes
+  (10 ms) correlate at +0.9: both get loud and quiet at the same moments. An
+  additive supply or ground disturbance would be correlated in the waveform
+  (the idle reference's hum is: +0.57). So it is multiplicative: a common event
+  in time acting on each channel's own independent bit stream.
+- It is not data dependent (reading zeros and reading data are the same), not
+  the ground return between the SD socket shield and the jack's ground lug (the
+  DC differential moves by 4 to 5 uV; 50 mV DC range of an XDM1041), not a
+  droop of the card's VDD (3.2965 V idle, 3.294 V reading), not a voltage step in
+  the audio pad (drive 0 to 3, slew limit on or off make the ring after each edge
+  nearly vanish or grow, and the noise stays at -30.2 to -30.4), not the
+  M0's pin edges: scoped during real reads with `comp` on, the edge phases
+  against the 341.34 ns tick are unchanged from idle (no edges in phases never
+  seen at idle, 0.05 to 0.06 % in both). Measured at the SD socket's VDD pin
+  (AC-coupled, full bandwidth, ambient FM pickup with the board off is
+  0.3 mV in 20 kHz to 1 MHz): reading adds about 12 mV RMS in 20 kHz to 1 MHz
+  (13.3 against 4.8 mV) and lines at the SPI clock and its harmonics (23.4375,
+  46.875, 70.3 MHz, 20 to 27 dB above idle); the audio stream alone adds 15 to
+  32 mV of ripple at 5 to 150 MHz. The buffer's own supply (ALDO4 at U501, input
+  from IPS/VSYS) has not been probed: that is the open measurement.
+
+A 10 uF + 100 nF ceramic pair soldered across the SD socket's VDD and VSS1 pads
+(leads a few millimetres) changed the recorded noise by nothing (reads -30.3 before,
+-30.5 after; references -50.8 and -50.7; same conditions, 25 MHz, burst 2, bus
+187.5 MHz). It also did not remove the ripple it was meant to: the 20 kHz to 1 MHz
+ripple at the VDD pin while reading went 13.3 -> 10.9 mV (idle 4.9 -> 1.8 mV, the
+23.4375 MHz clock line 19.7 -> 14.1 dB above idle). So that test does not exclude
+the card's supply: a card pulling tens of milliamps for tens of microseconds needs
+a far larger reservoir, or a ferrite bead or a few ohms in the VDD feed, for the
+ripple to drop by 20 dB. The decisive measurement remains the ripple on the
+audio buffer's own supply (ALDO4 at U501).
+
+Two more tests, with the scope's fourth channel tacked (fine wire) onto the
+buffer's VCC pin (U501 pin 5, ALDO4):
+- 47 pF ceramics from pin 31 and from pin 32 to ground (pin 33): the ring after each
+  edge drops (median overshoot after a rise 2.25 -> 1.9 V, undershoot after a fall
+  -0.47 -> -0.04 V), the tone level is unchanged (-11.6 dBFS), and the read noise is
+  unchanged: -30.3 dBFS in every condition (before: -30.2 to -30.4). Ringing of the
+  signal at the buffer's input, and its closeness to the switching threshold, is
+  not the cause. (The idle reference rose from -50.8 to -44.4 dBFS, probably the
+  added wire on VCC.)
+- Supply ripple (mV RMS, AC-coupled, full bandwidth), 20 kHz-1 MHz / 1-5 / 5-30 /
+  30-150 MHz. Buffer VCC: no stream, no read 0.30 / 0.50 / 2.1 / 5.7; stream, no read
+  2.34 / 2.84 / 5.9 / 20.2; stream + read 25 MHz 2.39 / 2.88 / 5.8 / 19.5; stream +
+  read 50 MHz 2.40 / 2.90 / 5.9 / 19.7; no stream + read 0.34 / 0.60 / 2.6 / 6.4. The
+  card's VDD, at the same time: 2.6 -> 7.5 mV (25 MHz) and 8.5 mV (50 MHz) in
+  20 kHz-1 MHz when reading. So reading ripples the card's supply but not the
+  buffer's: the buffer's supply is not how the noise arrives.
+What is left is interference picked up after the pins: the SPI1 traces, the socket
+and the card itself are near the audio parts, and the SDMMC card (on the Lyra,
+far from them) is silent. RF at the SPI clock and its harmonics, demodulated by each
+channel's own stages, would give what was measured: independent per-channel
+waveforms with a common envelope that follows the read bursts.
+
+Where the noise is (scope, same cal tone and reads, AC-coupled, audio band):
+at the jack tip the 1 kHz tone is 25 mV rms and silence is 0.17 / 0.20 / 0.27 / 0.40 mV
+rms in 200-1k / 1-4k / 4-10k / 10-20k Hz; with the card read (25 MHz, 2-word
+bursts) 0.54 / 1.05 / 1.42 / 1.58 mV, 50 MHz 0.61 / 1.21 / 1.65 / 1.84, 25 MHz with
+a 93.75 MHz bus 0.63 / 1.23 / 1.70 / 1.88 (-20 dB re the tone, as the recorder
+gave). The same excess is at the buffer's output (pin 6) and at its input (pin 31,
+the M0's own pad): after scaling by the 1.83 V against 3.23 V swing it is 4.8 / 5.8 /
+8.8 mV at pin 31 and 5.5 / 6.8 / 11 mV at pin 6. So the noise is already in the
+M0's bitstream at the pin; the buffer and the output filter only pass it, and the
+buffer's edges match the pin's (same edge count to 0.1 %, same share of narrow
+pulses). Supply, ground, ring, threshold, missing pulses and pickup are excluded.
+(Two-channel scope captures show spurious 64-sample mismatches between channels; do not
+match edges across channels at this fidelity.)
+
+**Correction (2026-10-12, later): the "10 MHz grid" and "pin follows issue time" claims earlier versions of this section made
+are withdrawn, and the "extra edges" that obscured it were measurement artefacts.**
+With pin 31 jumpered to pin 34, an on-chip counter (a small script, not kept in the repo: PWM1's
+counter mode on RMIO24) counts the pad's rising edges with no scope involved. For the
+toggling diagnostic firmware (one write per tick) it counts 1.001, 0.999, 1.015 and 1.014
+times the exact rate (1.4648 M cycles/s; the 1.5 % scatter is the timing of the read), and
+the scope's own hardware frequency counter reads 1,464,802 Hz at trigger levels from 0.5 to
+1.3 V (the expected rate less the scope clock's 28.9 ppm offset). So the pad has exactly one
+edge per tick. The edge lists taken from the scope's waveform memory had 1.64 times as
+many edges (ringing and acquisition artefacts; a 200 ns hold-off in the extractor
+brings them to 1.005 times), which is also what hid any grid. Edge-time analysis from those
+lists is unreliable until it has been redone on validated edges (the MSO digital
+channels, or this counter plus a hold-off checked against it). Every grid, "slot" and pin-interval number from those lists is withdrawn.
+Stock firmware, silence: the counter gives 1.034 M rising edges/s (0.70 edges per tick),
+the same in every stream.
+
+Earlier versions of this section also claimed that the pin follows the time the write is
+issued rather than the time it returns, and that a stall inside the write does not move the
+pin. Those claims were computed from the over-counted edge lists and are withdrawn; whether
+the pad changes at issue or at return has not been established (it needs the MSO's digital
+channels). What is measured and kept: a write blocks for 53 cycles normally and up to about
+113 with the card read (27 % of ticks stalled at all at 25 MHz), and the injection test below
+shows the loop cancels delays it sees before the write.
+
+Does the correction cancel a known timing error? (injection test, not kept in the repo; 256-cycle tick,
+jack-tip noise in 0.2-20 kHz, left channel, silence; the loop delays the pin write by K cycles on a random 1 in 8
+of the plain ticks). Noise added over the K = 0 floor, correction off / on (mV rms, in quadrature with the floor,
+which is 2.19 / 1.37 mV total): K = 8 cycles 1.8 / 0; 16: 2.4 / 0; 32: 4.0 / 0; 48: 4.8 / 0.5; 64: 5.9 / 0.56; 96: 8.3 / 0.72;
+128: 10.1 / 22 (the window edge). So the correction removes about 90 % of the amplitude (about 20 dB of
+the power) of a pre-write delay anywhere inside its window; what is left is a steady 9 to 10 % of the uncorrected
+error, rising in proportion to it, and not understood (a gain or pulse-shape error of about that size,
+or something the filter does). At the window edge (delay = half the tick modulus) the loop misreads the delay by a
+whole tick and the noise doubles. With the production window of that day (-28 to +99 cycles; gone since the loop's free-running clock, see "Cycle budget") a delayed write that is
+followed by an early one misreads as well: the first run of this test, with the window at 28, gave 12.8 mV with
+the correction on against 6.6 mV off for a 64-cycle delay. The error power scales as the square root of the injection rate (1/2, 1/8, 1/32, 1/128 of the
+plain ticks gave 6.1, 3.8, 1.9, 0.8 mV with the correction off), as for independent random timing errors.
+Delaying only the writes that carry B2 high changed nothing audible with the correction off (0.3 mV
+added) while delaying only those with B2 low gave the whole effect (4.1 mV); that asymmetry is unexplained.
+Consequence: lateness that the firmware sees before the write is cancelled well; what is left under card reads is
+lateness the loop does not see, or sees wrongly.
+
+Independent check of the free-running SysTick loop (commit 6927389), same board and session, stock firmware
+against a local build of that commit, jack-tip noise, 0.2-20 kHz, total mV rms over three streams per condition, silence
+stream (the loop plays digital silence), correction on, USB unplugged:
+
+| Condition | Stock | Free-running SysTick |
+|---|---|---|
+| no read | 0.48-0.59 | 0.67-0.71 |
+| read 25 MHz, 2-word bursts | 0.83-0.98 | 0.64-0.66 |
+| read 25 MHz, 1-word bursts | 0.78-1.08 | 0.67-0.68 |
+| read 50 MHz, 2-word bursts | 0.92-1.04 | 0.67-0.69 |
+| read 25 MHz, 4-word bursts | 6.6-7.5 | 0.64-0.67 |
+
+With a 1 kHz tone (THD+N re the tone, three streams): stock -30.4 dB with no read, -28.2 dB with 25 MHz 2-word reads, -9.9 dB
+with 4-word reads; free-running -30.3, -28.8 and -26.8 dB. So with the new loop reads add nothing audible to silence,
+the 4-word case is fixed (17 dB better with a tone), but with a tone present the reads still cost about 1.5 dB
+at 2-word bursts, as before, and the silence floor is 0.15-0.2 mV higher. The stock 4-word figure was 1.62-1.72 mV in
+an earlier session on the same board (image 8401686); what differed between the sessions is not known (the loop was
+not falling behind: 1 us/s, correction on).
+
+**What the "rain" is not** (by ear, same day, digital silence, comp on): the
+noise that remains while the SPI SD card is read sounds like rain, gets
+quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
+absent when the SDMMC card (`mmcblk0`, 22 MB/s, and throttled to 1.6 MB/s) is
+read, and does not change with the audio pad's drive strength or slew
+(`GPIO4_IOC_SARADC_CON` `0xFF4D8840`: drive 0 to 3, slew limit on or off). It
+is therefore not the M0 being late (40 times less lag changed nothing audible)
+and not storage reads in general. The SPI1 pins are already at 2 mA. Left: the
+mainboard's SD slot (and the display) coupling into the audio buffer's supply
+or input. (Since measured: the noise is already in the M0's bitstream at the pin, see "Where the noise is".)
 
 **An idle card ticked once a second** (found 2026-10-09, with the corrected
 loop, 375 MHz and four-word display bursts all in use). With a card in the
@@ -592,6 +986,30 @@ whether it was still there. The board file now names the pin `gpios`
 1 without, read from the pin), which gives the driver an interrupt and no
 polling. Not yet booted. Reading or writing the card while audio plays is
 still as above.
+
+**Reading the card: the card clock, and burst length.** How far the M0
+falls behind while 10 s of silence plays and the card is read with `dd`
+(`comp` on, 375 MHz), with the card clock set through
+`/sys/kernel/debug/mmc1/clock`:
+
+| Card clock | Read speed | M0 behind |
+|---|---|---|
+| 25 MHz (as booted) | 1.7 MB/s | 26 ms/s (25-66) |
+| 12.5 MHz | 1.1 MB/s | 16 ms/s |
+| 6.25 MHz | 667 kB/s | 1 ms/s |
+| no read | - | 0.002 ms/s |
+
+Half the clock helps in proportion to the data; a quarter helps far more,
+which is not understood. The data blocks do go by DMA (SPI1 has its
+channels; transfers of 64 words or more use them), in bursts of 16 words
+each way, and the working explanation is the display's: a burst cannot be
+interrupted, and 16 words to a peripheral take about as long as a tick.
+The bus priorities above make no difference, which fits. So the kernel
+patch now also takes `rockchip,rx-dma-burst`, the board file asks for 4
+words each way on SPI1, and both lengths can be changed while running
+(`tx_dma_burst`, `rx_dma_burst` in `/sys/bus/platform/devices/ff130000.spi/`).
+Not yet booted or measured: which lengths work, and whether short bursts
+allow a faster card clock (`cap-sd-highspeed` for 50 MHz).
 
 **The display: DMA burst length.** The kernel's `spi-rockchip` sends pixel
 data by DMA in bursts of a quarter of the FIFO, and the M0's pin write waits

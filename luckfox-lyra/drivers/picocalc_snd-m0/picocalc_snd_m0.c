@@ -122,15 +122,22 @@ MODULE_PARM_DESC(comp, "Correct for pin writes delayed by other bus traffic, whe
 /*
  * Set by the driver when a corrected stream has fallen behind by more than
  * M0_COMP_BEHIND_US a second: the loop cannot keep up with what is holding
- * its pin writes up (most likely the display's SPI driver still sending
- * 16-word DMA bursts: no "rockchip,tx-dma-burst" support in this kernel),
- * and playing uncorrected is better than that. Streams are uncorrected from
- * then on; write 0 here to have comp tried again.
+ * its pin writes up (most likely an SPI driver still sending 16-word DMA
+ * bursts: no "rockchip,tx-dma-burst" support in this kernel; that falls
+ * behind by about 100 ms a second), and playing uncorrected is better than
+ * that. Streams are uncorrected from then on; write 0 here to have comp
+ * tried again.
+ *
+ * The limit is not tight: with the 4-word bursts, reading the SD card on
+ * SPI1 (about 25000 interrupts a second of CPU register writes, which
+ * bursts do not shorten) settles the loop at 3 to 9 ms a second behind and
+ * keeps it there. That is about 0.4 % slow, a few cents flat, only while the
+ * card is read, and not a reason to lose the correction for the session.
  */
 static bool comp_gave_up;
 module_param(comp_gave_up, bool, 0644);
 MODULE_PARM_DESC(comp_gave_up, "comp is being ignored because a corrected stream could not keep pace; write 0 to retry");
-#define M0_COMP_BEHIND_US  1000
+#define M0_COMP_BEHIND_US  20000
 
 static unsigned int comp_min_hz = 2500000;
 module_param(comp_min_hz, uint, 0644);

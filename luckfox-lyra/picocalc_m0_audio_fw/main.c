@@ -26,6 +26,8 @@ _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_min_cvr) == M0_SHMEM_ST
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_overruns) == M0_SHMEM_STAT_OVERRUNS, "stat_overruns");
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, buffer) == M0_HEADER_SIZE, "header");
 _Static_assert(DSM_FS_SHIFT >= M0_COMP_LOG2_CYCLES, "comp scaling");
+/* m0_play_comp's m = FS * delta / tick is the count difference << 8 less FS */
+_Static_assert(DSM_FS_SHIFT == M0_COMP_LOG2_CYCLES + 8, "comp scaling: SysTick's 24-bit count is shifted up by 8");
 _Static_assert(M0_MIN_TICKS_PER_SAMPLE > M0_COMP_STEPS, "a sample needs a plain tick too");
 _Static_assert((M0_RING_BYTES & (M0_RING_BYTES - 1U)) == 0, "ring size must be a power of two");
 _Static_assert(M0_IDLE_CYCLES <= SYST_MAX + 1U, "idle period does not fit SysTick");
@@ -55,6 +57,17 @@ static void tick_set(uint32_t cycles)
 	REG(SYST_CVR) = 0;
 	tick_ack();
 	REG(SYST_CSR) = SYST_CSR_RUN;
+}
+
+/* SysTick as a free-running 24-bit counter (m0_play_comp): no tick, no
+ * exception, a count that wraps after 2^24 cycles */
+static void tick_free_run(void)
+{
+	REG(SYST_CSR) = 0;
+	REG(SYST_RVR) = SYST_MAX;
+	REG(SYST_CVR) = 0;
+	tick_ack();
+	REG(SYST_CSR) = SYST_CSR_FREE;
 }
 
 /* Take the tick timing from the header if it is usable, else the defaults,
@@ -100,7 +113,10 @@ static int tick_start(const m0_audio_shmem_t *shmem)
 	m0_play_state[PS_PLAIN / 4] = base - steps;
 	m0_play_state[PS_SHIFT / 4] = shift;
 	m0_play_state[PS_DX_MASK / 4] = interp;
-	tick_set(cycles);
+	if (comp)
+		tick_free_run();
+	else
+		tick_set(cycles);
 	return comp;
 }
 
@@ -141,6 +157,17 @@ int main(void)
 			m0_play_comp(); /* until ctrl != PLAY */
 #if M0_COMP_STATS == 1
 			shmem->stat_late = m0_play_state[PS_DSUM / 4];
+#elif M0_COMP_STATS == 2
+			/* Counts of plain ticks late by >= 32, 64, 100 cycles: read with
+			 * dd from /dev/mem at M0_TRACE_ADDR (no PROFILE build uses it) */
+			{
+				volatile uint32_t *h = (volatile uint32_t *)M0_TRACE_ADDR;
+
+				h[0] = m0_play_state[PS_H32 / 4];
+				h[1] = m0_play_state[PS_H64 / 4];
+				h[2] = m0_play_state[PS_H100 / 4];
+			}
+			shmem->stat_late = M0_STAT_LATE_UNKNOWN;
 #else
 			shmem->stat_late = M0_STAT_LATE_UNKNOWN;
 #endif

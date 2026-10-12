@@ -10,14 +10,24 @@ writes are recorded. The ring is pre-filled and kept non-empty except in the
 underrun test. This checks the arithmetic and the per-sample schedule; timing
 on the real core is what PROFILE=1 and picocalc_m0_diag_fw are for.
 
-m0_play_comp() reads the SysTick count after each pin write to see when the
-pin changed. Nothing counts here, so the harness puts the count there itself,
-as it would be for writes that are late by amounts the harness makes up: more
-when a write is held up, less again by as much as the loop can catch up in a
-tick, and sometimes more than a whole tick in all. Besides comparing with the
-model, those runs check from the pin writes alone that what the firmware puts
-back into the modulator does cancel the late edges: a model that shared a
-sign error with the firmware would pass the comparison.
+m0_play_comp() runs SysTick free (24 bits, counting down) and waits for each
+tick by reading the count in a loop, then reads it again after the pin write
+to see when the pin changed. The harness therefore keeps a clock: every read
+of the count returns the count at the clock's time and moves the clock on by
+what the firmware would have spent (a spin iteration, the tick's other work,
+the pin write, which it holds up by amounts the harness makes up: a share of
+the writes, by a few cycles up to several ticks, or exactly chosen ones). The
+model gets the counts the firmware read and nothing else. Besides comparing
+with it, the runs check:
+  - from the reads alone that the firmware writes in the first spin
+    iteration at or past the tick's time and not before it, on a grid of
+    exactly one tick per write however far behind it is (no tick is lost: after
+    a stall it catches up and is back on the grid, with writes less than a
+    tick apart meanwhile);
+  - from the pin writes alone that what the firmware puts back into the
+    modulator does cancel the late edges (a model that shared a sign error
+    with the firmware would pass the comparison).
+The count wraps at 24 bits in these runs, also in the middle of a stall.
 """
 import math
 import random
@@ -25,7 +35,7 @@ import struct
 import sys
 
 from elftools.elf.elffile import ELFFile
-from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS, UC_HOOK_MEM_WRITE
+from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB, UC_MODE_MCLASS, UC_HOOK_MEM_WRITE, UC_HOOK_MEM_READ
 from unicorn.arm_const import (UC_CPU_ARM_CORTEX_M0, UC_ARM_REG_SP, UC_ARM_REG_LR, UC_ARM_REG_R4,
                                UC_ARM_REG_R5, UC_ARM_REG_R6, UC_ARM_REG_R7, UC_ARM_REG_R8,
                                UC_ARM_REG_R9, UC_ARM_REG_R10, UC_ARM_REG_R11)
@@ -43,6 +53,7 @@ CTRL, WRITE_IDX, READ_IDX = 4, 8, 12
 PS_FRAC, PS_PLAIN = 4, 8                    # m0_play_state: what main.c sets
 PS_SHIFT, PS_DX_MASK = 72, 76
 PS_DSUM = 132                               # m0_play_comp: what plain ticks' writes came late by, added up
+PS_PREV = 148                               # m0_play_comp: the count after the previous pin write, << 8
 BUS_STEPS, STEPS = 8, 19                    # a PROFILE build has three more after the bus steps
 COMP_STEPS = 13                             # m0_play_comp: holds each sample, fewer steps
 MAX_SHIFT = 6
@@ -50,14 +61,20 @@ SYST_CVR = PPB + 0x18
 TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
 TRACE_UNDERRUN = 30
 COMP_CYCLES = 128                           # m0_play_comp: core cycles per tick, fixed
-COMP_BACK = 28                              # a write comes at most this much sooner than a tick after the last
-ON_TIME = 58                                # SysTick count after a pin write that is on time
-CATCH_UP = 15                               # cycles a late loop gains back per tick, in these tests
+# What the clock charges the firmware, in core cycles (the real figures are on the board: the
+# loop has about 20 spare per tick). The spin iteration is the 5 instructions of the wait loop.
+SPIN_ITER = 8                               # one pass of the wait loop
+EXIT = 7                                    # from the count that ends the wait to the pin write
+WRITE = 49                                  # the blocking pin write
+READ = 3                                    # the count read after it
+WORK_MIN, WORK_MAX = 46, 58                 # the rest of the tick, up to the first read of the next wait
+CNT_MASK = 0xFFFFFF                         # SysTick is 24 bits
 
 SAMPLE_RATE = 48000
 FS_SHIFT, CLAMP_SHIFT = 15, 20
 MASK32 = 0xFFFFFFFF
 IDX_MASK = RING - 4
+ONLY = ''                           # only the runs with this in their name (argv[2])
 
 
 def timing(core_hz, tick_cycles):
@@ -87,7 +104,7 @@ class Model:
         self.base, self.frac, self.cycles = tm
         self.comp = comp
         self.primed = not comp          # m0_play_comp: one tick before it starts, for a count
-        self.late = 0                   # how late the previous pin write was, core cycles
+        self.prev = 0                   # SysTick count after the previous pin write
         self.written = 0x0C000000       # the word on the pins
         self.late_sum = 0               # what plain ticks' writes came late by, added up
         self.x_used = 0                 # left input that went into the last pass
@@ -197,25 +214,29 @@ class Model:
             elif n == 11:
                 self.clamp(1)
 
-    def tick(self, ctrl, late=0):
-        """Returns the GPIO word written at this tick. late: by how many core
-        cycles that write was late (m0_play_comp)."""
+    def tick(self, ctrl, count=0):
+        """Returns the GPIO word written at this tick. count: the SysTick
+        count the firmware read after that write (m0_play_comp)."""
         if not self.primed:
-            self.primed, self.late = True, late
+            self.primed, self.prev = True, count
             return 0x0C000000
         out = self.word
         if self.comp:
-            # The firmware sees only counts: the time since the last write,
-            # less a tick, modulo the tick and taken as -COMP_BACK and up.
-            delta = (late - self.late + COMP_BACK) % self.cycles - COMP_BACK
+            # The firmware sees only counts: the time between the two writes
+            # is their difference, as a 24-bit signed number, and its excess
+            # over a tick is how much longer than a tick the level lasted.
+            gap = (self.prev - count) & CNT_MASK
+            if gap >= 1 << 23:
+                gap -= 1 << 24
+            delta = gap - self.cycles
             # The level that has just ended lasted a tick plus that: its
-            # feedback, +FS or -FS, was short by that fraction.
-            m = (delta << (FS_SHIFT + self.shift)) // self.cycles
+            # feedback, +FS or -FS, was off by that fraction.
+            m = s32((delta << (FS_SHIFT + self.shift)) // self.cycles)
             for ch, bit in ((0, 10), (1, 11)):
                 d = -m if self.written >> bit & 1 else m
                 self.i1[ch] = s32(self.i1[ch] + d)
                 self.i2[ch] = s32(self.i2[ch] + d)
-            self.late = late
+            self.prev = count
             self.written = out
             if self.pos >= self.steps and delta > 0:    # the tick now starting is a plain one
                 self.late_sum = (self.late_sum + delta) & MASK32
@@ -290,11 +311,17 @@ def cancels(name, trace, cycles, fs):
 
 
 def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=True,
-        comp=False, late=0.0, late_max=32, cancel=False):
+        comp=False, late=0.0, late_max=32, late_min=2, stalls=None, until=None, cnt0=0x654321,
+        settle=0, cancel=False):
     """Returns the number of mismatches. comp: run m0_play_comp; late: the
-    fraction of its pin writes that are held up, by 2 to late_max core cycles;
-    cancel: also check that the late edges are cancelled (needs a slow input
-    and enough of them to stand out from the modulator's own noise)."""
+    fraction of its pin writes that are held up, by late_min to late_max core
+    cycles, until the write number `until` if given; stalls: {write number:
+    cycles} held up as well; cnt0: SysTick's count when the clock starts;
+    settle: the last this many writes must be back on the grid; cancel: also
+    check that the late edges are cancelled (needs a slow input and enough of
+    them to stand out from the modulator's own noise)."""
+    if ONLY and ONLY not in name:
+        return 0
     uc, entry, state_addr, steps, stats = load(path, comp)
     if uc is None:
         print(f'{name:36s} (not in this build)')
@@ -313,7 +340,6 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         shift, interp = 0, False        # as main.c sets it up: m0_play_comp holds
     rnd = random.Random(7)
     trace = []
-    uc.mem_write(SYST_CVR, struct.pack('<I', ON_TIME))
     for i, (l, r) in enumerate(frames):
         uc.mem_write(SHMEM + HDR + 4 * i, struct.pack('<hh', l, r))
     # write_idx = 2 can never equal a frame-aligned index: ring never empty.
@@ -325,7 +351,34 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
 
     words = []
     ctrl_at = []                        # ctrl as the firmware would read it after tick n
-    state = {'stop_at': ticks, 'lag': 0, 'worst': 0}
+    state = {'stop_at': ticks, 'worst': 0, 'bad': 0, 'now': 0, 'reads': [], 'first': None,
+             'post': False, 'post_count': 0, 'work': False, 'prev_t': None, 'early': 0,
+             'off': []}
+    pins = []                           # when each pin changed (the clock's time)
+    problems = []
+
+    def count_at(t):
+        return (cnt0 - t) & CNT_MASK
+
+    def on_cvr(uc, access, addr, size, value, data):
+        """The firmware reads SysTick's count: serve the count at the clock's
+        time, after charging it for what it did since its last read."""
+        if state['post']:               # the read that says when the pin changed
+            state['post'] = False
+            state['work'] = True
+            val = state['post_count']
+            state['now'] += READ
+        else:
+            if state['first'] is None:
+                state['first'] = state['now']
+            elif state['work']:
+                state['now'] += WORK_MIN + rnd.randint(0, WORK_MAX - WORK_MIN)
+            else:
+                state['now'] += SPIN_ITER
+            state['work'] = False
+            state['reads'].append(state['now'])
+            val = count_at(state['now'])
+        uc.mem_write(SYST_CVR, struct.pack('<I', val))
 
     def write_idx_at(tick):
         # exactly what the firmware reads in the same tick
@@ -342,24 +395,43 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         if n >= state['stop_at']:
             uc.mem_write(SHMEM + CTRL, struct.pack('<I', 0))
         ctrl_at.append(0 if n >= state['stop_at'] else 1)
-        # How late this write is. A write that is held up makes all that
-        # follow late too, less what the loop catches up each tick.
         playing = comp and model.primed
-        if comp and n == 1:
-            state['lag'] = 70           # the first tick is wherever SysTick happened to be
+        if comp:
+            k = n - 1                   # the write number: 0 is the first one, both pins low
+            due = state['first'] + COMP_CYCLES * (k + 1)
+            reads = state['reads']
+            state['reads'] = []
+            # waited exactly until the tick was due: the last count read is the first at or past it
+            if not reads or reads[-1] < due or any(t >= due for t in reads[:-1]):
+                if len(problems) < 5:
+                    problems.append(f'write {k} due at {due}: counts read at {reads[:4]} ... {reads[-2:]} ({len(reads)} reads)')
+            stall = 0
+            if playing and (until is None or k < until) and rnd.random() < late:
+                stall = rnd.randint(late_min, late_max)
+            stall += (stalls or {}).get(k, 0)
+            state['now'] += EXIT + WRITE + stall
+            t = state['now']
+            pins.append(t)
+            state['post'] = True
+            state['post_count'] = count_at(t)
+            d = t - due                 # against the tick, whatever the write itself costs
+            state['off'].append(d - EXIT - WRITE)
+            if state['prev_t'] is not None:
+                state['early'] = max(state['early'], COMP_CYCLES - (t - state['prev_t']))
+            state['prev_t'] = t
+            count = state['post_count']
         else:
-            state['lag'] = max(0, state['lag'] - CATCH_UP)
-            if playing and rnd.random() < late:
-                state['lag'] += rnd.randint(2, late_max)
-        d = state['lag']
-        uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - d) % cycles))
+            count = 0
+            d = 0
         # keep the model in step so the hooks above can look at its state
-        expect.append(model.tick(ctrl_at[-1], d))
+        expect.append(model.tick(ctrl_at[-1], count))
         if playing:
             trace.append((value >> 10 & 1, d, model.x_used))
-            state['worst'] = max(state['worst'], d)
+            state['worst'] = max(state['worst'], d - EXIT - WRITE)
 
     uc.hook_add(UC_HOOK_MEM_WRITE, on_gpio, begin=GPIO4_DR, end=GPIO4_DR + 3)
+    if comp:
+        uc.hook_add(UC_HOOK_MEM_READ, on_cvr, begin=SYST_CVR, end=SYST_CVR + 3)
 
     model = Model(frames, read_idx, write_idx_at, tm, steps, shift, interp, comp)
     expect = []
@@ -415,16 +487,31 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         if dsum != model.late_sum:
             print(f'  {name}: lateness total {dsum}, model {model.late_sum}')
             bad += 1
+    if comp:
+        for p in problems:
+            print(f'  {name}: not waited for the tick: {p}')
+        bad += bool(problems)
+        # No tick is lost: whatever the stalls were, the loop is back on the grid at the end
+        # (a write is then up to a spin iteration after the tick's time)
+        if settle:
+            behind = max(state['off'][-settle:])
+            if behind > SPIN_ITER + 8:
+                print(f'  {name}: still {behind} cycles behind the grid {settle} writes after the last stall')
+                bad += 1
     if cancel:
         bad += cancels(name, trace, cycles, 1 << (FS_SHIFT + shift))
     ones_l = sum((w >> 10) & 1 for w in words) / max(len(words), 1)
     worst = f"  up to {state['worst']} cycles late" if state['worst'] else ''
+    if comp and state['early'] > 0:
+        worst += f", up to {state['early']} early"
     print(f'{name:36s} {len(words):7d} ticks  left duty {ones_l:.4f}  {"FAIL" if bad else "ok"}{worst}')
     return bad
 
 
 def main():
+    global ONLY
     path = sys.argv[1] if len(sys.argv) > 1 else 'rk3506-m0-audio.elf'
+    ONLY = sys.argv[2] if len(sys.argv) > 2 else ''
     rnd = random.Random(1)
     n = RING // 4
     sine = [(int(20000 * math.sin(2 * math.pi * k / 64)), int(-12000 * math.sin(2 * math.pi * k / 32))) for k in range(n)]
@@ -463,6 +550,28 @@ def main():
     bad += run(path, 'corrected, noise, 25 % held up', noise, 400000, tcomp, comp=True, late=0.25, late_max=99)
     bad += run(path, 'corrected, rails, 25 % held up', rails, 400000, tcomp, comp=True, late=0.25, late_max=99)
     bad += run(path, 'corrected, underrun', sine, 60000, tcomp, comp=True, late=0.1, underrun_after=30000)
+    # Lateness above 99 cycles, up to many ticks: the count's difference is a 24-bit number, so none
+    # of it is misread, and the loop makes up the ticks it is behind, with writes less than a tick apart
+    bad += run(path, 'corrected, 3 % held up 100-400', slow, 400000, tcomp, comp=True, late=0.03,
+               late_min=100, late_max=400, cancel=True)
+    bad += run(path, 'corrected, 0.3 % held up 100-3000', slow, 400000, tcomp, comp=True, late=0.003,
+               late_min=100, late_max=3000, cancel=True)
+    bad += run(path, 'corrected, noise, 1 % held up 100-1000', noise, 300000, tcomp, comp=True, late=0.01,
+               late_min=100, late_max=1000)
+    bad += run(path, 'corrected, stalls at the aliasing edges', slow, 60000, tcomp, comp=True,
+               stalls={2000 + 500 * i: c for i, c in enumerate(
+                   (28, 29, 70, 99, 100, 101, 127, 128, 129, 150, 227, 228, 255, 256, 257, 383, 384, 385, 512, 1000))},
+               settle=3000)
+    bad += run(path, 'corrected, stalls of 22 and 100 us', slow, 90000, tcomp, comp=True,
+               stalls={5000: 8000, 20000: 37500}, settle=8000)
+    bad += run(path, 'corrected, stall of 1 ms', slow, 60000, tcomp, comp=True, stalls={3000: 375000}, settle=8000)
+    # SysTick's 24-bit count wraps (every 2^24 cycles, 131072 ticks: the long runs above do not miss it)
+    bad += run(path, 'corrected, count wraps at the start', slow, 30000, tcomp, comp=True, cnt0=40,
+               late=0.05, late_min=20, late_max=300, until=20000, settle=1000, cancel=True)
+    bad += run(path, 'corrected, count wraps in a stall', slow, 30000, tcomp, comp=True, cnt0=0x3000,
+               stalls={20: 20000}, late=0.01, late_min=2, late_max=200, until=20000, settle=3000)
+    bad += run(path, 'corrected, count at half range', slow, 30000, tcomp, comp=True, cnt0=0x800100,
+               stalls={50: 2000, 3000: 128}, late=0.02, late_min=2, late_max=250, until=20000, settle=3000)
     bad += run(path, 'unaligned read_idx', sine, 20000, t1m2, read_idx=0x12346)
     if bad:
         print(f'check_play: {bad} FAILED')
