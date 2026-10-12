@@ -49,7 +49,9 @@
 #define PS_H32        136
 #define PS_H64        140
 #define PS_H100       144
-#define PS_SIZE       148
+/* m0_play_comp: SysTick count (<< 8) after the previous pin write */
+#define PS_PREV       148
+#define PS_SIZE       152
 
 /*
  * Ticks at the start of every sample that each carry one step of the
@@ -70,12 +72,12 @@
 #define M0_MAX_SHIFT  6
 
 /* m0_play_comp(): a tick is exactly this many core cycles (2^7), samples are
- * held (shift 0) and take this many steps. The time from one pin write to
- * the next is taken to be a tick less at most M0_COMP_BACK cycles. */
+ * held (shift 0) and take this many steps. SysTick runs free, reload
+ * SYST_MAX; the time from one pin write to the next is a 24-bit count
+ * difference, so any lateness up to 2^23 cycles (22 ms) is seen right. */
 #define M0_COMP_LOG2_CYCLES 7
 #define M0_COMP_CYCLES      (1 << M0_COMP_LOG2_CYCLES)
 #define M0_COMP_STEPS       13
-#define M0_COMP_BACK        28
 
 #ifndef M0_COMP_STATS
 #define M0_COMP_STATS 0
@@ -91,9 +93,10 @@ extern uint32_t m0_play_state[PS_SIZE / 4];
  * Returns when shmem->ctrl leaves M0_CTRL_PLAY, pins as the last tick left them. */
 void m0_play(void);
 /* The same, timing each pin write and correcting for late ones (play.S). Also
- * needs: a tick of M0_COMP_CYCLES, PS_SHIFT = 0, PS_PLAIN counted from
- * M0_COMP_STEPS, the M0's bus writes not bufferable. Holds each sample
- * whatever PS_DX_MASK says. Not in PROFILE builds. */
+ * needs: SysTick free-running (reload SYST_MAX, no tick interrupt), a tick of
+ * M0_COMP_CYCLES, PS_SHIFT = 0, PS_PLAIN counted from M0_COMP_STEPS, the
+ * M0's bus writes not bufferable. Holds each sample whatever PS_DX_MASK
+ * says. Not in PROFILE builds. */
 void m0_play_comp(void);
 #endif
 

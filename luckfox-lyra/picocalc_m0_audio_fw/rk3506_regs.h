@@ -83,6 +83,7 @@
 #define SYST_RVR          U32(0xE000E014)
 #define SYST_CVR          U32(0xE000E018)
 #define SYST_CSR_RUN      0x7U          /* ENABLE | TICKINT | CLKSOURCE = core clock */
+#define SYST_CSR_FREE     0x5U          /* ENABLE | CLKSOURCE: free-running count, no exception */
 #define SYST_MAX          0x00FFFFFFU
 #define SCB_ICSR          U32(0xE000ED04)
 #define ICSR_PENDSTSET_BIT 26

@@ -517,10 +517,20 @@ feedback, out of both integrators: the modulator then treats the bit as what
 it really delivered and shapes the error out of the audio band. It does
 this on every tick, late or not, with no branch on the lateness, so a tick
 always costs the same; the tick is exactly 128 core cycles, which makes the
-arithmetic shifts by constants. Because it measures from one write to the
-next and not against the tick grid, it stays right when the loop has fallen
-a tick or more behind the grid: it then just plays that much slower until it
-has caught up. `picocalc,comp` on the sound node (the m0-audio overlay as
+arithmetic shifts by constants. SysTick is not the tick in this loop but a
+free-running 24-bit clock (reload 0xFFFFFF, no exception, 44.7 ms to wrap at
+375 MHz): the loop spins on the count until the tick is due, a tick after the
+one before whatever happened in between, and the time between two pin writes
+is the difference of their counts (the counts are kept shifted up by 8, so the
+32-bit subtraction is the 24-bit one and its sign is a 24-bit sign). So any
+lateness up to 2^23 cycles (22 ms) is seen right, a loop that is behind makes
+up the time without a tick lost (its writes come less than a tick apart,
+meanwhile, by up to the cycles it has to spare) and the correction measures
+write to write, so it does not depend on where the grid is. (Until
+2026-10-12 SysTick's reload was the tick and the loop saw the gap modulo 128:
+-28 to +99 cycles, anything outside aliased. The catch-up writes of that
+loop were not 20 but about 40 cycles early, see "Cycle budget" below, so
+they were outside the window as well.) `picocalc,comp` on the sound node (the m0-audio overlay as
 shipped has it) or `comp=1` on the sound module selects it
 (default off; it needs all of the following).
 
@@ -533,8 +543,9 @@ What it needs, each established on the board:
    as the pin. If writes are late by more on average than the loop has
    spare, it falls further and further behind, which is far worse than not
    correcting. So this loop holds each sample (no interpolation), has 13
-   steps and keeps its constants in registers: about 19 cycles spare on a
-   plain tick, 12 on the longest step.
+   steps and keeps its constants in registers. Measured (see "Cycle budget"):
+   the loop's work is 87-89 of the 128 cycles on a plain tick, so about 38
+   spare (earlier estimates of 19 do not match that measurement).
 3. **Shorter DMA bursts in the display's SPI driver** (above), and the right
    length for the display's SPI clock. With the driver's own 16-word bursts
    the loop falls further and further behind while the display is redrawn.
@@ -581,14 +592,22 @@ bursts (`COMP_STATS=2` build, which has 7 cycles spare instead of 17):
 In simulation the correction takes a redraw's noise under a -40 dBFS tone
 from -36 dBFS to -72 (16 % of writes up to 32 cycles late). By ear, with an
 earlier and worse version of the loop: a tone played through a console flood
-was "not affected at all". The limit of the present loop is a write that
-comes 100 core cycles or more later than a tick after the one before (0.27
-us): that is misread. Four-word bursts hold a write up by 80 at most.
+was "not affected at all". Since 2026-10-12 there is no limit to how late a
+write may be short of 2^23 cycles (22 ms); before, a write 100 cycles or more
+later than a tick after the one before, or sooner than 28 cycles less, was
+misread.
 
-`check_play.py` runs this loop too, puts late writes in by setting the
-SysTick count it reads, and checks both that the firmware matches the model
-and, from the pin writes alone, that the late edges are cancelled (a model
-sharing a sign error with the firmware would pass the first).
+`check_play.py` runs this loop too, with a clock of its own that every read
+of the SysTick count advances (spin passes, the tick's other work, the
+blocking write, held up by amounts it makes up: a share of the writes, by
+2 cycles to several ticks, or exactly chosen ones such as 99, 100, 127, 128,
+129, 227, 228, 256 cycles and a millisecond), and checks that the firmware
+matches the model given the counts it read, that the loop waits for exactly
+the tick's time and no tick is lost (back on the grid after a stall, writes
+less than a tick apart meanwhile), the 24-bit count wrapping (also in the
+middle of a stall, and at the sign flip of the shifted count), and, from the
+pin writes alone, that the late edges are cancelled (a model sharing a sign
+error with the firmware would pass the first).
 
 Debug build: `make COMP_STATS=1` adds up by how many cycles the pin writes
 were pushed later, and the driver prints it when a stream ends (quiet
@@ -603,6 +622,72 @@ Where this lives: the SPI burst length is a kernel change,
 out-of-tree copy of the driver). The display's SPI clock, if it
 is to be lowered, is `spi-max-frequency` in the board device tree. The
 375 MHz clock and `comp` come with the m0-audio overlay.
+
+#### Cycle budget of the free-running loop, and what it did on the board (2026-10-12)
+
+Cycle counts from the listing are off by a lot here, so the work per tick was
+measured by running the loop with no wait: a test build in which the next
+tick is never due (new) or SysTick's period is far shorter than the work
+(old), so that the loop runs at its own pace, silence played through the
+driver, pace = frames played against time ("behind"). The two 24-bit effects
+of the free-running loop (once 2^23 cycles behind it would wait for the wrap
+round) halve the pace of the new test build exactly, which was corrected for.
+Average of the 61-tick sample (13 step ticks, 48 plain), cycles per tick:
+old loop 88.2, new loop 90.5; with the sample stretched to 2000 more plain
+ticks, so that the figure is the plain tick's: old 87.1, new 89.4. A tick
+costs about 2.3 cycles more than before: the spin (5 instructions on the
+count, one extra pass the loop does not need when late), the count kept in
+memory (load and store) and the deadline update, against the pending-bit clear and
+the four modulo instructions that went. Plain ticks therefore have about 38
+cycles spare (128 - 89) against 41 before, and the longest step tick the same
+2.3 less than it had. (The 19 and 12 spare cycles quoted for the old loop
+above do not match this measurement; with the old loop running no faster
+than one tick per 88 cycles on the board and keeping up with 96 and 100 cycle
+ticks they cannot have been the no-load figures. The pace tests were run
+with no SD card read; under a read the writes are held up and the spare is
+what that eats.) With the loop on its grid the writes land 0 to 7 cycles
+after the due time (the spin reads the count every 8 cycles); the correction
+measures that and cancels it, with a residual: silence plays 0.16 mV rms
+noisier than with the loop on SysTick's own tick (0.67 against 0.51 mV, below).
+Without the correction that jitter is 1.28 mV.
+
+The wider misreads were not the rare very late writes: the diagnostic build
+(`COMP_STATS=2`, which counts plain ticks whose write came 32, 64, 100 or
+more cycles later than a tick after the one before) found, over 20 s of
+silence with the card read (about 46 million plain ticks): 25 MHz 2-word
+bursts 15877 / 569 / 315; 25 MHz 1-word 37227 / 579 / 347; 50 MHz 2-word 66445
+/ 872 / 499; 25 MHz 4-word 1.2 M / 685 / 339; none without a read. So 100 cycles or
+more late are about 1 in 100,000 writes, far fewer than the 0.05 % that
+would have explained the noise. What the old loop got wrong must be
+the other end of its window: after a late write the loop catches up, its
+next write comes about 40 cycles early (the loop's work is 88 cycles, not 108),
+which is -40 and below the old window's -28, so it was read as 88 cycles
+late, an error of 2/3 of a tick of feedback, after every late write.
+(Not measured separately: the old loop was not instrumented.)
+
+A/B on the board, same session, same image, `comp` on, jack-tip noise (scope
+CH4, total mV rms 0.2-20 kHz, silence, 3 streams per condition and 2 runs per
+firmware; stock = the 1.0.0-pr-235 image's firmware, new = this one, run
+order stock, stock, new, new; USB unplugged):
+
+| Condition | Stock | New |
+|---|---|---|
+| no read | 0.48-0.53 (mean 0.51) | 0.66-0.68 (0.67) |
+| read 25 MHz, 2-word bursts | 0.94-1.18 (1.04) | 0.62-0.65 (0.63) |
+| read 25 MHz, 1-word | 0.86-1.15 (0.95) | 0.65-0.68 (0.67) |
+| read 50 MHz, 2-word | 0.99-1.12 (1.05) | 0.62-0.66 (0.64) |
+| read 25 MHz, 4-word | 6.1-7.9 (7.0) | 0.62-0.65 (0.63) |
+
+The reads add nothing measurable to the new loop's floor; the stock loop's
+read noise is gone (the 4-word case, which the reference measurements put at
+1.6-1.7 mV, was 7 mV in this session's stock runs; the board or the day
+differs from that reference). Cost: the silence floor is 0.16 mV higher
+(0.67 against 0.51), from the 8-cycle spin granularity. "Behind" as the driver reports it
+was 0-2 us per second in every read condition, both firmwares. A variant that took the
+time of the write from the count read just before it (not after) was tried
+and is much worse (silence 0.95, 25 MHz 2-word read 7.1 mV): the count after
+the blocking write is the better measure. The driver needed no change: it
+reads only read_idx and the pace figures.
 
 **The SPI SD card is the worst offender.** While `mmc1` is being read the M0
 does not just get late edges, it falls about 2 % behind (20 ms a second,
@@ -883,7 +968,7 @@ which is 2.19 / 1.37 mV total): K = 8 cycles 1.8 / 0; 16: 2.4 / 0; 32: 4.0 / 0; 
 the power) of a pre-write delay anywhere inside its window; what is left is a steady 9 to 10 % of the uncorrected
 error, rising in proportion to it, and not understood (a gain or pulse-shape error of about that size,
 or something the filter does). At the window edge (delay = half the tick modulus) the loop misreads the delay by a
-whole tick and the noise doubles. With the production window (-28 to +99 cycles) a delayed write that is
+whole tick and the noise doubles. With the production window of that day (-28 to +99 cycles; gone since the loop's free-running clock, see "Cycle budget") a delayed write that is
 followed by an early one misreads as well: the first run of this test, with the window at 28, gave 12.8 mV with
 the correction on against 6.6 mV off for a 64-cycle delay. The error power scales as the square root of the injection rate (1/2, 1/8, 1/32, 1/128 of the
 plain ticks gave 6.1, 3.8, 1.9, 0.8 mV with the correction off), as for independent random timing errors.
