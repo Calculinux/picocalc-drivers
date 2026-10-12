@@ -697,8 +697,8 @@ out for whole ticks at a time. Not yet looked into.
 
 **Reading the SPI SD card with four-word SPI1 bursts** (measured 2026-10-10,
 kernel with `rockchip,tx-dma-burst` / `rx-dma-burst` = 4 on `&spi1`, card
-clock 25 MHz, 3 MHz bit rate, TCM, 375 MHz core clock). `sd-audio-test.sh`
-(firmware directory, as root on the board) plays 12-15 s of digital silence
+clock 25 MHz, 3 MHz bit rate, TCM, 375 MHz core clock). a test script
+(not kept in the repo; run as root on the board) played 12-15 s of digital silence
 while `dd` reads the raw card at about 1.6 MB/s and prints the driver's
 "behind" figure for each SPI1 burst length. "Behind" is time the M0's
 schedule slipped, and it does not mean the same in the two loops: the
