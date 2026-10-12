@@ -1,0 +1,12 @@
+--- play.h	2026-10-10 21:34:55.352059074 -0400
++++ /home/benklop/.claude/jobs/96c5cf3c/tmp/fw6/play.h	2026-10-12 01:50:00.709682947 -0400
+@@ -95,6 +95,9 @@
+  * M0_COMP_STEPS, the M0's bus writes not bufferable. Holds each sample
+  * whatever PS_DX_MASK says. Not in PROFILE builds. */
+ void m0_play_comp(void);
++#ifdef M0_DIAG
++void m0_play_diag(void);
++#endif
+ #endif
+ 
+ #endif /* M0_PLAY_H */

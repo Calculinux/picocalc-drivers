@@ -1,0 +1,166 @@
+--- play.S	2026-10-10 21:34:55.351289265 -0400
++++ /home/benklop/.claude/jobs/96c5cf3c/tmp/fw6/play.S	2026-10-12 01:50:00.736775405 -0400
+@@ -755,3 +755,163 @@
+ #ifndef M0_PROFILE
+ 	M0_PLAY	m0_play_comp, 1
+ #endif
++
++#ifdef M0_DIAG
++/* m0_play_diag, v2: timing diagnostic. Every tick: after wfi, on every 8th tick
++ * a software delay of DIAG_DELAY_LOOPS * 4 cycles (known truth for the scope);
++ * then the corrected loop's write (clear PENDST, str to GPIO, read SysTick), plus
++ * one SysTick read just BEFORE the str. Logged as 32 bits: pre count [8:0],
++ * post count [17:9], PENDSTSET read after the post count [18]. DIAG_ENTRIES
++ * ticks, the first a low write; then 3 low writes (sync mark); DIAG_CTRL[0]=2;
++ * then alternate and wait for DIAG_CTRL[1] = 1 (arm). Returns when ctrl != PLAY. */
++	.equ	DIAG_CTRL, M0_SHMEM_ADDR + 0x2100
++	.equ	DIAG_LOG, DIAG_CTRL + 0x10
++	.equ	DIAG_ENTRIES, 940
++	.section .bss.diag_log, "aw", %nobits
++	.align	2
++	.global	diag_log
++diag_log:
++	.space	2 * DIAG_ENTRIES
++	.text
++	.equ	DIAG_HIGH_WORD, 0x0C000400
++	.equ	DIAG_DELAY_LOOPS, 10
++
++	.section .ramfunc, "ax", %progbits
++	.align	2
++	.global	m0_play_diag
++	.thumb_func
++	.type	m0_play_diag, %function
++m0_play_diag:
++	push	{r4-r7, lr}
++	mov	r4, r8
++	mov	r5, r9
++	mov	r6, r10
++	mov	r7, r11
++	push	{r4-r7}
++	mov	r7, sp
++	ldr	r6, =m0_play_state
++	mov	sp, r6
++	str	r7, [sp, #PS_SAVED_SP]
++	ldr	r0, =SYST_CVR
++	str	r0, [sp, #PS_K_CVR]
++	ldr	r0, =SCB_ICSR
++	str	r0, [sp, #PS_K_ICSR]
++	ldr	r0, =GPIO4_DR_ADDR
++	mov	lr, r0
++	ldr	r0, =DIAG_CTRL
++	mov	r8, r0
++	ldr	r3, =GPIO4_DR_B23_LOW
++	ldr	r4, =DIAG_HIGH_WORD
++	mov	r11, r3
++	movs	r0, #0
++	mov	r9, r0			@ tick counter
++	mov	r6, r8
++	str	r0, [r6, #0]
++	str	r0, [r6, #4]
++	ldr	r0, =diag_log
++	ldr	r1, =diag_log + 2 * DIAG_ENTRIES
++	movs	r2, #4			@ start frozen: the host arms it
++	b	.L_dtick
++
++	.ltorg
++
++.L_dtick:
++	wfi
++#ifdef M0_DIAG_INJECT
++	mov	r7, r9
++	adds	r7, #1
++	mov	r9, r7
++	movs	r6, #7
++	ands	r6, r7
++	bne	.L_dnodelay
++	movs	r6, #DIAG_DELAY_LOOPS
++.L_ddelay:
++	subs	r6, #1
++	bne	.L_ddelay
++.L_dnodelay:
++#endif
++	ldr	r7, [sp, #PS_K_ICSR]
++	movs	r6, #1
++	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
++	str	r6, [r7]		@ tick taken
++	mov	r6, lr
++	mov	r7, r11
++	ldr	r5, [sp, #PS_K_CVR]
++	ldr	r5, [r5]		@ count just before the write
++	str	r7, [r6]		@ the pin write (blocking)
++	ldr	r6, [sp, #PS_K_CVR]
++	ldr	r6, [r6]		@ count after it
++	ldr	r7, [sp, #PS_K_ICSR]
++	ldr	r7, [r7]
++	lsrs	r7, r7, #ICSR_PENDSTSET_BIT
++	lsls	r7, r7, #31
++	lsrs	r7, r7, #31		@ PENDSTSET after the post count
++	lsls	r6, r6, #7
++	orrs	r6, r5
++	lsls	r7, r7, #14
++	orrs	r6, r7
++	cmp	r2, #0
++	bne	.L_dnotlog
++	strh	r6, [r0]
++	adds	r0, #2
++	cmp	r0, r1
++	bne	.L_dtoggle
++	movs	r2, #3			@ log full: three low writes follow
++.L_dnotlog:
++	cmp	r2, #4
++	beq	.L_dfrozen
++	mov	r11, r3			@ sync hold: low
++	subs	r2, r2, #1
++	bne	.L_dtick
++	movs	r2, #4
++	ldr	r6, =diag_log
++	ldr	r7, =DIAG_LOG
++	ldr	r0, =2 * DIAG_ENTRIES - 2
++1:	ldrh	r5, [r6, r0]
++	strh	r5, [r7, r0]
++	subs	r0, #2
++	bpl	1b
++	movs	r7, #2
++	mov	r6, r8
++	str	r7, [r6, #0]		@ done
++	b	.L_dtick
++.L_dfrozen:
++	ldr	r7, =M0_SHMEM_ADDR + M0_SHMEM_CTRL
++	ldr	r7, [r7]
++	cmp	r7, #M0_CTRL_PLAY
++	bne	.L_dstop
++	mov	r6, r8
++	ldr	r7, [r6, #4]
++	cmp	r7, #0
++	beq	.L_dtoggle
++	mov	r7, r11
++	cmp	r7, r4			@ start only after a high write
++	bne	.L_dtoggle
++	movs	r7, #0
++	str	r7, [r6, #4]
++	str	r7, [r6, #0]
++	ldr	r0, =diag_log
++	movs	r2, #0
++	mov	r11, r3
++	b	.L_dtick
++.L_dtoggle:
++	mov	r7, r11
++	cmp	r7, r3
++	beq	1f
++	mov	r11, r3
++	b	.L_dtick
++1:	mov	r11, r4
++	b	.L_dtick
++.L_dstop:
++	ldr	r6, [sp, #PS_SAVED_SP]
++	mov	sp, r6
++	pop	{r4-r7}
++	mov	r8, r4
++	mov	r9, r5
++	mov	r10, r6
++	mov	r11, r7
++	pop	{r4-r7, pc}
++
++	.ltorg
++	.size	m0_play_diag, . - m0_play_diag
++#endif

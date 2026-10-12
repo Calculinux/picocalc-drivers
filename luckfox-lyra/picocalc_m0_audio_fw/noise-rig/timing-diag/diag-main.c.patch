@@ -1,0 +1,17 @@
+--- main.c	2026-10-10 21:34:55.352577810 -0400
++++ /home/benklop/.claude/jobs/96c5cf3c/tmp/fw6/main.c	2026-10-12 01:50:00.709682947 -0400
+@@ -134,6 +134,14 @@
+ 
+ 		shmem->m0_state = M0_STATE_PLAY;
+ 		REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
++#ifdef M0_DIAG
++		tick_start(shmem);
++		REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
++		m0_play_diag();
++		shmem->stat_late = M0_STAT_LATE_UNKNOWN;
++		gpio_write_both(0, 0);
++		continue;
++#endif
+ 		if (tick_start(shmem)) {
+ #ifndef M0_PROFILE
+ 			/* Blocking writes: the loop times each pin write */
