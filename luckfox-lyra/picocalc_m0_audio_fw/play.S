@@ -116,8 +116,12 @@
  *   measured, a quarter of the pin writes are up to 0.4 us late while the
  *   display is redrawn, and every late edge is an error in the output.
  *   m0_play_comp() is the same loop with the pin write made blocking (main.c
- *   turns "bufferable" off for it), so that the SysTick count read straight
- *   after it says when the pin changed:
+ *   turns "bufferable" off for it), and the SysTick count read just BEFORE the
+ *   write: the pin follows when the write is issued, not when the blocking
+ *   write returns (a stall inside the write does not move it: measured with
+ *   the timing diagnostic, noise-rig/timing-diag/README.md; measuring after
+ *   the write, as an earlier version did, counted every stall as lateness and
+ *   made the correction worse than none in a model, docs/m0-audio.md):
  *      delta  = previous count - count, modulo the tick, as a number from
  *               -28 to 99        @ the level that just ended lasted a tick
  *                                @ + delta core cycles
@@ -219,18 +223,23 @@ m0_play_state:
 	add	r7, r11
 	.endm
 
-/* m0_play_comp: tick taken, pin write, and when the pin changed: leaves the
- * SysTick count in r6. */
+/* m0_play_comp: tick taken, pin write: leaves the SysTick count taken just
+ * BEFORE the write in r6. The pin follows when the write is issued, not when
+ * the blocking write returns (a stall inside it does not move the pin;
+ * noise-rig/timing-diag/README.md), so that is the count to measure by. It is
+ * kept in PS_PRE over the write, there being no register to spare. */
 	.macro	WRITE_TIMED
 	ldr	r7, [sp, #PS_K_ICSR]
 	movs	r6, #1
 	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
 	str	r6, [r7]		@ tick taken: clear SysTick's pending bit
+	ldr	r6, [sp, #PS_K_CVR]
+	ldr	r6, [r6]		@ when the write is issued
+	str	r6, [sp, #PS_PRE]
 	mov	r6, lr
 	mov	r7, r11
-	str	r7, [r6]		@ OUTPUT, and wait until the pin has changed
-	ldr	r6, [sp, #PS_K_CVR]
-	ldr	r6, [r6]		@ when was that
+	str	r7, [r6]		@ OUTPUT, blocking: the next one does not queue behind it
+	ldr	r6, [sp, #PS_PRE]
 	.endm
 
 /* Wait for the tick, put out the bits, run both modulators.

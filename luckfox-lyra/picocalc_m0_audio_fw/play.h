@@ -49,7 +49,9 @@
 #define PS_H32        136
 #define PS_H64        140
 #define PS_H100       144
-#define PS_SIZE       148
+/* m0_play_comp: the SysTick count taken just before the pin write, kept over it */
+#define PS_PRE        148
+#define PS_SIZE       152
 
 /*
  * Ticks at the start of every sample that each carry one step of the

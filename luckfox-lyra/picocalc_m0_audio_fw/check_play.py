@@ -51,7 +51,7 @@ TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
 TRACE_UNDERRUN = 30
 COMP_CYCLES = 128                           # m0_play_comp: core cycles per tick, fixed
 COMP_BACK = 28                              # a write comes at most this much sooner than a tick after the last
-ON_TIME = 58                                # SysTick count after a pin write that is on time
+ON_TIME = 114                               # SysTick count just before a pin write that is on time (the timing diagnostic read 114)
 CATCH_UP = 15                               # cycles a late loop gains back per tick, in these tests
 
 SAMPLE_RATE = 48000
@@ -313,7 +313,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         shift, interp = 0, False        # as main.c sets it up: m0_play_comp holds
     rnd = random.Random(7)
     trace = []
-    uc.mem_write(SYST_CVR, struct.pack('<I', ON_TIME))
+    uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - 70) % cycles))   # the first tick is wherever SysTick happened to be
     for i, (l, r) in enumerate(frames):
         uc.mem_write(SHMEM + HDR + 4 * i, struct.pack('<hh', l, r))
     # write_idx = 2 can never equal a frame-aligned index: ring never empty.
@@ -325,7 +325,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
 
     words = []
     ctrl_at = []                        # ctrl as the firmware would read it after tick n
-    state = {'stop_at': ticks, 'lag': 0, 'worst': 0}
+    state = {'stop_at': ticks, 'lag': 70, 'worst': 0}
 
     def write_idx_at(tick):
         # exactly what the firmware reads in the same tick
@@ -342,17 +342,17 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         if n >= state['stop_at']:
             uc.mem_write(SHMEM + CTRL, struct.pack('<I', 0))
         ctrl_at.append(0 if n >= state['stop_at'] else 1)
-        # How late this write is. A write that is held up makes all that
-        # follow late too, less what the loop catches up each tick.
+        # How late this write was issued: the count the firmware read just
+        # before it (m0_play_comp measures by that; the pin follows when the
+        # write is issued, not when it returns). A write that is held up
+        # makes all that follow late too, less what the loop catches up each
+        # tick. The next write's count is put in place now.
         playing = comp and model.primed
-        if comp and n == 1:
-            state['lag'] = 70           # the first tick is wherever SysTick happened to be
-        else:
-            state['lag'] = max(0, state['lag'] - CATCH_UP)
-            if playing and rnd.random() < late:
-                state['lag'] += rnd.randint(2, late_max)
         d = state['lag']
-        uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - d) % cycles))
+        state['lag'] = max(0, state['lag'] - CATCH_UP)
+        if playing and rnd.random() < late:
+            state['lag'] += rnd.randint(2, late_max)
+        uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - state['lag']) % cycles))
         # keep the model in step so the hooks above can look at its state
         expect.append(model.tick(ctrl_at[-1], d))
         if playing:
