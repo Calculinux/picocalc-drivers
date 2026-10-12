@@ -816,6 +816,21 @@ pulses). Supply, ground, ring, threshold, missing pulses and pickup are excluded
 (Two-channel scope captures show spurious 64-sample mismatches between channels; do not
 match edges across channels at this fidelity.)
 
+The pin does not change when the M0's blocking write returns (timing diagnostic
+firmware: pin 31 toggled every tick with the corrected loop's own write and SysTick
+read, each count logged, the scope's edge times matched to the log tick by tick, 128-cycle
+tick, silence). Pin edges land on a 10 MHz grid, 37.5 core cycles: each edge is at
+`37.5 * ceil((R + x) / 37.5) + C`, R being the time the write returned by the SysTick
+count (94 % of ticks within 6 cycles, rms 1.1 cycles = 3 ns, the rest are flips across a grid
+step). x, the grid's phase against SysTick, is new at every stream start. The loop's
+lateness measure said every write was on time; the pin edges are spread over 37.5
+cycles (rms 10.7 cycles = 29 ns, the pattern repeating every 75 ticks since
+128 mod 37.5 = 15.5). With a tick of 150 cycles (4 grid steps, 2.5 MHz) 89 % of the
+intervals are within 4 cycles of 150 and the rest are +-37.5 steps. So the "write
+returns when the pin changes" assumption of m0_play_comp is wrong by up to 37.5 cycles
+(100 ns), and a tick that is a multiple of 37.5 cycles (75, 150, 225, 300, 375) makes
+the delay the same every tick.
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
