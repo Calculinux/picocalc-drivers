@@ -25,7 +25,9 @@ _Static_assert(__builtin_offsetof(m0_audio_shmem_t, read_idx) == M0_SHMEM_READ_I
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_min_cvr) == M0_SHMEM_STAT_MIN_CVR, "stat_min_cvr");
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, stat_overruns) == M0_SHMEM_STAT_OVERRUNS, "stat_overruns");
 _Static_assert(__builtin_offsetof(m0_audio_shmem_t, buffer) == M0_HEADER_SIZE, "header");
+#if M0_COMP_CYCLES == 128
 _Static_assert(DSM_FS_SHIFT >= M0_COMP_LOG2_CYCLES, "comp scaling");
+#endif
 _Static_assert(M0_MIN_TICKS_PER_SAMPLE > M0_COMP_STEPS, "a sample needs a plain tick too");
 _Static_assert((M0_RING_BYTES & (M0_RING_BYTES - 1U)) == 0, "ring size must be a power of two");
 _Static_assert(M0_IDLE_CYCLES <= SYST_MAX + 1U, "idle period does not fit SysTick");
@@ -90,7 +92,12 @@ static int tick_start(const m0_audio_shmem_t *shmem)
 #ifndef M0_PROFILE
 	/* The corrected loop is written for one tick length; it holds each
 	 * sample and has fewer steps (play.S). */
+#ifdef M0_COMP_FORCE
+	/* test builds: no driver change needed for another tick length */
+	if (cycles == M0_COMP_CYCLES) {
+#else
 	if ((shmem->flags & M0_FLAG_COMP) && cycles == M0_COMP_CYCLES) {
+#endif
 		comp = 1;
 		shift = 0;
 		steps = M0_COMP_STEPS;

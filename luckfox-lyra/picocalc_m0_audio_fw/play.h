@@ -51,7 +51,9 @@
 #define PS_H100       144
 /* m0_play_comp: the SysTick count taken just before the pin write, kept over it */
 #define PS_PRE        148
-#define PS_SIZE       152
+/* m0_play_comp, 150-cycle tick: address of the table of corrections */
+#define PS_K_TAB      152
+#define PS_SIZE       156
 
 /*
  * Ticks at the start of every sample that each carry one step of the
@@ -71,13 +73,26 @@
  * sample may last at most 2^shift ticks; the state has room for this much. */
 #define M0_MAX_SHIFT  6
 
-/* m0_play_comp(): a tick is exactly this many core cycles (2^7), samples are
- * held (shift 0) and take this many steps. The time from one pin write to
- * the next is taken to be a tick less at most M0_COMP_BACK cycles. */
+/* m0_play_comp(): a tick is exactly M0_COMP_CYCLES core cycles, samples are
+ * held (shift 0) and take M0_COMP_STEPS steps. The time from one pin write to
+ * the next is taken to be a tick less at most M0_COMP_BACK cycles, and more by
+ * no more than the rest of the tick (so late by up to M0_COMP_CYCLES - 1 -
+ * M0_COMP_BACK cycles can be told). 128 (2^7, 2.93 MHz at 375 MHz) works in
+ * shifts; 150 (2.5 MHz, four steps of the pin's 10 MHz grid, 37.5 cycles
+ * each: noise-rig/timing-diag/README.md) takes a modulo and a table, and has
+ * the cycles to spare for it: make COMP_CYCLES=150. */
+#ifndef M0_COMP_CYCLES
+#define M0_COMP_CYCLES      128
+#endif
+#if M0_COMP_CYCLES == 128
 #define M0_COMP_LOG2_CYCLES 7
-#define M0_COMP_CYCLES      (1 << M0_COMP_LOG2_CYCLES)
-#define M0_COMP_STEPS       13
 #define M0_COMP_BACK        28
+#elif M0_COMP_CYCLES == 150
+#define M0_COMP_BACK        40
+#else
+#error "M0_COMP_CYCLES: 128 or 150"
+#endif
+#define M0_COMP_STEPS       13
 
 #ifndef M0_COMP_STATS
 #define M0_COMP_STATS 0

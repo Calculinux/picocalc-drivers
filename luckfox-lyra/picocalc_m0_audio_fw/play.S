@@ -174,8 +174,10 @@
 	.equ	RING_IDX_MASK, M0_RING_BYTES - M0_FRAME_BYTES
 	.equ	PENDST_TO_SIGN, 31 - ICSR_PENDSTSET_BIT
 	.equ	S, M0_BUS_STEPS + M0_PROFILE_STEPS	@ number of the last SRAM step
+#if M0_COMP_CYCLES == 128
 	.equ	COMP_LSL, DSM_FS_SHIFT - M0_COMP_LOG2_CYCLES
 	.equ	COMP_MOD, 32 - M0_COMP_LOG2_CYCLES
+#endif
 	.equ	COMP_BACK, M0_COMP_BACK
 
 /* For check_play.py, which has to know how this build schedules a sample */
@@ -242,6 +244,16 @@ m0_play_state:
 	ldr	r6, [sp, #PS_PRE]
 	.endm
 
+/* m: for the 150-cycle tick, the correction FS * delta / tick from a table
+ * (m0_comp_tab), r6 = (delta + COMP_BACK) * 2 on entry, m on leaving; r7 is
+ * clobbered. In the 128-cycle loop it is already in r6. */
+	.macro	COMP_M
+#if M0_COMP_CYCLES != 128
+	ldr	r7, [sp, #PS_K_TAB]
+	ldrsh	r6, [r7, r6]
+#endif
+	.endm
+
 /* Wait for the tick, put out the bits, run both modulators.
  * comp 0: enters with the GPIO word in r7 and its address in r6, leaves the
  *         next word in r7; r6 is free.
@@ -254,36 +266,56 @@ m0_play_state:
 	mov	r7, r12			@ the previous count + the word written then
 	mov	r12, r6
 	add	r12, r11		@ this count + this word, for the next tick
+#if M0_COMP_CYCLES == 128
 	subs	r6, r7, r6		@ (the words are bits 10 up)
 	adds	r6, #COMP_BACK
 	lsls	r6, r6, #COMP_MOD
 	lsrs	r6, r6, #COMP_MOD
 	subs	r6, #COMP_BACK		@ delta: this write came a tick + delta after the last
 	lsls	r6, r6, #COMP_LSL	@ m = FS * delta / tick
+#else
+	subs	r6, r7, r6		@ the counts' difference with the words in bits 10 up:
+	lsls	r6, r6, #23
+	asrs	r6, r6, #23		@ -149 to 149
+	adds	r6, #COMP_BACK
+	bpl	10f
+	adds	r6, #M0_COMP_CYCLES	@ modulo the tick, as -COMP_BACK and up
+10:	cmp	r6, #M0_COMP_CYCLES
+	blt	11f
+	subs	r6, #M0_COMP_CYCLES
+11:	lsls	r6, r6, #1		@ delta + COMP_BACK, as an offset into the table of m
+#endif
 	lsls	r7, r7, #31 - GPIO4_B2_BIT	@ the levels that just ended: N = left, C = right
 	bcs	2f
 	bmi	1f
+	COMP_M
 	adds	r0, r0, r6		@ left 0, right 0
 	adds	r1, r1, r6
 	adds	r3, r3, r6
 	adds	r4, r4, r6
 	b	9f
-1:	subs	r0, r0, r6		@ left 1, right 0
+1:	COMP_M
+	subs	r0, r0, r6		@ left 1, right 0
 	subs	r1, r1, r6
 	adds	r3, r3, r6
 	adds	r4, r4, r6
 	b	9f
 2:	bmi	3f
+	COMP_M
 	adds	r0, r0, r6		@ left 0, right 1
 	adds	r1, r1, r6
 	subs	r3, r3, r6
 	subs	r4, r4, r6
 	b	9f
-3:	subs	r0, r0, r6		@ left 1, right 1
+3:	COMP_M
+	subs	r0, r0, r6		@ left 1, right 1
 	subs	r1, r1, r6
 	subs	r3, r3, r6
 	subs	r4, r4, r6
 9:
+#if M0_COMP_STATS && M0_COMP_CYCLES != 128
+#error "COMP_STATS needs the 128-cycle tick"
+#endif
 #if M0_COMP_STATS == 1
 	.if	\stats
 	asrs	r6, r6, #COMP_LSL	@ delta again
@@ -460,6 +492,10 @@ m0_play_state:
 	str	r0, [sp, #PS_K_ICSR]
 	ldr	r0, =GPIO4_DR_ADDR
 	str	r0, [sp, #PS_K_GPIO]
+#if M0_COMP_CYCLES != 128
+	ldr	r0, =m0_comp_tab
+	str	r0, [sp, #PS_K_TAB]
+#endif
 #ifdef M0_PROFILE
 	ldr	r0, =M0_TRACE_ADDR
 	str	r0, [sp, #PS_K_TRACE]
@@ -763,4 +799,17 @@ m0_play_state:
 	M0_PLAY	m0_play, 0
 #ifndef M0_PROFILE
 	M0_PLAY	m0_play_comp, 1
+#endif
+
+#if M0_COMP_CYCLES != 128
+/* m = FS * delta / tick, truncated towards zero, for delta = k - COMP_BACK */
+	.section .rodata.m0_comp_tab, "a", %progbits
+	.align	1
+	.global	m0_comp_tab
+m0_comp_tab:
+	.set	k, 0
+	.rept	M0_COMP_CYCLES
+	.hword	(((k - M0_COMP_BACK) << DSM_FS_SHIFT) / M0_COMP_CYCLES)
+	.set	k, k + 1
+	.endr
 #endif

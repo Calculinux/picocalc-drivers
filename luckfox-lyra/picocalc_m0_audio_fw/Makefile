@@ -26,6 +26,16 @@ ifneq ($(COMP_STATS),)
 CFLAGS += -DM0_COMP_STATS=$(COMP_STATS)
 endif
 
+# make COMP_CYCLES=150: the corrected loop's tick is 150 core cycles (2.5 MHz at
+# 375 MHz) instead of 128; COMP_FORCE=1: it runs whatever the driver's flags
+# say (for tests; the driver only asks for the loop at 128).
+ifneq ($(COMP_CYCLES),)
+CFLAGS += -DM0_COMP_CYCLES=$(COMP_CYCLES)
+endif
+ifneq ($(COMP_FORCE),)
+CFLAGS += -DM0_COMP_FORCE
+endif
+
 OBJS = startup.o main.o play.o resource_table.o
 ELF  = rk3506-m0-audio.elf
 
