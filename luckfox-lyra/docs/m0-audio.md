@@ -831,6 +831,33 @@ returns when the pin changes" assumption of m0_play_comp is wrong by up to 37.5 
 (100 ns), and a tick that is a multiple of 37.5 cycles (75, 150, 225, 300, 375) makes
 the delay the same every tick.
 
+Measured with the card read (timing diagnostic firmware, 128-cycle tick, pin 31
+toggled every tick, SysTick counted just before and just after the blocking pin
+write and logged in the M0's own memory; the scope's edge times matched to the log
+tick by tick, 3 x 939 ticks per condition):
+- The pin edges are on the 10 MHz grid (37.5 cycles) in every condition, with the
+  same coherence (0.94-0.96) and period, so a pin interval is a whole number of
+  37.5-cycle steps (silence: 3 or 4; card read at 25 MHz: 3 or 4 on 98 % of ticks,
+  5 to 7 on 1.3 %; at 50 MHz: 5 on 9 %).
+- The pin follows when the write is issued, not when it returns. The count taken
+  before the write predicts the pin interval to within one step on 96.8 / 87.6 /
+  78 % of ticks (card read at 25 MHz with 2-word bursts / at 50 MHz / at 25 MHz with
+  the 93.75 MHz bus and 4-word bursts); the count after the write, which
+  m0_play_comp uses, on 84.6 / 74.0 / 63.2 %. Regressing the pin interval against
+  the write's own blocking time gives a slope of +0.04 / -0.02 / -0.16: a stall
+  inside the write does not move the pin.
+- A write blocks for 53 cycles normally; with the card read the 99th percentile is
+  101-105 and the longest 113 (27 % of ticks stalled at all, 9 % by more than 20
+  cycles, at 25 MHz). The loop treats each stall as lateness and corrects for it.
+  The rms difference between the loop's interval and the pin's is 37.5 / 37.9 /
+  52.2 cycles with the post-write count, against 23.5 / 30.1 / 37.8 with the
+  pre-write count: the post-write count adds 23-36 cycles rms (61-96 ns) of error to the
+  correction (about 15 cycles rms of any interval is the grid step itself).
+- Stalls before the write (the pre-write count 20 cycles or more late): 1.8 / 2.0 /
+  12.3 % of ticks; the write returns after the next tick has begun (PENDSTSET) on
+  0.6 / 1.2 / 8.8 %. Pin intervals that even the pre-write count does not explain
+  (off by 1.5 steps or more): 2.3 / 9.9 / 15.4 % of ticks.
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
