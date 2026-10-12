@@ -67,5 +67,8 @@ elif cmd == "off":
     hi(CRU, 0x3A4, 0x0FFF, s["mclk_sai1(CLKSEL_CON41)"] & 0x0FFF)
     wr(CRU, 0x32C, s["frac_div(CLKSEL_CON11)"])
     os.remove("/tmp/ref10m.save"); show()
+elif cmd == "drive":      # drive N (0 weakest .. 7): IOC1 GPIO1_B1 drive field, 8-bit level code (1 << (N + 1)) - 1
+    lvl = int(sys.argv[2]); print("drive reg before %#010x" % rd(IOC1, 0x150))
+    hi(IOC1, 0x150, 0xFF << 8, ((1 << (lvl + 1)) - 1) << 8); print("drive reg after  %#010x" % rd(IOC1, 0x150))
 else:
     print(__doc__)
