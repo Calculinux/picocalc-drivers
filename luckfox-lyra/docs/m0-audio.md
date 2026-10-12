@@ -977,6 +977,25 @@ added) while delaying only those with B2 low gave the whole effect (4.1 mV); tha
 Consequence: lateness that the firmware sees before the write is cancelled well; what is left under card reads is
 lateness the loop does not see, or sees wrongly.
 
+Independent check of the free-running SysTick loop (commit 6927389), same board and session, stock firmware
+against a local build of that commit, jack-tip noise, 0.2-20 kHz, total mV rms over three streams per condition, silence
+stream (the loop plays digital silence), correction on, USB unplugged:
+
+| Condition | Stock | Free-running SysTick |
+|---|---|---|
+| no read | 0.48-0.59 | 0.67-0.71 |
+| read 25 MHz, 2-word bursts | 0.83-0.98 | 0.64-0.66 |
+| read 25 MHz, 1-word bursts | 0.78-1.08 | 0.67-0.68 |
+| read 50 MHz, 2-word bursts | 0.92-1.04 | 0.67-0.69 |
+| read 25 MHz, 4-word bursts | 6.6-7.5 | 0.64-0.67 |
+
+With a 1 kHz tone (THD+N re the tone, three streams): stock -30.4 dB with no read, -28.2 dB with 25 MHz 2-word reads, -9.9 dB
+with 4-word reads; free-running -30.3, -28.8 and -26.8 dB. So with the new loop reads add nothing audible to silence,
+the 4-word case is fixed (17 dB better with a tone), but with a tone present the reads still cost about 1.5 dB
+at 2-word bursts, as before, and the silence floor is 0.15-0.2 mV higher. The stock 4-word figure was 1.62-1.72 mV in
+an earlier session on the same board (image 8401686); what differed between the sessions is not known (the loop was
+not falling behind: 1 us/s, correction on).
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is
