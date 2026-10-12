@@ -901,8 +901,8 @@ pulses). Supply, ground, ring, threshold, missing pulses and pickup are excluded
 (Two-channel scope captures show spurious 64-sample mismatches between channels; do not
 match edges across channels at this fidelity.)
 
-**Correction (2026-10-12, later): the "10 MHz grid" described in the next two paragraphs
-is withdrawn, and the "extra edges" that obscured it were measurement artefacts.**
+**Correction (2026-10-12, later): the "10 MHz grid" and "pin follows issue time" claims earlier versions of this section made
+are withdrawn, and the "extra edges" that obscured it were measurement artefacts.**
 With pin 31 jumpered to pin 34, an on-chip counter (`noise-rig/pincount.py`: PWM1's
 counter mode on RMIO24) counts the pad's rising edges with no scope involved. For the
 toggling diagnostic firmware (one write per tick) it counts 1.001, 0.999, 1.015 and 1.014
@@ -913,52 +913,17 @@ edge per tick. The edge lists taken from the scope's waveform memory had 1.64 ti
 many edges (ringing and acquisition artefacts; a 200 ns hold-off in the extractor
 brings them to 1.005 times), which is also what hid any grid. Edge-time analysis from those
 lists is unreliable until it has been redone on validated edges (the MSO digital
-channels, or this counter plus a hold-off checked against it). Treat the grid, the "slot"
-intervals and every number computed from them in the next two paragraphs as unverified.
+channels, or this counter plus a hold-off checked against it). Every grid, "slot" and pin-interval number from those lists is withdrawn.
 Stock firmware, silence: the counter gives 1.034 M rising edges/s (0.70 edges per tick),
 the same in every stream.
 
-The pin does not change when the M0's blocking write returns (timing diagnostic
-firmware: pin 31 toggled every tick with the corrected loop's own write and SysTick
-read, each count logged, the scope's edge times matched to the log tick by tick, 128-cycle
-tick, silence). Pin edges land on a 10 MHz grid, 37.5 core cycles: each edge is at
-`37.5 * ceil((R + x) / 37.5) + C`, R being the time the write returned by the SysTick
-count (94 % of ticks within 6 cycles, rms 1.1 cycles = 3 ns, the rest are flips across a grid
-step). x, the grid's phase against SysTick, is new at every stream start. The loop's
-lateness measure said every write was on time; the pin edges are spread over 37.5
-cycles (rms 10.7 cycles = 29 ns, the pattern repeating every 75 ticks since
-128 mod 37.5 = 15.5). With a tick of 150 cycles (4 grid steps, 2.5 MHz) 89 % of the
-intervals are within 4 cycles of 150 and the rest are +-37.5 steps. So the "write
-returns when the pin changes" assumption of m0_play_comp is wrong by up to 37.5 cycles
-(100 ns), and a tick that is a multiple of 37.5 cycles (75, 150, 225, 300, 375) makes
-the delay the same every tick.
-
-Measured with the card read (timing diagnostic firmware, 128-cycle tick, pin 31
-toggled every tick, SysTick counted just before and just after the blocking pin
-write and logged in the M0's own memory; the scope's edge times matched to the log
-tick by tick, 3 x 939 ticks per condition):
-- The pin edges are on the 10 MHz grid (37.5 cycles) in every condition, with the
-  same coherence (0.94-0.96) and period, so a pin interval is a whole number of
-  37.5-cycle steps (silence: 3 or 4; card read at 25 MHz: 3 or 4 on 98 % of ticks,
-  5 to 7 on 1.3 %; at 50 MHz: 5 on 9 %).
-- The pin follows when the write is issued, not when it returns. The count taken
-  before the write predicts the pin interval to within one step on 96.8 / 87.6 /
-  78 % of ticks (card read at 25 MHz with 2-word bursts / at 50 MHz / at 25 MHz with
-  the 93.75 MHz bus and 4-word bursts); the count after the write, which
-  m0_play_comp uses, on 84.6 / 74.0 / 63.2 %. Regressing the pin interval against
-  the write's own blocking time gives a slope of +0.04 / -0.02 / -0.16: a stall
-  inside the write does not move the pin.
-- A write blocks for 53 cycles normally; with the card read the 99th percentile is
-  101-105 and the longest 113 (27 % of ticks stalled at all, 9 % by more than 20
-  cycles, at 25 MHz). The loop treats each stall as lateness and corrects for it.
-  The rms difference between the loop's interval and the pin's is 37.5 / 37.9 /
-  52.2 cycles with the post-write count, against 23.5 / 30.1 / 37.8 with the
-  pre-write count: the post-write count adds 23-36 cycles rms (61-96 ns) of error to the
-  correction (about 15 cycles rms of any interval is the grid step itself).
-- Stalls before the write (the pre-write count 20 cycles or more late): 1.8 / 2.0 /
-  12.3 % of ticks; the write returns after the next tick has begun (PENDSTSET) on
-  0.6 / 1.2 / 8.8 %. Pin intervals that even the pre-write count does not explain
-  (off by 1.5 steps or more): 2.3 / 9.9 / 15.4 % of ticks.
+Earlier versions of this section also claimed that the pin follows the time the write is
+issued rather than the time it returns, and that a stall inside the write does not move the
+pin. Those claims were computed from the over-counted edge lists and are withdrawn; whether
+the pad changes at issue or at return has not been established (it needs the MSO's digital
+channels). What is measured and kept: a write blocks for 53 cycles normally and up to about
+113 with the card read (27 % of ticks stalled at all at 25 MHz), and the injection test below
+shows the loop cancels delays it sees before the write.
 
 Does the correction cancel a known timing error? (injection test, `noise-rig/injection-test`; 256-cycle tick,
 jack-tip noise in 0.2-20 kHz, left channel, silence; the loop delays the pin write by K cycles on a random 1 in 8
@@ -1005,8 +970,7 @@ read, and does not change with the audio pad's drive strength or slew
 is therefore not the M0 being late (40 times less lag changed nothing audible)
 and not storage reads in general. The SPI1 pins are already at 2 mA. Left: the
 mainboard's SD slot (and the display) coupling into the audio buffer's supply
-or input. Not measured: nobody has put a scope on the buffer's supply or input
-during a card read.
+or input. (Since measured: the noise is already in the M0's bitstream at the pin, see "Where the noise is".)
 
 **An idle card ticked once a second** (found 2026-10-09, with the corrected
 loop, 375 MHz and four-word display bursts all in use). With a card in the

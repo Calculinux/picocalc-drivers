@@ -1,3 +1,5 @@
+> **Stale patches:** the `*.patch` files were made against the loop before commit 6927389 (free-running SysTick) and no longer apply to `play.S`. Kept for the method; re-derive against the current loop before reuse.
+
 # Injection test: how well does the audio loop's lateness correction cancel a known timing error?
 
 `inject-*.patch` (against this firmware directory, 2026-10-12) build a test firmware (`make INJECT=1`): the corrected

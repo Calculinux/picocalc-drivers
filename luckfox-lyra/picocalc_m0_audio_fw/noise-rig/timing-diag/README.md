@@ -1,3 +1,5 @@
+> **Stale patches:** the `*.patch` files were made against the loop before commit 6927389 (free-running SysTick) and no longer apply to `play.S`. Kept for the method; re-derive against the current loop before reuse.
+
 # Pin-timing diagnostic: what the M0's SysTick count says vs when the pin changes
 
 Hand-off for whoever changes the lateness correction in `m0_play_comp` (play.S).
