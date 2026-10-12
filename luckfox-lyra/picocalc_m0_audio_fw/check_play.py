@@ -51,7 +51,8 @@ SYST_CVR = PPB + 0x18
 TRACE = SHMEM + 0x2100                      # PROFILE builds: event log
 TRACE_UNDERRUN = 30
 COMP_CYCLES = int(os.environ.get('COMP_CYCLES', '128'))   # m0_play_comp: core cycles per tick, fixed (make COMP_CYCLES=150 for the other build)
-COMP_BACK = 28 if COMP_CYCLES == 128 else 40   # a write comes at most this much sooner than a tick after the last
+COMP_BACK = 28 if COMP_CYCLES == 128 else 40
+COUNT_AFTER = not os.environ.get('COUNT_BEFORE')   # the firmware reads the count after the write (make COUNT_BEFORE=1 for the other)   # a write comes at most this much sooner than a tick after the last
 COMP_WINDOW = COMP_CYCLES - 1 - COMP_BACK   # and this much later (99 at 128, 109 at 150)
 ON_TIME = COMP_CYCLES - 14                  # SysTick count just before a pin write that is on time (the timing diagnostic read 114 at 128)
 CATCH_UP = 15                               # cycles a late loop gains back per tick, in these tests
@@ -72,7 +73,7 @@ def comp_m(delta, shift, cycles):
     """FS * delta / tick. 128: a shift, exact. Otherwise the firmware's table,
     which the assembler truncates towards zero."""
     a = abs(delta) << (FS_SHIFT + shift)
-    return (a // cycles) * (1 if delta >= 0 else -1) if cycles != 128 else (delta << (FS_SHIFT + shift)) // cycles
+    return (a // cycles) * (1 if delta >= 0 else -1) if cycles not in (128, 256) else (delta << (FS_SHIFT + shift)) // cycles
 
 
 def s32(v):
@@ -322,7 +323,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         shift, interp = 0, False        # as main.c sets it up: m0_play_comp holds
     rnd = random.Random(7)
     trace = []
-    uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - 70) % cycles))   # the first tick is wherever SysTick happened to be
+    uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - 70) % cycles if not COUNT_AFTER else ON_TIME))   # the first tick is wherever SysTick happened to be
     for i, (l, r) in enumerate(frames):
         uc.mem_write(SHMEM + HDR + 4 * i, struct.pack('<hh', l, r))
     # write_idx = 2 can never equal a frame-aligned index: ring never empty.
@@ -334,7 +335,7 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
 
     words = []
     ctrl_at = []                        # ctrl as the firmware would read it after tick n
-    state = {'stop_at': ticks, 'lag': 70, 'worst': 0}
+    state = {'stop_at': ticks, 'lag': 0 if COUNT_AFTER else 70, 'worst': 0}
 
     def write_idx_at(tick):
         # exactly what the firmware reads in the same tick
@@ -357,11 +358,22 @@ def run(path, name, frames, ticks, tm, read_idx=0, underrun_after=None, interp=T
         # makes all that follow late too, less what the loop catches up each
         # tick. The next write's count is put in place now.
         playing = comp and model.primed
-        d = state['lag']
-        state['lag'] = max(0, state['lag'] - CATCH_UP)
-        if playing and rnd.random() < late:
-            state['lag'] += rnd.randint(2, late_max)
-        uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - state['lag']) % cycles))
+        if COUNT_AFTER:
+            # the count is read after this write: put it in place now, as before
+            if comp and n == 1:
+                state['lag'] = 70       # the first tick is wherever SysTick happened to be
+            else:
+                state['lag'] = max(0, state['lag'] - CATCH_UP)
+                if playing and rnd.random() < late:
+                    state['lag'] += rnd.randint(2, late_max)
+            d = state['lag']
+            uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - d) % cycles))
+        else:
+            d = state['lag']
+            state['lag'] = max(0, state['lag'] - CATCH_UP)
+            if playing and rnd.random() < late:
+                state['lag'] += rnd.randint(2, late_max)
+            uc.mem_write(SYST_CVR, struct.pack('<I', (ON_TIME - state['lag']) % cycles))
         # keep the model in step so the hooks above can look at its state
         expect.append(model.tick(ctrl_at[-1], d))
         if playing:

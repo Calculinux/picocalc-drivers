@@ -858,6 +858,41 @@ tick by tick, 3 x 939 ticks per condition):
   0.6 / 1.2 / 8.8 %. Pin intervals that even the pre-write count does not explain
   (off by 1.5 steps or more): 2.3 / 9.9 / 15.4 % of ticks.
 
+**Where the count is taken, and the tick length** (2026-10-12, jack tip on the
+scope, AC, 20 MHz, the 1 kHz test tone at 25.7 mV rms, silence or reads, register
+bus really at 187.5 MHz unless said, card 25 MHz, 2-word bursts unless said). dB
+are the 200 Hz - 20 kHz noise against the tone:
+
+| firmware | silence | reads 25 MHz | reads 50 MHz | 25 MHz, 4-word bursts | 4-word, bus 93.75 |
+|---|---|---|---|---|---|
+| stock: 128-cycle tick, count after the write | -32.8 | -19.7 | -17.8 | -10.6 | -18.8 |
+| 128, count BEFORE the write (`COUNT_BEFORE=1`) | -31.1 | -9.1 | -15.0 | -8.5 | -4.7 |
+| 150-cycle tick (2.5 MHz), count after | -21.3 | -19.0 | -18.1 | -18.9 | -11.4 |
+| 256-cycle tick (1.46 MHz), count after | -24.4 | -18.7 | -17.4 | -18.5 | -8.3 |
+
+- The timing diagnostic's conclusion (noise-rig/timing-diag/README.md) that the pin
+  follows when a write is issued, so that the count should be taken before it, is
+  not what the audio says: that change alone, 4 cycles, is 10 dB worse at 25 MHz
+  (and a model built on that conclusion predicted 7 dB better). The same
+  diagnostic firmware, built from its patches and run on a freshly booted board
+  with the register bus at 93.75, 125 and 187.5 MHz, showed no 10 MHz grid in the pin
+  edges (intervals 128.5 / 128.1 / 127.2 cycles, coherence at 37.5 cycles 0.000;
+  the saved data of the original measurement has 112 / 150 and 0.95), so the grid
+  is not a fixed property of the board, and why it was there is not known.
+- The floor while the card is read at 2-word bursts is the same, -19 to -20 dB, at
+  128, 150 and 256 cycles: the window of late writes the loop can tell (-28 to +99,
+  -40 to +109, -40 to +215 cycles) and the cycles it has to spare (15, 26,
+  147) do not change it. Whatever sets it is not the loop's reading of late writes.
+- A longer tick fixes 4-word bursts at a 187.5 MHz bus (-10.6 to -18.9) and breaks them at
+  93.75 (-18.8 to -11.4 and -8.3); silence is worse at both longer ticks (a tone
+  cluster around 1.3 - 2.9 kHz at 150 cycles, 2.1 kHz the largest at 1.4 mV).
+- Measurement notes: the register bus is set with `lsperi.py DIV` (bus = 375 MHz /
+  (DIV + 1)); the earlier test scripts passed 187.5 and 93.75 as the divider, which
+  fails silently, so conditions labelled with a bus in earlier runs ran at whatever bus the
+  board was at. In captures at 500 MS/s and 1 GS/s (1.2M points) the scope shows
+  extra edges on CH1 (4.75 per us against the real 2.93) in a pattern repeating every
+  1024 ns; at 125 MS/s (0.5 ms per division, 6M points) the edges are right.
+
 **What the "rain" is not** (by ear, same day, digital silence, comp on): the
 noise that remains while the SPI SD card is read sounds like rain, gets
 quieter at 12.5 and 6.25 MHz card clocks, louder with the console flooding, is

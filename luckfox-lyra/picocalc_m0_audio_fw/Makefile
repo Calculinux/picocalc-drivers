@@ -36,6 +36,12 @@ ifneq ($(COMP_FORCE),)
 CFLAGS += -DM0_COMP_FORCE
 endif
 
+# make COUNT_BEFORE=1: measure by the SysTick count taken before the pin write
+# instead of after it returns; on the board that is about 10 dB louder
+ifneq ($(COUNT_BEFORE),)
+CFLAGS += -DM0_COUNT_BEFORE
+endif
+
 OBJS = startup.o main.o play.o resource_table.o
 ELF  = rk3506-m0-audio.elf
 

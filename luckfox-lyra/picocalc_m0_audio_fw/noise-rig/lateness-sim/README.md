@@ -40,3 +40,10 @@ tick 14 against 36, window lower bound 28 against 40; reads-like as above):
 With a 150-cycle tick the lower window bound has to follow the extra spare
 cycles: with 28 the catch-up of a late write aliases and the correction is
 worse than none.
+
+**Not borne out on the board.** The model's ranking (count before the write 7 dB
+better than after; a 150-cycle tick leaving no grid noise in silence) was tested on
+the board (docs/m0-audio.md, "Where the count is taken"): the count before the write
+is 10 dB worse, and the 150-cycle tick has a tone cluster in silence. The model
+assumed the pin follows the write's issue time on a 10 MHz grid; on a freshly
+booted board no such grid was found. Kept as a record of the method only.

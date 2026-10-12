@@ -87,10 +87,13 @@
 #if M0_COMP_CYCLES == 128
 #define M0_COMP_LOG2_CYCLES 7
 #define M0_COMP_BACK        28
+#elif M0_COMP_CYCLES == 256
+#define M0_COMP_LOG2_CYCLES 8		/* a diagnostic only: the window reaches +215 */
+#define M0_COMP_BACK        40
 #elif M0_COMP_CYCLES == 150
 #define M0_COMP_BACK        40
 #else
-#error "M0_COMP_CYCLES: 128 or 150"
+#error "M0_COMP_CYCLES: 128, 150 or 256"
 #endif
 #define M0_COMP_STEPS       13
 

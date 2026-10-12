@@ -116,12 +116,10 @@
  *   measured, a quarter of the pin writes are up to 0.4 us late while the
  *   display is redrawn, and every late edge is an error in the output.
  *   m0_play_comp() is the same loop with the pin write made blocking (main.c
- *   turns "bufferable" off for it), and the SysTick count read just BEFORE the
- *   write: the pin follows when the write is issued, not when the blocking
- *   write returns (a stall inside the write does not move it: measured with
- *   the timing diagnostic, noise-rig/timing-diag/README.md; measuring after
- *   the write, as an earlier version did, counted every stall as lateness and
- *   made the correction worse than none in a model, docs/m0-audio.md):
+ *   turns "bufferable" off for it), so that the SysTick count read straight
+ *   after it says when the pin changed. (Reading it just BEFORE the write, as
+ *   the timing diagnostic, noise-rig/timing-diag/README.md, suggests, makes
+ *   the audio about 10 dB louder on the board: make COUNT_BEFORE=1 to try.)
  *      delta  = previous count - count, modulo the tick, as a number from
  *               -28 to 99        @ the level that just ended lasted a tick
  *                                @ + delta core cycles
@@ -174,7 +172,7 @@
 	.equ	RING_IDX_MASK, M0_RING_BYTES - M0_FRAME_BYTES
 	.equ	PENDST_TO_SIGN, 31 - ICSR_PENDSTSET_BIT
 	.equ	S, M0_BUS_STEPS + M0_PROFILE_STEPS	@ number of the last SRAM step
-#if M0_COMP_CYCLES == 128
+#ifdef M0_COMP_LOG2_CYCLES
 	.equ	COMP_LSL, DSM_FS_SHIFT - M0_COMP_LOG2_CYCLES
 	.equ	COMP_MOD, 32 - M0_COMP_LOG2_CYCLES
 #endif
@@ -231,6 +229,20 @@ m0_play_state:
  * noise-rig/timing-diag/README.md), so that is the count to measure by. It is
  * kept in PS_PRE over the write, there being no register to spare. */
 	.macro	WRITE_TIMED
+#ifndef M0_COUNT_BEFORE
+	/* the count after the blocking write returns: on the board it keeps the
+	 * audio far quieter than the count before the write (docs/m0-audio.md),
+	 * whatever the timing diagnostic suggested */
+	ldr	r7, [sp, #PS_K_ICSR]
+	movs	r6, #1
+	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
+	str	r6, [r7]		@ tick taken: clear SysTick's pending bit
+	mov	r6, lr
+	mov	r7, r11
+	str	r7, [r6]		@ OUTPUT, and wait until the pin has changed
+	ldr	r6, [sp, #PS_K_CVR]
+	ldr	r6, [r6]		@ when was that
+#else
 	ldr	r7, [sp, #PS_K_ICSR]
 	movs	r6, #1
 	lsls	r6, r6, #ICSR_PENDSTCLR_BIT
@@ -242,13 +254,14 @@ m0_play_state:
 	mov	r7, r11
 	str	r7, [r6]		@ OUTPUT, blocking: the next one does not queue behind it
 	ldr	r6, [sp, #PS_PRE]
+#endif
 	.endm
 
 /* m: for the 150-cycle tick, the correction FS * delta / tick from a table
  * (m0_comp_tab), r6 = (delta + COMP_BACK) * 2 on entry, m on leaving; r7 is
  * clobbered. In the 128-cycle loop it is already in r6. */
 	.macro	COMP_M
-#if M0_COMP_CYCLES != 128
+#ifndef M0_COMP_LOG2_CYCLES
 	ldr	r7, [sp, #PS_K_TAB]
 	ldrsh	r6, [r7, r6]
 #endif
@@ -266,7 +279,7 @@ m0_play_state:
 	mov	r7, r12			@ the previous count + the word written then
 	mov	r12, r6
 	add	r12, r11		@ this count + this word, for the next tick
-#if M0_COMP_CYCLES == 128
+#ifdef M0_COMP_LOG2_CYCLES
 	subs	r6, r7, r6		@ (the words are bits 10 up)
 	adds	r6, #COMP_BACK
 	lsls	r6, r6, #COMP_MOD
@@ -313,7 +326,7 @@ m0_play_state:
 	subs	r3, r3, r6
 	subs	r4, r4, r6
 9:
-#if M0_COMP_STATS && M0_COMP_CYCLES != 128
+#if M0_COMP_STATS && !defined(M0_COMP_LOG2_CYCLES)
 #error "COMP_STATS needs the 128-cycle tick"
 #endif
 #if M0_COMP_STATS == 1
@@ -492,7 +505,7 @@ m0_play_state:
 	str	r0, [sp, #PS_K_ICSR]
 	ldr	r0, =GPIO4_DR_ADDR
 	str	r0, [sp, #PS_K_GPIO]
-#if M0_COMP_CYCLES != 128
+#ifndef M0_COMP_LOG2_CYCLES
 	ldr	r0, =m0_comp_tab
 	str	r0, [sp, #PS_K_TAB]
 #endif
@@ -801,7 +814,7 @@ m0_play_state:
 	M0_PLAY	m0_play_comp, 1
 #endif
 
-#if M0_COMP_CYCLES != 128
+#ifndef M0_COMP_LOG2_CYCLES
 /* m = FS * delta / tick, truncated towards zero, for delta = k - COMP_BACK */
 	.section .rodata.m0_comp_tab, "a", %progbits
 	.align	1
