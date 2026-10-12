@@ -5,7 +5,7 @@ from capture import acquire
 from edges import edges, grid_residuals
 import numpy as np
 
-SSH=["ssh","-o","BatchMode=yes","-o","ConnectTimeout=6","root@192.168.6.110"]
+SSH=["ssh","-o","BatchMode=yes","-o","ConnectTimeout=6","root@"+__import__("os").environ.get("BOARD_HOST","192.168.6.110")]
 def board(cmd):
     return subprocess.run(SSH+[cmd],capture_output=True,text=True,timeout=60).stdout.strip()
 SPI="/sys/bus/platform/devices/ff130000.spi"
