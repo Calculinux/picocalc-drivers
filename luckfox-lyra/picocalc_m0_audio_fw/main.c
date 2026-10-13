@@ -70,6 +70,63 @@ static void tick_free_run(void)
 	REG(SYST_CSR) = SYST_CSR_FREE;
 }
 
+/* The tick length tick_start() will use (the header's, if it is usable) */
+static uint32_t tick_cycles_of(const m0_audio_shmem_t *shmem)
+{
+	if (shmem->tick_cycles < 2U || shmem->tick_cycles > SYST_MAX + 1U ||
+	    shmem->ticks_base < M0_MIN_TICKS_PER_SAMPLE)
+		return M0_DEFAULT_TICK_CYCLES;
+	return shmem->tick_cycles;
+}
+
+/* Take the output between "both pins low" (idle) and the mid level that
+ * silence plays at (half the ticks high), or back. The buffer is AC coupled,
+ * so a jump between the two is a pop; a slow smoothstep in the density of
+ * ones is not: it is a few hertz, below what headphones play, and its
+ * slope-limited step through the coupling capacitor is tiny. 'up' fades in.
+ *
+ * A first-order modulator with a little dither (so the density does not turn
+ * into whistling tones at low values) at one bit per tick, the same tick as
+ * the stream will use; both channels get the same bits. The density changes
+ * every 2^M0_FADE_STEP_LOG2 ticks. SysTick runs free here and the loop
+ * schedules its ticks, so one that runs late does not stretch the fade. */
+#define M0_FADE_STEP_LOG2   6   /* ticks per density step */
+#define M0_FADE_STEPS_LOG2  12  /* density steps: 2^18 ticks, 90 ms at 2.9 MHz */
+
+static void fade_pins(uint32_t cycles, int up)
+{
+	uint32_t rnd = 0x1D872B41U, acc = 0, prev;
+	uint32_t i, k;
+
+	tick_free_run();
+	prev = REG(SYST_CVR);
+	for (i = 0; i < (1U << M0_FADE_STEPS_LOG2); i++) {
+		/* smoothstep 3u^2 - 2u^3 in Q16, then half of it: density 0..0.5 */
+		uint32_t u = (up ? i : (1U << M0_FADE_STEPS_LOG2) - 1U - i)
+			     << (16 - M0_FADE_STEPS_LOG2);
+		uint32_t u2 = (u * u) >> 16;
+		uint32_t u3 = (u2 * u) >> 16;
+		uint32_t dens = (3U * u2 - 2U * u3) >> 1;
+
+		for (k = 0; k < (1U << M0_FADE_STEP_LOG2); k++) {
+			uint32_t bit;
+
+			rnd ^= rnd << 13;
+			rnd ^= rnd >> 17;
+			rnd ^= rnd << 5;
+			acc += dens;
+			/* error stays the undithered one; dither +-1/4 LSB */
+			bit = (int32_t)acc + (int32_t)((rnd >> 16) & 0x7FFFU) - 0x4000 >= 0x10000;
+			if (bit)
+				acc -= 0x10000U;
+			while (((prev - REG(SYST_CVR)) & SYST_MAX) < cycles)
+				;
+			prev = (prev - cycles) & SYST_MAX;
+			gpio_write_both(bit, bit);
+		}
+	}
+}
+
 /* Take the tick timing from the header if it is usable, else the defaults,
  * hand the per-sample part to m0_play() and switch SysTick to the tick rate.
  * Returns whether the stream can be played by m0_play_comp(). */
@@ -150,6 +207,9 @@ int main(void)
 
 		shmem->m0_state = M0_STATE_PLAY;
 		REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
+		/* Pins from low to the mid level without a step (no pop) */
+		REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
+		fade_pins(tick_cycles_of(shmem), 1);
 		if (tick_start(shmem)) {
 #ifndef M0_PROFILE
 			/* Blocking writes: the loop times each pin write */
@@ -180,6 +240,10 @@ int main(void)
 			m0_play(); /* until ctrl != PLAY */
 			shmem->stat_late = M0_STAT_LATE_NONE;
 		}
+		/* ... and back to low the same way: the host stopped the stream,
+		 * not the signal, so the pins are at the mid level, not at rest */
+		REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
+		fade_pins(tick_cycles_of(shmem), 0);
 		gpio_write_both(0, 0);
 	}
 }

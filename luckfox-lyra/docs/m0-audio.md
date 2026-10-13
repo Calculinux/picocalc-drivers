@@ -80,10 +80,24 @@ at the control word on each wake; `GRF_SOC_STATUS2` shows the M0 asleep in
 
 ```
 host: wait for m0_state == IDLE, fill in the header, ctrl = PLAY
-M0:   sees PLAY at its next idle wake, m0_state = PLAY, SysTick to the tick rate, plays
+M0:   sees PLAY at its next idle wake, m0_state = PLAY, fades the pins up (90 ms), SysTick to the tick rate, plays
 host: ctrl = STOP
-M0:   sees STOP within one sample, pins low, SysTick slow, m0_state = IDLE
+M0:   sees STOP within one sample, fades the pins down (90 ms), pins low, SysTick slow, m0_state = IDLE
 ```
+
+### Start and stop without a pop
+
+Idle has both pins low; silence plays at a density of one half. The output
+is AC coupled (47 uF), so jumping between the two is a step of about half the
+buffer's supply through the coupling capacitor: a pop at every start and
+stop. `fade_pins()` (main.c) moves between them over 2^18 ticks (90 ms at
+2.9 MHz) with a smoothstep in the density of ones, made by a dithered
+first-order modulator at the stream's own tick, both channels alike. What is
+left is a few hertz and its slope-limited step through the capacitor. The
+host's ring is not read during the fade, so the stream starts 90 ms later than
+before, and the M0 takes 90 ms longer to be idle after a stop (the driver
+waits up to about 375 ms). Not measured on hardware yet; the fade length is
+`M0_FADE_STEPS_LOG2` / `M0_FADE_STEP_LOG2`.
 
 ## What things cost on this SoC
 
