@@ -70,75 +70,77 @@ static void tick_free_run(void)
 	REG(SYST_CSR) = SYST_CSR_FREE;
 }
 
-/* The tick length tick_start() will use (the header's, if it is usable) */
-static uint32_t tick_cycles_of(const m0_audio_shmem_t *shmem)
-{
-	if (shmem->tick_cycles < 2U || shmem->tick_cycles > SYST_MAX + 1U ||
-	    shmem->ticks_base < M0_MIN_TICKS_PER_SAMPLE)
-		return M0_DEFAULT_TICK_CYCLES;
-	return shmem->tick_cycles;
-}
-
 /* Take the output between "both pins low" (idle) and the mid level that
  * silence plays at (half the ticks high), or back. The buffer is AC coupled,
  * so a jump between the two is a pop; a slow smoothstep in the density of
  * ones is not: it is a few hertz, below what headphones play, and its
  * slope-limited step through the coupling capacitor is tiny. 'up' fades in.
  *
- * Both channels get the same bits, one per tick, at the stream's own tick.
- * Below FADE_SECOND_ORDER (a density of 1/16) a first-order modulator with a
- * little dither (so the sparse ones do not turn into whistling tones); above
- * it a second-order one, whose noise in the audio band is some 25 dB lower
- * (simulated: -77 against -52 dBFS) but which is not stable that close to
- * all zeros. The density changes every 2^M0_FADE_STEP_LOG2 ticks. SysTick
- * runs free here and the loop schedules its ticks, so one that runs late
- * does not stretch the fade. */
+ * The fade does not start at a density of 0 but at FADE_MIN_DENS (4 %), with
+ * a step of that much (0.12 V at the pin, 1/13 of the pop it avoids): below
+ * a density of about 1.4 % the ones are single pulses at audio rates, noise
+ * in the band that no modulator can shape away (recorded: -20 dBFS for 20 ms
+ * at each end of the fade), and a second-order loop is not stable there
+ * anyway.
+ *
+ * Both channels get the same bits, one per fade tick (256 core cycles, half
+ * the stream's rate), from a second-order error-feedback modulator. The
+ * density changes every 2^M0_FADE_STEP_LOG2 ticks.
+ *
+ * A pin write that comes d core cycles after its tick moves d/tick of the
+ * previous bit's level into this tick (the waiting loop alone is a few cycles
+ * late, at random): the modulator is told, as m0_play_comp does, and shapes
+ * it away. Without that the fade hissed at about -35 dBFS (recorded);
+ * simulated, this brings it to about -50. SysTick runs free here and the
+ * loop schedules its ticks, so one that runs late does not stretch the fade. */
 #define M0_FADE_STEP_LOG2   6   /* ticks per density step */
-#define M0_FADE_STEPS_LOG2  12  /* density steps: 2^18 ticks, 90 ms at 2.9 MHz */
-#define FADE_SECOND_ORDER   0x1000 /* density, Q16 */
+#define M0_FADE_STEPS_LOG2  11  /* density steps: 2^17 ticks, 90 ms at 375 MHz */
+#define FADE_MIN_DENS       1000 /* Q16 */
+/* A fade tick is 256 core cycles whatever the stream's: the loop below takes
+ * about 120 cycles with its unbuffered write, more than a 128-cycle tick
+ * holds (it then lost its schedule and the correction ran away). */
+#define M0_FADE_TICK_LOG2   8
+#define M0_FADE_TICK        (1 << M0_FADE_TICK_LOG2)
 
-static void fade_pins(uint32_t cycles, int up)
+static void fade_pins(int up)
 {
-	uint32_t rnd = 0x1D872B41U, acc = 0, prev;
-	int32_t e1 = 0, e2 = 0;
+	uint32_t prev;
+	int32_t e1 = 0, e2 = 0, yp = 0;
 	uint32_t i, k;
 
 	tick_free_run();
 	prev = REG(SYST_CVR);
 	for (i = 0; i < (1U << M0_FADE_STEPS_LOG2); i++) {
-		/* smoothstep 3u^2 - 2u^3 in Q16, then half of it: density 0..0.5 */
+		/* smoothstep 3u^2 - 2u^3 in Q16, from FADE_MIN_DENS to 1/2 */
 		uint32_t u = (up ? i : (1U << M0_FADE_STEPS_LOG2) - 1U - i)
 			     << (16 - M0_FADE_STEPS_LOG2);
 		uint32_t u2 = (u * u) >> 16;
 		uint32_t u3 = (u2 * u) >> 16;
-		uint32_t dens = (3U * u2 - 2U * u3) >> 1;
+		int32_t dens = FADE_MIN_DENS +
+			(int32_t)(((0x8000U - FADE_MIN_DENS) * (3U * u2 - 2U * u3)) >> 16);
 
 		for (k = 0; k < (1U << M0_FADE_STEP_LOG2); k++) {
-			uint32_t bit;
+			int32_t v = dens - 2 * e1 + e2;	/* NTF (1 - z^-1)^2, Q16 */
+			int32_t y = v >= 0x8000 ? 0x10000 : 0;
+			int32_t late, cur;
 
-			if (dens >= FADE_SECOND_ORDER) {
-				/* error feedback, NTF (1 - z^-1)^2, Q16 */
-				int32_t v = (int32_t)dens - 2 * e1 + e2;
-
-				bit = v >= 0x8000;
-				e2 = e1;
-				e1 = (bit ? 0x10000 : 0) - v;
-				acc = 0;
+			do {
+				cur = (int32_t)((prev - REG(SYST_CVR)) & SYST_MAX);
+			} while (cur < M0_FADE_TICK);
+			gpio_write_both(y != 0, y != 0);
+			late = cur - M0_FADE_TICK;
+			/* A loop that lost its schedule starts again from now,
+			 * with no correction for the backlog */
+			if (late > M0_FADE_TICK / 2) {
+				late = 0;
+				prev = REG(SYST_CVR);
 			} else {
-				e1 = e2 = 0;
-				rnd ^= rnd << 13;
-				rnd ^= rnd >> 17;
-				rnd ^= rnd << 5;
-				acc += dens;
-				/* error stays the undithered one; dither +-1/4 LSB */
-				bit = (int32_t)acc + (int32_t)((rnd >> 16) & 0x7FFFU) - 0x4000 >= 0x10000;
-				if (bit)
-					acc -= 0x10000U;
+				prev = (prev - M0_FADE_TICK) & SYST_MAX;
 			}
-			while (((prev - REG(SYST_CVR)) & SYST_MAX) < cycles)
-				;
-			prev = (prev - cycles) & SYST_MAX;
-			gpio_write_both(bit, bit);
+			e2 = e1;
+			/* Q16 level the extra 'late' cycles of the last bit add */
+			e1 = y + ((yp - y) >> M0_FADE_TICK_LOG2) * late - v;
+			yp = y;
 		}
 	}
 }
@@ -225,7 +227,7 @@ int main(void)
 		REG(CRU_BASE + CRU_GATE_CON13) = CRU_GPIO4_EN;
 		/* Pins from low to the mid level without a step (no pop) */
 		REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
-		fade_pins(tick_cycles_of(shmem), 1);
+		fade_pins(1);
 		if (tick_start(shmem)) {
 #ifndef M0_PROFILE
 			/* Blocking writes: the loop times each pin write */
@@ -259,7 +261,7 @@ int main(void)
 		/* ... and back to low the same way: the host stopped the stream,
 		 * not the signal, so the pins are at the mid level, not at rest */
 		REG(GRF_BASE + GRF_SOC_CON0) = GRF_CON0_MCU_UNBUFFERED;
-		fade_pins(tick_cycles_of(shmem), 0);
+		fade_pins(0);
 		gpio_write_both(0, 0);
 	}
 }
