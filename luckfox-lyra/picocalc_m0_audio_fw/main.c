@@ -85,17 +85,22 @@ static uint32_t tick_cycles_of(const m0_audio_shmem_t *shmem)
  * ones is not: it is a few hertz, below what headphones play, and its
  * slope-limited step through the coupling capacitor is tiny. 'up' fades in.
  *
- * A first-order modulator with a little dither (so the density does not turn
- * into whistling tones at low values) at one bit per tick, the same tick as
- * the stream will use; both channels get the same bits. The density changes
- * every 2^M0_FADE_STEP_LOG2 ticks. SysTick runs free here and the loop
- * schedules its ticks, so one that runs late does not stretch the fade. */
+ * Both channels get the same bits, one per tick, at the stream's own tick.
+ * Below FADE_SECOND_ORDER (a density of 1/16) a first-order modulator with a
+ * little dither (so the sparse ones do not turn into whistling tones); above
+ * it a second-order one, whose noise in the audio band is some 25 dB lower
+ * (simulated: -77 against -52 dBFS) but which is not stable that close to
+ * all zeros. The density changes every 2^M0_FADE_STEP_LOG2 ticks. SysTick
+ * runs free here and the loop schedules its ticks, so one that runs late
+ * does not stretch the fade. */
 #define M0_FADE_STEP_LOG2   6   /* ticks per density step */
 #define M0_FADE_STEPS_LOG2  12  /* density steps: 2^18 ticks, 90 ms at 2.9 MHz */
+#define FADE_SECOND_ORDER   0x1000 /* density, Q16 */
 
 static void fade_pins(uint32_t cycles, int up)
 {
 	uint32_t rnd = 0x1D872B41U, acc = 0, prev;
+	int32_t e1 = 0, e2 = 0;
 	uint32_t i, k;
 
 	tick_free_run();
@@ -111,14 +116,25 @@ static void fade_pins(uint32_t cycles, int up)
 		for (k = 0; k < (1U << M0_FADE_STEP_LOG2); k++) {
 			uint32_t bit;
 
-			rnd ^= rnd << 13;
-			rnd ^= rnd >> 17;
-			rnd ^= rnd << 5;
-			acc += dens;
-			/* error stays the undithered one; dither +-1/4 LSB */
-			bit = (int32_t)acc + (int32_t)((rnd >> 16) & 0x7FFFU) - 0x4000 >= 0x10000;
-			if (bit)
-				acc -= 0x10000U;
+			if (dens >= FADE_SECOND_ORDER) {
+				/* error feedback, NTF (1 - z^-1)^2, Q16 */
+				int32_t v = (int32_t)dens - 2 * e1 + e2;
+
+				bit = v >= 0x8000;
+				e2 = e1;
+				e1 = (bit ? 0x10000 : 0) - v;
+				acc = 0;
+			} else {
+				e1 = e2 = 0;
+				rnd ^= rnd << 13;
+				rnd ^= rnd >> 17;
+				rnd ^= rnd << 5;
+				acc += dens;
+				/* error stays the undithered one; dither +-1/4 LSB */
+				bit = (int32_t)acc + (int32_t)((rnd >> 16) & 0x7FFFU) - 0x4000 >= 0x10000;
+				if (bit)
+					acc -= 0x10000U;
+			}
 			while (((prev - REG(SYST_CVR)) & SYST_MAX) < cycles)
 				;
 			prev = (prev - cycles) & SYST_MAX;

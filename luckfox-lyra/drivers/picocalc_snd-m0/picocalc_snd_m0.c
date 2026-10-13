@@ -120,23 +120,13 @@ module_param(comp, bool, 0644);
 MODULE_PARM_DESC(comp, "Correct for pin writes delayed by other bus traffic, where the core clock allows (default off)");
 
 /*
- * Set by the driver when a corrected stream has fallen behind by more than
- * M0_COMP_BEHIND_US a second: the loop cannot keep up with what is holding
- * its pin writes up (most likely an SPI driver still sending 16-word DMA
- * bursts: no "rockchip,tx-dma-burst" support in this kernel; that falls
- * behind by about 100 ms a second), and playing uncorrected is better than
- * that. Streams are uncorrected from then on; write 0 here to have comp
- * tried again.
- *
- * The limit is not tight: with the 4-word bursts, reading the SD card on
- * SPI1 (about 25000 interrupts a second of CPU register writes, which
- * bursts do not shorten) settles the loop at 3 to 9 ms a second behind and
- * keeps it there. That is about 0.4 % slow, a few cents flat, only while the
- * card is read, and not a reason to lose the correction for the session.
+ * A corrected stream that falls behind by more than M0_COMP_BEHIND_US a
+ * second is logged. It used to switch comp off for the rest of the session,
+ * but that was wrong more often than right: the fall-behind is what an SPI
+ * driver still sending 16-word DMA bursts does (no "rockchip,tx-dma-burst"
+ * in the kernel, about 100 ms a second), and the uncorrected loop is no
+ * better then, while a short or slow-starting stream could trip it too.
  */
-static bool comp_gave_up;
-module_param(comp_gave_up, bool, 0644);
-MODULE_PARM_DESC(comp_gave_up, "comp is being ignored because a corrected stream could not keep pace; write 0 to retry");
 #define M0_COMP_BEHIND_US  20000
 
 static unsigned int comp_min_hz = 2500000;
@@ -281,7 +271,7 @@ static void m0_set_tick_timing_locked(struct picocalc_m0 *m)
 		cycles = step * DIV_ROUND_CLOSEST(hclk, step * (unsigned long)hz);
 		/* The corrected loop: one tick length only, which has to be a
 		 * whole number of GPIO clock periods */
-		if (READ_ONCE(comp) && !READ_ONCE(comp_gave_up) && M0_COMP_CYCLES % step == 0 &&
+		if (READ_ONCE(comp) && M0_COMP_CYCLES % step == 0 &&
 		    hclk / M0_COMP_CYCLES >= READ_ONCE(comp_min_hz)) {
 			cycles = M0_COMP_CYCLES;
 			with_comp = true;
@@ -386,9 +376,8 @@ static void m0_report_pace(struct picocalc_m0 *m)
 		 m->stat_update_ns / 1000, m->stat_windows, m->stat_unsynced);
 	if (m->comp && ns >= 2 * (u64)NSEC_PER_SEC &&
 	    (s64)(due_us - got_us) * USEC_PER_SEC > (s64)due_us * M0_COMP_BEHIND_US) {
-		WRITE_ONCE(comp_gave_up, true);
 		dev_warn(&m->pdev->dev,
-			 "the corrected loop fell behind: playing uncorrected from now on (does this kernel's SPI driver have rockchip,tx-dma-burst? write 0 to comp_gave_up to retry)\n");
+			 "the corrected loop fell behind (does this kernel's SPI driver have rockchip,tx-dma-burst?)\n");
 	}
 	/* The firmware adds up how late its pin writes were, in core cycles,
 	 * over the plain ticks: all of a sample's but the steps. */
@@ -709,10 +698,15 @@ static enum hrtimer_restart m0_timer_cb(struct hrtimer *t)
 	now = ktime_get_raw_ns();
 	m0_copy_to_ring_locked(m, true); /* first of all brings played_frames up to date */
 	if (!m->pace_valid) {
-		m->pace_valid = true;
-		m->pace_t0 = m->pace_t1 = now;
-		m->pace_frames = 0;
-		m->pace_mark = m->played_frames;
+		/* Not before the M0 has taken its first frame: it fades the pins
+		 * up first and reads nothing meanwhile, which is not lag (and
+		 * would make a short stream give up comp). */
+		if (m->last_read_idx) {
+			m->pace_valid = true;
+			m->pace_t0 = m->pace_t1 = now;
+			m->pace_frames = 0;
+			m->pace_mark = m->played_frames;
+		}
 	} else if (queued) {
 		m->pace_frames += m0_frames_since(runtime, m->played_frames, m->pace_mark);
 		m->pace_mark = m->played_frames;

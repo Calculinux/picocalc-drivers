@@ -91,12 +91,15 @@ Idle has both pins low; silence plays at a density of one half. The output
 is AC coupled (47 uF), so jumping between the two is a step of about half the
 buffer's supply through the coupling capacitor: a pop at every start and
 stop. `fade_pins()` (main.c) moves between them over 2^18 ticks (90 ms at
-2.9 MHz) with a smoothstep in the density of ones, made by a dithered
-first-order modulator at the stream's own tick, both channels alike. What is
+2.9 MHz) with a smoothstep in the density of ones, both channels alike, at the
+stream's own tick: a dithered first-order modulator below a density of 1/16,
+a second-order one above it (first order alone swelled audibly as hiss:
+simulated in-band noise -52 dBFS against -77 for the second order, which is
+not stable that close to all zeros). What is
 left is a few hertz and its slope-limited step through the capacitor. The
 host's ring is not read during the fade, so the stream starts 90 ms later than
 before, and the M0 takes 90 ms longer to be idle after a stop (the driver
-waits up to about 375 ms). Not measured on hardware yet; the fade length is
+waits up to about 375 ms; its pace check starts at the first frame the M0 reads, so the fade does not count as lag). Not measured on hardware yet; the fade length is
 `M0_FADE_STEPS_LOG2` / `M0_FADE_STEP_LOG2`.
 
 ## What things cost on this SoC
@@ -744,17 +747,13 @@ uncorrected figure says nothing about how late the edges were.
   DMA. So this is probably the CPU's register writes to the SPI controller
   (which the M0's pin write waits for, as with GPIO data writes), not DMA
   beats. Not checked.
-- The driver's give-up check (`M0_COMP_BEHIND_US`, 1 ms/s) is made when a
-  stream **ends**, over the whole stream, and then ignores `comp` for every
-  later stream until `comp_gave_up` is written 0. So with the shipped
-  settings the first stream played during a card read ends with
-  `comp_gave_up` set, and the display redraw correction is gone for the rest
-  of the session. A corrected loop 0.4 % slow is better than that, so the
-  limit is now 20 ms/s (2 %): above the 3-9 ms/s the loop settles at during
-  card reads, far below the ~100 ms/s it runs away at with 16-word bursts.
-  Checked on the board with the module built against the image's kernel tree:
-  three back-to-back 8 s streams during `dd` of the card (1.5 MB/s) ran
-  corrected at 3.5-4.1 ms/s behind and `comp_gave_up` stayed N throughout.
+- The driver used to switch `comp` off for the rest of the session when a
+  stream ended more than `M0_COMP_BEHIND_US` (20 ms/s) behind (`comp_gave_up`).
+  That is gone: it only logs a warning now. It made a short stream (the
+  start fade counted as lag) lose the correction for good, and the case it
+  guarded against, an SPI driver with 16-word DMA bursts (about 100 ms/s
+  behind), is no better uncorrected. The limit had been raised from 1 to
+  20 ms/s because card reads settle at 3-9 ms/s behind.
 - With `COMP_STATS=1` (7 fewer spare cycles) the same reads are 5.9-8.7
   ms/s behind, twice as bad: the loop is that sensitive to its spare cycles.
   Pin writes pushed later averaged 3.5-8 cycles a tick (burst 16 and 4), against 3.5 for
