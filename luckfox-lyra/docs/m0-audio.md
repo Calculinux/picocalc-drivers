@@ -80,10 +80,47 @@ at the control word on each wake; `GRF_SOC_STATUS2` shows the M0 asleep in
 
 ```
 host: wait for m0_state == IDLE, fill in the header, ctrl = PLAY
-M0:   sees PLAY at its next idle wake, m0_state = PLAY, SysTick to the tick rate, plays
+M0:   sees PLAY at its next idle wake, m0_state = PLAY, fades the pins up (90 ms), SysTick to the tick rate, plays
 host: ctrl = STOP
-M0:   sees STOP within one sample, pins low, SysTick slow, m0_state = IDLE
+M0:   sees STOP within one sample, fades the pins down (90 ms), pins low, SysTick slow, m0_state = IDLE
 ```
+
+### Start and stop without a pop
+
+Idle has both pins low; silence plays at a density of one half. The output
+is AC coupled (47 uF), so jumping between the two is a step of about half the
+buffer's supply through the coupling capacitor: a pop at every start and
+stop. `fade_pins()` (main.c) moves between them over 2^17 fade ticks (90 ms)
+with a smoothstep in the density of ones, both channels alike, from a
+second-order error-feedback modulator. Its tick is 256 core cycles (half the
+stream's rate: the C loop with its unbuffered pin write takes about 120
+cycles and lost its schedule at 128), and it tells the modulator how late
+each pin write came, as `m0_play_comp` does. The ramp starts at a density of
+`FADE_MIN_DENS` (1.5 %, a step of 0.05 V) rather than 0: below about 1.4 %
+the ones are single pulses at audio rates.
+
+Recorded (Tascam through the isolator, same 6 start/stop cycles of digital
+silence, ch0; rms and peak over each event; 1 FS is about 0.55 V here):
+
+| firmware | peak 20 Hz+ | rms | 300 Hz-20 kHz peak / rms | length |
+|---|---|---|---|---|
+| no fade (pop) | 1.10 FS (clipped) | -12 dBFS | 0.94 FS / -31 dBFS | 220 ms |
+| 1st-order fade from 0, 128-cycle tick, no lateness correction | 0.16 | -29 | 0.11 / -39 | 260 ms |
+| second-order, 256-cycle tick, corrected, from 4 % | 0.39 | -28 | 0.31 / -40 | 265 ms |
+| the same from 1.5 % | 0.37 | -29 | 0.24 / -38 | 260 ms |
+
+Steady silence plays at -57 dBFS (300 Hz-20 kHz) and idle at -85. The middle
+of the corrected fade is at -48 to -52 dBFS, 5 to 9 dB over steady silence,
+where the uncorrected one was at -35 (that is edge-timing jitter of a few
+cycles; a second-order loop with a fast tick left uncorrected by the loop
+overrun made it worse, -17, and the correction then ran away). What is left
+are short clicks at the two ends (0.1 to 0.3 FS for a millisecond or two):
+the step at the start of the ramp, the modulator's start-up, and a burst of
+tonal noise in the last 20 ms before idle. The ring is not read during the
+fade, so a stream starts 90 ms later than before and the M0 takes 90 ms
+longer to be idle after a stop (the driver waits up to about 375 ms; its pace
+check starts at the first frame the M0 reads, so the fade does not count as
+lag). Fade length: `M0_FADE_STEPS_LOG2` / `M0_FADE_STEP_LOG2`.
 
 ## What things cost on this SoC
 
@@ -730,17 +767,13 @@ uncorrected figure says nothing about how late the edges were.
   DMA. So this is probably the CPU's register writes to the SPI controller
   (which the M0's pin write waits for, as with GPIO data writes), not DMA
   beats. Not checked.
-- The driver's give-up check (`M0_COMP_BEHIND_US`, 1 ms/s) is made when a
-  stream **ends**, over the whole stream, and then ignores `comp` for every
-  later stream until `comp_gave_up` is written 0. So with the shipped
-  settings the first stream played during a card read ends with
-  `comp_gave_up` set, and the display redraw correction is gone for the rest
-  of the session. A corrected loop 0.4 % slow is better than that, so the
-  limit is now 20 ms/s (2 %): above the 3-9 ms/s the loop settles at during
-  card reads, far below the ~100 ms/s it runs away at with 16-word bursts.
-  Checked on the board with the module built against the image's kernel tree:
-  three back-to-back 8 s streams during `dd` of the card (1.5 MB/s) ran
-  corrected at 3.5-4.1 ms/s behind and `comp_gave_up` stayed N throughout.
+- The driver used to switch `comp` off for the rest of the session when a
+  stream ended more than `M0_COMP_BEHIND_US` (20 ms/s) behind (`comp_gave_up`).
+  That is gone: it only logs a warning now. It made a short stream (the
+  start fade counted as lag) lose the correction for good, and the case it
+  guarded against, an SPI driver with 16-word DMA bursts (about 100 ms/s
+  behind), is no better uncorrected. The limit had been raised from 1 to
+  20 ms/s because card reads settle at 3-9 ms/s behind.
 - With `COMP_STATS=1` (7 fewer spare cycles) the same reads are 5.9-8.7
   ms/s behind, twice as bad: the loop is that sensitive to its spare cycles.
   Pin writes pushed later averaged 3.5-8 cycles a tick (burst 16 and 4), against 3.5 for
