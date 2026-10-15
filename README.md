@@ -9,6 +9,7 @@
    - **`drivers/`** – Generic drivers applicable to any SBC used with PicoCalc (MFD, keyboard, LCD, sound, etc.).
    - **`overlays/`** – Generic device tree overlays (e.g. 100 kHz I2C, DS3231 RTC).
    - **`luckfox-lyra/`** – Luckfox Lyra–specific drivers, firmware, overlays, and device tree sources.
+   - **`keymaps/`** – Userspace console assets loaded by kbd tools (`loadkeys`): `picocalc.map`, the PicoCalc console keymap.
 
    What this repo contains
    - A top-level Makefile that can build all drivers against a kernel source (`KERNEL_SRC` / `KSRC`).
