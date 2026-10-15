@@ -819,6 +819,7 @@ static int m0_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 		}
 		/* Header/PLAY are written in work once the M0 is confirmed idle. */
 		m->shmem->ctrl = M0_CTRL_STOP;
+		m->running = false;
 		/* A START on a stream that is already running (userspace xrun
 		 * recovery re-triggers through stop/prepare/start) is re-armed
 		 * in the worker, which tears the M0 down and hands it the fresh
