@@ -467,6 +467,11 @@ static void m0_init_header_locked(struct picocalc_m0 *m)
 		return;
 	runtime = m->substream->runtime;
 	m0_set_tick_timing_locked(m);
+	/* The pointer-domain counters are only consistent when reset together
+	 * with the ring indices, so reset them where the ring is reset. */
+	m->copied_frames = 0;
+	m->played_frames = 0;
+	m->elapsed_mark = 0;
 	/* The frame before read_idx is what plays until the first frame is
 	 * fetched, and straight away if the ring starts out empty. */
 	memset(m->shmem->buffer + m->buf_size - 4, 0, 4);
@@ -806,24 +811,30 @@ static int m0_pcm_trigger(struct snd_pcm_substream *ss, int cmd)
 	spin_lock_irqsave(&m->lock, flags);
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		if (m->want_play) {
-			ret = -EALREADY;
-			break;
-		}
-		m->copied_frames = 0;
-		m->played_frames = 0;
-		m->elapsed_mark = 0;
-		/* Header/PLAY are written in work once the M0 is confirmed idle. */
-		m->shmem->ctrl = M0_CTRL_STOP;
 		/* Fire once per ALSA period (do_div avoids __aeabi_uldivmod on 32-bit ARM) */
 		{
 			u64 nsec = (u64)NSEC_PER_SEC * runtime->period_size;
 			do_div(nsec, runtime->rate);
 			m->period_ktime = ns_to_ktime(nsec);
 		}
-
+		/* Header/PLAY are written in work once the M0 is confirmed idle. */
+		m->shmem->ctrl = M0_CTRL_STOP;
+		/* A START on a stream that is already running (userspace xrun
+		 * recovery re-triggers through stop/prepare/start) is re-armed
+		 * in the worker, which tears the M0 down and hands it the fresh
+		 * header again, instead of failing it: refusing here wedges the
+		 * core's state machine in an unrecoverable error loop, since the
+		 * driver can no longer represent a stop. */
 		m->want_play = true;
 		schedule_work(&m->rproc_work);
+		/* The core latches the trigger timestamp only on a clean
+		 * PREPARED->RUNNING transition of its state machine; a
+		 * re-triggered stream can otherwise be handed a zero or stale
+		 * value, and timestamp-based consumers (e.g. cpal) treat that
+		 * disagreement as a broken stream and shed the data. Keep it
+		 * honest on every start, not just the first. */
+		snd_pcm_gettime(runtime, &runtime->trigger_tstamp);
+		runtime->trigger_tstamp_latched = true;
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
