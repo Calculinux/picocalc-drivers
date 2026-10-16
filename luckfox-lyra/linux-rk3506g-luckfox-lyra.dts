@@ -24,8 +24,8 @@
 };
 
 &rng {
-	status = "ok";
-}
+	status = "okay";
+};
 
 /**********display**********/
 /* SPI DBI stock panel needs no CMA; DSI overlays re-enable & set size. */
