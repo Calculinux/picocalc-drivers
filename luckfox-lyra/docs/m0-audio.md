@@ -3,8 +3,9 @@
 Status: **plays on hardware** (Luckfox Lyra RK3506G2 in a PicoCalc,
 Calculinux 6.1.99, 2026-10-02): test tones through the ALSA device, at a
 3 MHz output bit rate with the firmware running as TCM, or 1 MHz in bus
-mode. Audio quality has not been measured or judged yet; see
-[Open issues](#open-issues).
+mode. First listening test (2026-10-09): subjectively very good, with one
+faint once-a-second tick in silence; see [Listening test](#listening-test).
+Audio quality has not been measured; see [Open issues](#open-issues).
 
 Sources: RK3506 TRM Part 1 V1.2, RK3506G2 datasheet V1.5, the PicoCalc
 mainboard V2.0 schematic, the upstream M0 loader
@@ -1093,12 +1094,58 @@ Earlier observations, for the record: the same number of late ticks with the
 heartbeat LED trigger on or off; in simulation the modulator produces no
 burst of in-band noise when its input drops to digital silence.
 
+## Listening test
+
+2026-10-09, first critical listening, by the author (not an audiophile): a
+high-quality jazz internet radio stream played with `ffmpeg` on the PicoCalc
+itself, through the ALSA device, on wired headphones. Configuration: the
+current defaults, TCM at 3 MHz with the M0 at 375 MHz and `comp` on (the
+corrected playback loop). The kernel was the 6.1.99 image whose `spi-rockchip`
+reads `rockchip,tx-dma-burst` (checked by finding the property lookup in the
+decompressed image), and the display's SPI0 sets it to 4, so the display ran
+with four-word DMA bursts. Over a stream of 35 to 86 s the driver reported the
+M0 12 to 56 us behind (0 us per second), so no stall long enough to matter.
+
+- **Overall:** much better than expected. Even the most subtle sounds render
+  clearly, and no frequency range heard was a problem. By ear, comparable to
+  good Yamaha stereo gear with the same headphones for the most part.
+- **One fault:** a faint rhythmic tick about once a second during silence
+  (between tracks, or in quiet passages). It is inaudible under even the
+  lightest playing audio.
+
+This is a single subjective impression, not a measurement; it does not
+close open issue 2.
+
+Leads on the tick (not yet tested):
+
+- The period is close to the display's redraw: the console's terminal
+  program redraws every 1.0133 s, and each redraw makes a few consecutive
+  M0 ticks late (see "What the ticking was"). `ffmpeg` also redraws its
+  progress line on the console. Whether this is that, or the 203 ms/1 s
+  cursor and status updates, is unknown.
+- Check the period: exactly 1.000 s points to a timer, a drifting period of
+  about 1.0133 s to the terminal redraw.
+- Run `ffmpeg -nostats -loglevel quiet`, or play from a file with the
+  console display frozen (`poptest.sh`), and listen again. If the tick
+  goes, it is the display redraw. `comp` and the four-word bursts were
+  both already active, so it would be a redraw effect they do not remove.
+  The M0's "behind" figure being near zero argues against it: a stall big
+  enough to hear would show there.
+- Play digital silence locally (`-f lavfi -i anullsrc`) to rule out the
+  stream and network.
+- Record the headphone output on a PC line input and look at the tick: a
+  broadband click suggests a late pin write, a low-frequency thump a supply
+  or DC movement.
+
 ## Open issues
 
 1. **Hiss**: gone by ear with the even tick (it was plainly audible at 63
-   cycles per tick).
-2. **Quality.** Not measured. Nobody has yet listened critically or looked at
-   the output on a scope or analyser, at any tick rate.
+   cycles per tick). The first listening test heard none, only the
+   once-a-second tick in silence ([Listening test](#listening-test)).
+2. **Quality.** Not measured. One critical listening so far
+   ([Listening test](#listening-test)): very good by ear on headphones, bar
+   the tick in silence. Nobody has looked at the output on a scope or
+   analyser, at any tick rate.
 3. **Pin timing with bufferable writes** is inferred, not observed (above).
 4. **Suspend.** Untested in either mode: what suspend-to-RAM does to the TCM
    contents and the M0, and whether anything needs the boot-stage code this
